@@ -1013,6 +1013,116 @@ LogicalResult decomposeConcats(ModuleOp m) {
   return applyPatternsGreedily(m, std::move(patterns));
 }
 
+// 세 축 이상에서 바깥 축 여러 평면에 걸치면서 안쪽 축은 일부만 쓰는 조각은
+// 가장 안쪽 축의 행들로 읽히지 않는다 — 토큰 둘의 새 K 행 [8, 2, 128] 을
+// 창 [8, 256, 128] 에 쓰는 것이 그렇다(헤드마다 2행, 사이에 254행). 그런 쓰기를
+// 바깥 축을 따라 평면마다 하나씩으로 나눈다. 각 조각은 행 몇 개짜리다.
+LogicalResult splitPlanarSlices(OpBuilder &b, ModuleOp m) {
+  SmallVector<tensor::InsertSliceOp> work;
+  m.walk([&](tensor::InsertSliceOp op) {
+    auto dest = op.getDestType();
+    if (dest.getRank() < 3 || !dest.hasStaticShape() || !op.hasUnitStride() ||
+        ShapedType::isDynamicShape(op.getStaticSizes()) || ShapedType::isDynamicShape(op.getStaticOffsets()))
+      return;
+    auto sizes = op.getStaticSizes();
+    int outer = -1, inner = -1;
+    for (int d = 0; d + 1 < dest.getRank(); ++d)
+      if (sizes[d] > 1) { if (outer < 0) outer = d; inner = d; }
+    // 여러 평면을 가지는 축이 하나뿐이면 그 축의 행들이다. 둘 이상이면 그
+    // 사이의 축이 통째여야 행으로 읽힌다.
+    if (outer < 0 || outer == inner) return;
+    bool dense = true;
+    for (int d = outer + 1; d <= inner; ++d)
+      if (sizes[d] != dest.getDimSize(d)) dense = false;
+    if (dense) return;
+    work.push_back(op);
+  });
+  for (auto op : work) {
+    b.setInsertionPoint(op);
+    auto loc = op.getLoc();
+    auto sizes = llvm::to_vector(op.getStaticSizes());
+    auto offsets = llvm::to_vector(op.getStaticOffsets());
+    auto sourceType = op.getSourceType();
+    int outer = 0;
+    while (sizes[outer] == 1) ++outer;
+    // insert_slice 가 순위를 줄인 원본을 받을 수도 있으므로 원본 축을 따로 센다.
+    if (sourceType.getRank() != int64_t(sizes.size())) continue;
+    Value into = op.getDest();
+    auto pieceSizes = sizes;
+    pieceSizes[outer] = 1;
+    SmallVector<OpFoldResult> ones(sizes.size(), b.getIndexAttr(1)), pieceSizeAttrs;
+    for (auto v : pieceSizes) pieceSizeAttrs.push_back(b.getIndexAttr(v));
+    for (int64_t i = 0; i < sizes[outer]; ++i) {
+      SmallVector<OpFoldResult> from(sizes.size(), b.getIndexAttr(0)), to;
+      from[outer] = b.getIndexAttr(i);
+      for (auto [d, v] : llvm::enumerate(offsets)) to.push_back(b.getIndexAttr(v + (int64_t(d) == outer ? i : 0)));
+      Value piece = b.create<tensor::ExtractSliceOp>(
+          loc, RankedTensorType::get(pieceSizes, sourceType.getElementType()), op.getSource(), from,
+          pieceSizeAttrs, ones);
+      into = b.create<tensor::InsertSliceOp>(loc, piece, into, to, pieceSizeAttrs, ones);
+    }
+    op.getResult().replaceAllUsesWith(into);
+    op.erase();
+  }
+  return success();
+}
+
+// 행마다 하나인 FP32 값이 reshape 때문에 행렬 모양으로 남는 경우가 있다 — 토큰
+// 여럿의 헤드별 RMSNorm 스칼라는 [토큰, 헤드]다. 그것도 결국 행 하나에 값 하나인
+// 레인이므로, 한 축으로 펴서 다른 행 스칼라처럼 스칼라 유닛이 받게 한다.
+LogicalResult flattenLanes(OpBuilder &b, ModuleOp m) {
+  // 행 벡터를 reshape 만 거쳐 행렬 모양으로 본 값인가. 행렬 연산의 FP32
+  // 중간값(RMSNorm 의 FP32 제곱 등)은 여기 해당하지 않는다.
+  std::function<bool(Value)> fromLanes = [&](Value v) {
+    if (isRowShape(v.getType())) return true;
+    if (auto collapse = v.getDefiningOp<tensor::CollapseShapeOp>()) return fromLanes(collapse.getSrc());
+    if (auto expand = v.getDefiningOp<tensor::ExpandShapeOp>()) return fromLanes(expand.getSrc());
+    return false;
+  };
+  // 편 결과는 한 축 값의 reshape 라 그것을 읽는 다음 op 도 후보가 된다.
+  // 더 펼 것이 없을 때까지 되풀이한다.
+  for (bool changed = true; changed;) {
+    changed = false;
+    SmallVector<linalg::GenericOp> work;
+    m.walk([&](linalg::GenericOp gen) {
+      if (gen.getNumLoops() != 2 || gen.getNumDpsInits() != 1 || gen.getNumResults() != 1) return;
+      if (!llvm::all_of(gen.getIteratorTypesArray(),
+                        [](utils::IteratorType t) { return t == utils::IteratorType::parallel; }))
+        return;
+      auto out = dyn_cast<RankedTensorType>(gen.getResult(0).getType());
+      if (!out || !out.hasStaticShape() || out.getRank() != 2 || !out.getElementType().isF32() ||
+          isRowShape(out))
+        return;
+      for (auto [map, value] : llvm::zip(gen.getIndexingMapsArray(), gen->getOperands())) {
+        auto type = dyn_cast<RankedTensorType>(value.getType());
+        if (!map.isIdentity() || !type || type.getShape() != out.getShape() || !type.getElementType().isF32())
+          return;
+      }
+      if (gen.getNumDpsInputs() == 0 || !llvm::all_of(gen.getDpsInputs(), fromLanes)) return;
+      work.push_back(gen);
+    });
+    for (auto gen : work) {
+      b.setInsertionPoint(gen);
+      auto loc = gen.getLoc();
+      auto out = cast<RankedTensorType>(gen.getResult(0).getType());
+      SmallVector<ReassociationIndices> all{{0, 1}};
+      SmallVector<Value> operands;
+      for (Value value : gen->getOperands()) operands.push_back(b.create<tensor::CollapseShapeOp>(loc, value, all));
+      auto lane = AffineMap::getMultiDimIdentityMap(1, b.getContext());
+      auto flat = b.create<linalg::GenericOp>(
+          loc, TypeRange{operands.back().getType()}, ValueRange(operands).drop_back(), ValueRange{operands.back()},
+          SmallVector<AffineMap>(operands.size(), lane),
+          SmallVector<utils::IteratorType>{utils::IteratorType::parallel});
+      IRMapping mapping;
+      gen.getRegion().cloneInto(&flat.getRegion(), mapping);
+      gen.getResult(0).replaceAllUsesWith(b.create<tensor::ExpandShapeOp>(loc, out, flat.getResult(0), all));
+      gen.erase();
+      changed = true;
+    }
+  }
+  return success();
+}
+
 // RMSNorm 은 FP32 로 제곱해 FP32 로 더한다. FP16 좁히기는 그 제곱을 FP16 원소별
 // 연산으로 떼어 내는데, |x| 가 256 을 넘으면 x*x 가 FP16 최댓값을 넘는다.
 // 깊은 층의 잔차 스트림에는 그런 값이 있다. V_DOT_F16_F32 는 FP16 두 스트림을
@@ -1201,6 +1311,7 @@ LogicalResult normalizeGraph(ModuleOp m) {
 
   // ── ③ 모양을 바꾸는 재작성들 ──────────────────────────────────────
   if (failed(decomposeConcats(m))) return failure();      // concat → 조각별 슬라이스 쓰기
+  if (failed(splitPlanarSlices(batched, m))) return failure();  // 행으로 안 읽히는 쓰기 → 평면별
   if (failed(pretransposeWeights(batched, m))) return failure();   // 전치를 미리 접어 없앤다
   if (failed(decomposeTransposes(batched, m))) return failure();   // 남은 전치를 분해
   if (failed(flattenElementwise(batched, m))) return failure();    // 원소별 연산을 rank-2 로
@@ -1246,6 +1357,10 @@ LogicalResult normalizeGraph(ModuleOp m) {
 
   // ── ⑦ FP16 으로 좁히기 ────────────────────────────────────────────
   if (failed(dropRowReshapes(m))) return failure();
+  if (failed(cleanIR(m))) return failure();
+  // 행렬 모양으로 남은 행 스칼라를 한 축으로. region 의 상수가 행 모양 텐서로
+  // 올라가기(hoistRegionScalars) 전이라야 피연산자가 전부 항등으로 읽힌다.
+  if (failed(flattenLanes(b, m))) return failure();
   if (failed(cleanIR(m))) return failure();
   if (failed(narrowMatrixChains(b, m))) return failure();
   if (failed(hoistRegionScalars(b, m))) return failure();

@@ -46,11 +46,10 @@ def prepare(capture: Path, out: Path, prompt: str, quantize: bool) -> Step:
     manifest = json.loads((capture / "manifest.json").read_text())
     c = Config(**manifest["config"])
     L, M, P = manifest["layers"], manifest["tokens"], manifest["capacity"]
-    assert M == 1, "the host loop decodes one token per step"
     model = Path(manifest["model"])
     from transformers import AutoTokenizer
     tokens = AutoTokenizer.from_pretrained(model)(prompt)["input_ids"]
-    assert 1 <= len(tokens) <= P + 1, "prompt longer than the cache"
+    assert M <= len(tokens) <= P + M, "prompt shorter than one step or longer than the cache"
     checkpoint = Checkpoint(model)
     embed = checkpoint.get("model.embed_tokens.weight")
     reference = DecodeStep(c, L, manifest["head"]).float()
@@ -58,20 +57,23 @@ def prepare(capture: Path, out: Path, prompt: str, quantize: bool) -> Step:
     if quantize:
         w8a8(reference)
 
-    def run(x, position, past, windows):
-        cos, sin = rope_tables(c, [position])
-        mask = step_mask(M, P, past)
+    # The module takes M and P from its inputs, so the prefix goes through it one
+    # token at a time in the same window (P + M - 1 cached slots, 1 new).
+    def run(x, past, windows):
+        steps = x.shape[0]
+        cos, sin = rope_tables(c, list(range(past, past + steps)))
+        mask = step_mask(steps, P + M - steps, past)
         with torch.no_grad():
             return reference(x, cos, sin, mask, *windows), cos, sin, mask
 
     windows = [torch.zeros(c.kv_heads, P + M, c.head_dim) for _ in range(2 * L)]
-    for t, token in enumerate(tokens[:-1]):
-        outputs, *_ = run(embed[token][None].float(), t, t, windows)
-        for i in range(2 * L):                  # the host moves the new rows into slot t
+    past = len(tokens) - M
+    for t, token in enumerate(tokens[:past]):
+        outputs, *_ = run(embed[token][None].float(), t, windows)
+        for i in range(2 * L):                  # the host moves the new row into slot t
             windows[i][:, t] = outputs[1 + i][:, 0]
-    last = len(tokens) - 1
-    x = embed[tokens[-1]][None].to(torch.float16)
-    outputs, cos, sin, mask = run(x.float(), last, last, [w.clone() for w in windows])
+    x = embed[tokens[past:]].to(torch.float16)
+    outputs, cos, sin, mask = run(x.float(), past, [w.clone() for w in windows])
     step_inputs = [x, cos.half(), sin.half(), mask.half()] + [w.half() for w in windows]
 
     source = out / "inputs"
