@@ -2,6 +2,7 @@
 // Normalize.cpp — Stage 1 전반 — 캡처를 이 컴파일러가 아는 모양으로
 //===----------------------------------------------------------------------===//
 #include "GraphInternal.h"
+#include "mlir/Transforms/WalkPatternRewriteDriver.h"
 
 using namespace mlir;
 namespace npu {
@@ -450,6 +451,12 @@ LogicalResult hoistRegionScalars(OpBuilder &b, ModuleOp m) {
 /// 제자리 버퍼화를 못 하게 만들 수 있다
 /// (`Yield operand #0 is not equivalent to the corresponding iter bbArg`).
 /// 그래서 지울 축이 실제로 있을 때만 돌린다.
+///
+/// **행과 열 두 축은 남긴다.** decode 는 토큰이 하나라 활성값이 1xH 인데,
+/// 모든 단위 축을 지우면 행 축까지 사라져 H 짜리 rank-1 이 되고, 행마다
+/// 하나인 스칼라는 rank-0 이 된다. 뒤의 재작성과 lowering 은 전부 rank-2
+/// 행렬과 행 벡터를 전제하므로, 바깥 단위 축부터 지우되 루프가 둘 남으면
+/// 멈춘다. 8x1x128 의 가운데 1 은 지워지고 1x2560 은 그대로다.
 LogicalResult foldBatchDimension(ModuleOp m) {
   bool ranked = false;
   m.walk([&](Operation *op) {
@@ -457,8 +464,32 @@ LogicalResult foldBatchDimension(ModuleOp m) {
       if (auto shaped = dyn_cast<ShapedType>(type); shaped && shaped.getRank() > 2) ranked = true;
   });
   if (!ranked) return success();
+  linalg::ControlDropUnitDims options;
+  options.controlFn = [](Operation *op) -> SmallVector<unsigned> {
+    auto gen = dyn_cast<linalg::GenericOp>(op);
+    if (!gen) return {};
+    auto ranges = gen.getStaticLoopRanges();
+    SmallVector<unsigned> unit;
+    for (unsigned d = 0; d < ranges.size(); ++d)
+      if (ranges[d] == 1) unit.push_back(d);
+    // 바깥 축부터 지우므로 남는 것은 안쪽 두 루프다.
+    size_t keep = std::min<size_t>(2, ranges.size());
+    size_t droppable = ranges.size() > keep ? ranges.size() - keep : 0;
+    if (unit.size() > droppable) unit.resize(droppable);
+    return unit;
+  };
+  {
+    RewritePatternSet patterns(m.getContext());
+    linalg::populateFoldUnitExtentDimsPatterns(patterns, options);
+    walkAndApplyPatterns(m, std::move(patterns));
+  }
+  {
+    RewritePatternSet patterns(m.getContext());
+    linalg::populateMoveInitOperandsToInputPattern(patterns);
+    linalg::populateFoldUnitExtentDimsCanonicalizationPatterns(patterns, options);
+    (void)applyPatternsGreedily(m, std::move(patterns));
+  }
   PassManager pm(m.getContext());
-  pm.addPass(createLinalgFoldUnitExtentDimsPass());
   pm.addPass(createCanonicalizerPass());
   pm.addPass(createCSEPass());
   return pm.run(m);
