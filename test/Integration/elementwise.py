@@ -1,7 +1,7 @@
 """VPU stream semantics and linalg.generic lowering against a PyTorch oracle.
 
 Two cases. The hand-written target IR pins the instruction contract itself; the
-graph source runs the same hardware through 1..4막 from a tensor matmul plus an
+graph source runs the same hardware through Stage 1..4 from a tensor matmul plus an
 elementwise chain, which is the shape every decoder layer has.
 """
 import argparse

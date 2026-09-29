@@ -1,5 +1,5 @@
-#include "plena/Target/Program.h"
-#include "plena/Target/ISA.h"
+#include "npu/Target/Program.h"
+#include "npu/Target/ISA.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -7,7 +7,7 @@
 #include <set>
 #include <tuple>
 
-namespace plena {
+namespace npu {
 namespace {
 class Frontier {
   struct State {
@@ -342,4 +342,4 @@ std::string systemManifestForEncoded(const Program &p, uint64_t wordCount) {
     ",\n  \"l2_regions\": [{\"name\": \"l2\", \"offset\": 0, \"size\": " +
     std::to_string(p.l2Bytes) + ", \"alignment\": 64}]\n}\n";
 }
-} // namespace plena
+} // namespace npu

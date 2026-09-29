@@ -1,5 +1,5 @@
-#include "plena/Transforms/Pipeline.h"
-#include "plena/Analysis/MemoryPlan.h"
+#include "npu/Transforms/Pipeline.h"
+#include "npu/Analysis/MemoryPlan.h"
 #include "mlir/Analysis/Liveness.h"
 #include "mlir/Dialect/Bufferization/Transforms/BufferViewFlowAnalysis.h"
 #include "mlir/Dialect/Bufferization/Transforms/OneShotAnalysis.h"
@@ -11,7 +11,7 @@
 #include "llvm/ADT/StringMap.h"
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
   bufferization::OneShotBufferizationOptions options;
   options.bufferizeFunctionBoundaries = true;
@@ -81,7 +81,7 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
   requirements.push_back(staging);
   // --readback: an L2 window for the outputs, live only after the last
   // statement, so it can share addresses with everything that died before.
-  if (m->hasAttr("plena.readback")) {
+  if (m->hasAttr("npu.readback")) {
     uint64_t bytes = 0;
     entry.walk([&](func::ReturnOp ret) {
       for (auto v : ret.getOperands())
@@ -111,26 +111,26 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
     auto address = b.getI64IntegerAttr(found->second);
     if (auto arg = dyn_cast<BlockArgument>(allocations[i])) {
       auto f = cast<func::FuncOp>(arg.getOwner()->getParentOp());
-      f.setArgAttr(arg.getArgNumber(),"plena.address",address);
+      f.setArgAttr(arg.getArgNumber(),"npu.address",address);
     } else {
       // [first statement, one past the last statement] that needs the buffer,
       // as computed above; recorded so 03-placed.mlir shows why two buffers
       // may share an address.
       auto *alloc = allocations[i].getDefiningOp();
-      alloc->setAttr("plena.address",address);
-      alloc->setAttr("plena.live",b.getDenseI64ArrayAttr({int64_t(requirements[i].begin),
+      alloc->setAttr("npu.address",address);
+      alloc->setAttr("npu.live",b.getDenseI64ArrayAttr({int64_t(requirements[i].begin),
                                                           int64_t(requirements[i].end)}));
     }
   }
-  m->setAttr("plena.l1_capacity",b.getI64IntegerAttr(hw.l1Bytes));
+  m->setAttr("npu.l1_capacity",b.getI64IntegerAttr(hw.l1Bytes));
   if (auto found = addressOf.find("readback"); found != addressOf.end())
-    m->setAttr("plena.readback_l2",b.getI64IntegerAttr(found->second));
-  m->setAttr("plena.l2_staging",b.getI64IntegerAttr(addressOf["staging"]));
-  m->setAttr("plena.l2_staging_bytes",b.getI64IntegerAttr(kDRAMStagingBytes));
-  m->setAttr("plena.l1_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.l1HighWater[0])));
-  m->setAttr("plena.l2_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.l2HighWater)));
-  m->setAttr("plena.dram_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.dramHighWater)));
-  m->setAttr("plena.stage",b.getStringAttr("placed"));
+    m->setAttr("npu.readback_l2",b.getI64IntegerAttr(found->second));
+  m->setAttr("npu.l2_staging",b.getI64IntegerAttr(addressOf["staging"]));
+  m->setAttr("npu.l2_staging_bytes",b.getI64IntegerAttr(kDRAMStagingBytes));
+  m->setAttr("npu.l1_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.l1HighWater[0])));
+  m->setAttr("npu.l2_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.l2HighWater)));
+  m->setAttr("npu.dram_bytes",b.getI64IntegerAttr(std::max<uint64_t>(64,placed.value.dramHighWater)));
+  m->setAttr("npu.stage",b.getStringAttr("placed"));
   return success();
 }
-} // namespace plena
+} // namespace npu

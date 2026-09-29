@@ -25,7 +25,7 @@
 
 이는 분석 비용 모델을 통한 탐색이다. 모든 후보를 시뮬레이터로 실행하는 자동 튜너,
 임의의 루프 순서/코어 분할 탐색, L2 K 분할은 구현하지 않았다. 코어는 기존처럼
-L2 패널의 연속된 N 구간을 나눈다. `plena.plans`에는 L2/L1 크기, 사용 코어,
+L2 패널의 연속된 N 구간을 나눈다. `npu.plans`에는 L2/L1 크기, 사용 코어,
 스테이지 수, 예상 바이트와 사이클이 기록된다. 예상 사이클은 하드웨어 실측값이 아니다.
 
 ## 컴파일 비용 수정
@@ -81,12 +81,12 @@ GEMM은 약 26.3% 감소했다. Llama 32토큰은 약 0.3% 증가했으므로 �
 cmake -S . -B build/tiling-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DMLIR_DIR=/home/jjh4777/third_party/torch-mlir/build-llvm/lib/cmake/mlir \
   -DLLVM_DIR=/home/jjh4777/third_party/torch-mlir/build-llvm/lib/cmake/llvm \
-  -DPLENA_TEST_EMULATOR=/home/jjh4777/PLENA_Simulator_v2/transactional_emulator/target/release/transactional_emulator \
-  -DPLENA_TEST_SETTINGS=/home/jjh4777/plena_settings_lp6.toml
+  -DNPU_TEST_EMULATOR=/home/jjh4777/PLENA_Simulator_v2/transactional_emulator/target/release/transactional_emulator \
+  -DNPU_TEST_SETTINGS=/home/jjh4777/plena_settings_lp6.toml
 cmake --build build/tiling-release -j 3
 ctest --test-dir build/tiling-release --output-on-failure
 
-build/tiling-release/bin/plena-compile --from=graph INPUT.mlir \
+build/tiling-release/bin/npu-compile --from=graph INPUT.mlir \
   --settings examples/llama/hardware4.toml --fp16 --reciprocal-division \
   --time-stages -o OUTPUT
 ```

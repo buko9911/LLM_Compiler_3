@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS NPUDialect.td)
+mlir_tablegen(NPUDialect.h.inc -gen-dialect-decls -dialect=npu)
+mlir_tablegen(NPUDialect.cpp.inc -gen-dialect-defs -dialect=npu)
+mlir_tablegen(NPUOps.h.inc -gen-op-decls)
+mlir_tablegen(NPUOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(NPUDialectIncGen)

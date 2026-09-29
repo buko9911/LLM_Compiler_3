@@ -1,4 +1,4 @@
-# PLENA 컴파일러 v3 설계
+# NPU 컴파일러 v3 설계
 
 2026-09-16. MLIR 기반. v1(`LLM_Compiler`), v2(`LLM_Compiler_v2`), 같은 하드웨어를
 타깃하는 외부 구현(`kimjongjip/NPU-compiler`), 그리고 공개된 NPU 컴파일러 스택
@@ -10,13 +10,13 @@
 
 **목표**
 
-- HF 체크포인트를 받아 PLENA NPU에서 실행 가능한 프로그램을 낸다.
+- HF 체크포인트를 받아 NPU에서 실행 가능한 프로그램을 낸다.
 - 쪼개는 방식(타일·코어·K 분할)을 **탐색해서 고른다**. 사람이 지정하지 않는다.
 - 모델 종류에 의존하지 않는다. 새 아키텍처를 위해 코드를 추가하지 않는다.
 
 **비목표**
 
-- 임의 하드웨어 백엔드. 타깃은 PLENA 하나다.
+- 임의 하드웨어 백엔드. 타깃은 NPU 하나다.
 - 학습. 추론(prefill + decode)만.
 - 동적 shape. 모든 타일은 정적이다.
 
@@ -34,14 +34,14 @@
 
 | | Hexagon-MLIR (Qualcomm) | MiniNPU | v3 |
 |---|---|---|---|
-| | canonicalize / CSE | — | 1막 |
-| | **Operator Fusion** | **fuse-linear-relu** | 2막 |
-| | **Tiling for Memory Hierarchy** | **plan-tiles** (비용 모델 탐색) | 2막 |
-| | Multi-threading → async | — | 2막 |
-| | **Double buffering** (구조 변환) | — | 2막 |
+| | canonicalize / CSE | — | Stage 1 |
+| | **Operator Fusion** | **fuse-linear-relu** | Stage 2 |
+| | **Tiling for Memory Hierarchy** | **plan-tiles** (비용 모델 탐색) | Stage 2 |
+| | Multi-threading → async | — | Stage 2 |
+| | **Double buffering** (구조 변환) | — | Stage 2 |
 | | Vectorization (HVX) | — | — |
-| | **Bufferization** + layout | **Bufferization** | 3막 |
-| | LLVM → 바이너리 | SCF → LLVM | 4막 |
+| | **Bufferization** + layout | **Bufferization** | Stage 3 |
+| | LLVM → 바이너리 | SCF → LLVM | Stage 4 |
 
 **공통 규칙 셋:**
 
@@ -90,14 +90,14 @@ v3 = **v2의 탐색기** + **표준 파이프라인 순서** + **v1의 단계 �
 | 명령이 적힌 순서대로 실행되지 않는다 | 순서를 그린다 |
 
 ```
-0막 꺼내기   Python         모델 → linalg IR + 가중치 + 심볼
+Stage 0 꺼내기   Python         모델 → linalg IR + 가중치 + 심볼
 ──────────────────────────────────────────────── tensor ────
-1막 읽기     "할 수 있나?"   표준 정리 → 표현 가능성 검사 → L2 예산 분할
-2막 쪼개기   "어떻게?"       묶기 → 타일 탐색 → 타일 루프 → 더블버퍼 구조
+Stage 1 읽기     "할 수 있나?"   표준 정리 → 표현 가능성 검사 → L2 예산 분할
+Stage 2 쪼개기   "어떻게?"       묶기 → 타일 탐색 → 타일 루프 → 더블버퍼 구조
 ──────────────────────────────────────────────── memref ────
-3막 놓기     "어디에?"       버퍼화 → 주소 배정 → DMA 명령 삽입
-──────────────────────────────────────────────── plena ─────
-4막 적기     "어떤 명령?"    명령 생성 → 블록 의존 → 패키징
+Stage 3 놓기     "어디에?"       버퍼화 → 주소 배정 → DMA 명령 삽입
+──────────────────────────────────────────────── npu ─────
+Stage 4 적기     "어떤 명령?"    명령 생성 → 블록 의존 → 패키징
 ```
 
 막 경계가 곧 **IR 층 경계**다. 표준의 3층(그래프/구조화/타깃)과 대응한다.
@@ -107,10 +107,10 @@ v3 = **v2의 탐색기** + **표준 파이프라인 순서** + **v1의 단계 �
 
 | 순서 | 정하는 것 | 막 |
 |---|---|---|
-| 1 | 무엇끼리 묶을지 | 2막 |
-| 2 | 타일 크기 | 2막 |
-| 3 | 어느 메모리 계층 | 2막 후보의 요구 계약, 3막 검증·실체화 |
-| 4 | 몇 번지 | 3막 |
+| 1 | 무엇끼리 묶을지 | Stage 2 |
+| 2 | 타일 크기 | Stage 2 |
+| 3 | 어느 메모리 계층 | Stage 2 후보의 요구 계약, Stage 3 검증·실체화 |
+| 4 | 몇 번지 | Stage 3 |
 
 ### 3.1 막 사이 산출물
 
@@ -123,7 +123,7 @@ v3 = **v2의 탐색기** + **표준 파이프라인 순서** + **v1의 단계 �
 01-legal.mlir      검사 통과, L2 예산 부착
 02-tiled.mlir      타일 루프 + 코어 forall + ping/pong
 03-placed.mlir     memref + 주소 + DMA
-04-isa.mlir        plena.program
+04-isa.mlir        npu.program
 program.bin        Unified Program v5 바이너리 + system.json
 program.mem        코어 ISA 워드의 텍스트 진단 출력
 ```
@@ -139,16 +139,16 @@ program.mem        코어 ISA 워드의 텍스트 진단 출력
 
 | 단계 | MLIR이 주는 것 | 우리가 만들 것 |
 |---|---|---|
-| 0막 import | `torch-mlir` FX importer | 없음 |
-| 1막 정리 | `canonicalize`, `cse` | 표현 가능성 검사, 예산 분할 |
-| 2막 융합 | `tileConsumerAndFuseProducersUsingSCF` | 그룹 형성 규칙 |
-| 2막 타일링 | `TilingInterface`, `scf` 타일링 | **★ 비용 모델 + 후보 탐색** |
-| 2막 코어 분할 | `scf.forall` + mapping attr | 매핑 규칙 |
-| 2막 더블버퍼 | `scf` 파이프라이닝 | PLENA 제약 반영 |
-| 3막 버퍼화 | `one-shot-bufferize` | memory space 배정 규칙 |
-| 3막 메모리 배치 | — | **★ 주소 배정 + spill/remat** |
-| 4막 codegen | Dialect Conversion 틀 | **★ ISA 인코딩** |
-| 도구 | `PassManager`, `lit`, `FileCheck`, `plena-opt` 템플릿 | 없음 |
+| Stage 0 import | `torch-mlir` FX importer | 없음 |
+| Stage 1 정리 | `canonicalize`, `cse` | 표현 가능성 검사, 예산 분할 |
+| Stage 2 융합 | `tileConsumerAndFuseProducersUsingSCF` | 그룹 형성 규칙 |
+| Stage 2 타일링 | `TilingInterface`, `scf` 타일링 | **★ 비용 모델 + 후보 탐색** |
+| Stage 2 코어 분할 | `scf.forall` + mapping attr | 매핑 규칙 |
+| Stage 2 더블버퍼 | `scf` 파이프라이닝 | NPU 제약 반영 |
+| Stage 3 버퍼화 | `one-shot-bufferize` | memory space 배정 규칙 |
+| Stage 3 메모리 배치 | — | **★ 주소 배정 + spill/remat** |
+| Stage 4 codegen | Dialect Conversion 틀 | **★ ISA 인코딩** |
+| 도구 | `PassManager`, `lit`, `FileCheck`, `npu-opt` 템플릿 | 없음 |
 
 ★ 세 개가 실제 작업량이다. 나머지는 상용 인프라를 조립한다.
 
@@ -159,23 +159,23 @@ program.mem        코어 ISA 워드의 텍스트 진단 출력
 표준 다이얼렉트를 최대한 오래 유지하고, **표준으로 표현 못 하는 것만** 우리 것으로.
 
 ```
-0~2막   linalg + tensor + scf + arith    ← 표준만
-3막     memref (memory space 부착)        ← 표준 버퍼화
-4막     plena + memref                    ← 여기서 처음 우리 다이얼렉트
-4막 끝  plena.program
+Stage 0~2   linalg + tensor + scf + arith    ← 표준만
+Stage 3     memref (memory space 부착)        ← 표준 버퍼화
+Stage 4     npu + memref                    ← 여기서 처음 우리 다이얼렉트
+Stage 4 끝  npu.program
 ```
 
-**다이얼렉트는 하나(`plena`). op 개수는 고정하지 않는다.** 아래 여섯은 기본 연산이며,
+**다이얼렉트는 하나(`npu`). op 개수는 고정하지 않는다.** 아래 여섯은 기본 연산이며,
 VPU·제어 명령 표현을 추가한다. 명령 생성 뒤에도 검증 가능한 타깃 IR을 남긴다.
 
 | op | 의미 |
 |---|---|
-| `plena.mma` | 누산기 += A×B |
-| `plena.writeout` | 누산기를 L1으로 꺼내고 **비운다** |
-| `plena.dma` | 계층 간 전송 |
-| `plena.core_block` | 코어 블록 경계 |
-| `plena.wait` | 자원 동기화 |
-| `plena.program` | 최종 워드 스트림 |
+| `npu.mma` | 누산기 += A×B |
+| `npu.writeout` | 누산기를 L1으로 꺼내고 **비운다** |
+| `npu.dma` | 계층 간 전송 |
+| `npu.core_block` | 코어 블록 경계 |
+| `npu.wait` | 자원 동기화 |
+| `npu.program` | 최종 워드 스트림 |
 
 층 구분은 다이얼렉트가 아니라 **단계 검사기**가 한다.
 
@@ -205,14 +205,14 @@ v2는 이 도장을 찍지 않아 표준 버퍼화가 전부 space 0으로 만�
 
 ## 6. 각 막
 
-### 0막 · 꺼내기 (Python)
+### Stage 0 · 꺼내기 (Python)
 
 모델에서 계산 그래프를 꺼낸다. **IR 텍스트를 손으로 만들지 않는다.**
 
 1. **파라미터 외부화** — `functional_call`로 등록 없이 호출해 가중치를 함수 인자로
    뺀다. 안 하면 8B 모델 IR이 16GB가 된다.
 2. **`@prefill` / `@decode` 래퍼** — 시그니처가 다르다(decode는 KV 캐시·위치·유효 길이를 받고
-   갱신본을 낸다). 여기서 갈라두면 1~4막 어느 패스도 모드를 몰라도 된다.
+   갱신본을 낸다). 여기서 갈라두면 Stage 1~4 어느 패스도 모드를 몰라도 된다.
 3. **`torch.export` → torch-mlir → linalg** — 분해를 **켠다**. 패턴을 안 보므로
    linalg로 받는 게 낫다.
 4. **가중치 파일 + 심볼 테이블**.
@@ -225,12 +225,12 @@ v2는 이 도장을 찍지 않아 표준 버퍼화가 전부 space 0으로 만�
 | `Could not find state mapping for buffer` | RoPE `inv_freq`가 비영속 버퍼 | export 전 `_non_persistent_buffers_set` 비우기 |
 | `failed to legalize torch.aten.diff` | transformers 5.x `create_causal_mask` | 4D 덧셈 마스크를 미리 만들어 넘김 |
 
-**0막 결과를 파일로 저장하므로, 이후 컴파일러 개발 중에는 PyTorch를 띄우지 않는다.**
+**Stage 0 결과를 파일로 저장하므로, 이후 컴파일러 개발 중에는 PyTorch를 띄우지 않는다.**
 
-### 1막 · 읽기 — "할 수 있나?"
+### Stage 1 · 읽기 — "할 수 있나?"
 
 `canonicalize`, `cse` (표준) → **표현 가능성 검사** → **메모리 요구량 분석**.
-융합 전에 L2 예산을 확정하지 않는다. 예산 확정은 2막의 그룹 결정 뒤다.
+융합 전에 L2 예산을 확정하지 않는다. 예산 확정은 Stage 2의 그룹 결정 뒤다.
 
 거부 조건은 "패턴을 못 알아봄"이 아니라 "이 기계로 표현 불가능"이다.
 
@@ -255,13 +255,13 @@ L2에 들어가려는 것이 두 종류인데 성격이 다르다.
 
 ```
 L2 8MB
-├── 필수 상주 버퍼 몫 ← 1막 분석 + 2막 그룹 경계로 확정
-└── 스테이징 몫       ← 2막이 이 안에서 타일을 고른다
+├── 필수 상주 버퍼 몫 ← Stage 1 분석 + Stage 2 그룹 경계로 확정
+└── 스테이징 몫       ← Stage 2이 이 안에서 타일을 고른다
 ```
 
 v2는 순서가 반대여서 스테이징 예약이 보수적으로 잡히고 나머지 L2를 못 썼다.
 
-### 2막 · 쪼개기 — "어떻게?" (전부 텐서 레벨)
+### Stage 2 · 쪼개기 — "어떻게?" (전부 텐서 레벨)
 
 **(1) 묶기** — FFN의 gate/up/활성화/곱을 한 덩어리로. 크기는 미정.
 그룹 경계를 먼저 정하고 예산을 확정한다. 실제 타일 생성과 생산자 융합에는
@@ -286,7 +286,7 @@ struct TilingPlan {
 **(3) 타일 루프 생성** — `scf.forall`(코어) + `scf.for`(타일) + 스테이징 복사.
 
 **(4) 더블 버퍼링 구조** — ping/pong 버퍼 도입과 루프 재구조화. **실제 DMA 명령
-삽입은 3막**이다. Hexagon-MLIR이 이 둘을 나눈 것과 같다: 루프 변환은 텐서에서
+삽입은 Stage 3**이다. Hexagon-MLIR이 이 둘을 나눈 것과 같다: 루프 변환은 텐서에서
 안전하고, DMA는 주소가 필요하다.
 
 #### 하드웨어가 걸러내는 것
@@ -301,7 +301,7 @@ writeout 후 VPU 덧셈으로 표현할 수 있지만, 지원 dtype과 중간 �
 writeout 후 VPU로 더하는 방법뿐이며, 수치 계약을 먼저 검증한 후보만 비용 비교한다.
 부분합 스케줄은 부분 K 구간의 중복·누락과 writeout마다 누산기 비움을 별도로 검사한다.
 
-### 3막 · 놓기 — "어디에?" (memref로 내려감)
+### Stage 3 · 놓기 — "어디에?" (memref로 내려감)
 
 **(1) 버퍼화** — `one-shot-bufferize` + memory space 배정 규칙.
 
@@ -322,16 +322,16 @@ writeout 후 VPU로 더하는 방법뿐이며, 수치 계약을 먼저 검증한
 스테이징 버퍼와 그래프 버퍼를 **같은 allocator**가 다룬다. v2가 둘을 분리해
 L2를 놀린 지점이다.
 
-**(3) DMA 명령 삽입** — 2막이 만든 ping/pong 구조에 실제 전송을 채운다.
+**(3) DMA 명령 삽입** — Stage 2이 만든 ping/pong 구조에 실제 전송을 채운다.
 
-### 4막 · 적기 — "어떤 명령?"
+### Stage 4 · 적기 — "어떤 명령?"
 
-1. 루프 전개 + `plena` 명령 생성
+1. 루프 전개 + `npu` 명령 생성
 2. **블록 의존 그리기** — 런너는 프로그램 순서를 지키지 않는다. 계산 블록과 전송
    블록이 따로 돈다. 같은 코어의 블록은 순서를 유지하고, 다른 자원 사이에는
    버퍼 구간의 RAW/WAR/WAW 의존성을 연결한다. 모든 블록을 직렬화하지 않는다.
    비동기 버퍼 생존은 발행이 아니라 완료 이벤트까지다.
-3. 패키징 — 0막에서 **이름**으로만 적어둔 가중치가 여기서 주소를 받는다(링커 역할).
+3. 패키징 — Stage 0에서 **이름**으로만 적어둔 가중치가 여기서 주소를 받는다(링커 역할).
 
 ---
 
@@ -339,10 +339,10 @@ L2를 놀린 지점이다.
 
 | 막 뒤 | 검사 |
 |---|---|
-| 1막 | 타깃 명령·물리 주소 부재 / 지원·수치 계약 검사 / 메모리 분석 정보 |
-| 2막 | 코어별 누산기 하나 / 일반·부분합 스케줄별 K 커버리지 / 메모리 요구 계약 |
-| 3막 | 주소·용량·정렬 / 동시 live 구간 비중첩 / 비동기 완료까지 생존 / 계획 대비 추가 복사 |
-| 4막 | 미변환 실행 region 부재 / 인코딩 왕복 / 자원·메모리 의존성 / CORE 경계에서 빈 누산기 |
+| Stage 1 | 타깃 명령·물리 주소 부재 / 지원·수치 계약 검사 / 메모리 분석 정보 |
+| Stage 2 | 코어별 누산기 하나 / 일반·부분합 스케줄별 K 커버리지 / 메모리 요구 계약 |
+| Stage 3 | 주소·용량·정렬 / 동시 live 구간 비중첩 / 비동기 완료까지 생존 / 계획 대비 추가 복사 |
+| Stage 4 | 미변환 실행 region 부재 / 인코딩 왕복 / 자원·메모리 의존성 / CORE 경계에서 빈 누산기 |
 
 버그가 **생긴 자리에서** 잡힌다.
 
@@ -381,7 +381,7 @@ M=1이라 시스톨릭 배열 효율이 1/32로 떨어진다. 하드웨어 구�
 압도하므로, 탐색기가 자동으로 DRAM 트래픽을 줄이는 계획을 고른다. 목적 함수를
 바꾸는 게 아니라 지배항이 바뀔 뿐이다.
 
-이것이 prefill/decode를 **0막에서 두 함수로 갈라놓는** 또 하나의 이유다.
+이것이 prefill/decode를 **Stage 0에서 두 함수로 갈라놓는** 또 하나의 이유다.
 
 ### 8.3 KV 캐시
 
@@ -417,13 +417,13 @@ M=1이라 시스톨릭 배열 효율이 1/32로 떨어진다. 하드웨어 구�
 
 | 도구 | 역할 |
 |---|---|
-| `plena-opt` | IR in → IR out. 패스 임의 조합 |
-| `plena-compile` | 모델/IR in → Unified Program v5 패키지 out |
-| `plena-asm` | 어셈블리 ↔ 바이너리 |
+| `npu-opt` | IR in → IR out. 패스 임의 조합 |
+| `npu-compile` | 모델/IR in → Unified Program v5 패키지 out |
+| `npu-asm` | 어셈블리 ↔ 바이너리 |
 
 ```sh
-plena-opt 01-legal.mlir --select-strategy --explain   # 계획서만 보기
-plena-opt 02-tiled.mlir --bufferize --place           # 3막만 다시
+npu-opt 01-legal.mlir --select-strategy --explain   # 계획서만 보기
+npu-opt 02-tiled.mlir --bufferize --place           # Stage 3만 다시
 ```
 
 ---
@@ -432,14 +432,14 @@ plena-opt 02-tiled.mlir --bufferize --place           # 3막만 다시
 
 ```
 LLM_Compiler/
-├── include/plena/
+├── include/npu/
 │   ├── Target/        MLIR 없이 동작. ISA, 인코딩, HardwareConfig
-│   ├── Dialect/       plena (타깃 의미에 따라 op 추가)
+│   ├── Dialect/       npu (타깃 의미에 따라 op 추가)
 │   ├── Analysis/      CostModel, Lifetime, Budget
 │   └── Transforms/    막별 패스
 ├── lib/
-├── python/plena/capture/   torch.export만. IR 생성 없음
-├── tools/plena-opt, plena-compile, plena-asm
+├── python/npu/capture/   torch.export만. IR 생성 없음
+├── tools/npu-opt, npu-compile, npu-asm
 ├── test/              lit + FileCheck
 ├── unittests/         gtest
 └── docs/
@@ -457,12 +457,12 @@ LLM_Compiler/
 
 | # | 넓히는 것 | 완료 기준 |
 |---|---|---|
-| S0 | 인프라 | `plena-opt`가 빈 함수를 왕복 |
-| S1 | 4막만 | 손으로 쓴 32×32 행렬곱이 시뮬레이터에서 정답 |
-| S2 | + 2막 | 1024×576×1536이 정답 |
-| S3 | + 3막 | L1이 모자란 크기에서도 정답 |
-| S4 | + 1막 | 일반 커널(RMSNorm이 linalg인 채로) 정답 |
-| S5 | + 0막 | SmolLM2-135M **1층 prefill** 정답 |
+| S0 | 인프라 | `npu-opt`가 빈 함수를 왕복 |
+| S1 | Stage 4만 | 손으로 쓴 32×32 행렬곱이 시뮬레이터에서 정답 |
+| S2 | + Stage 2 | 1024×576×1536이 정답 |
+| S3 | + Stage 3 | L1이 모자란 크기에서도 정답 |
+| S4 | + Stage 1 | 일반 커널(RMSNorm이 linalg인 채로) 정답 |
+| S5 | + Stage 0 | SmolLM2-135M **1층 prefill** 정답 |
 | S6 | 넓히기 | 30층 → decode |
 | S7 | (선택) | 프로파일이 벡터 병목을 가리키면 패턴 최적화 |
 
@@ -527,7 +527,7 @@ v2는 메모리 공간을 타입에 안 박아 백엔드가 2-pass가 됐고, v1
 
 LLVM이 `-fno-exceptions`로 빌드되어 있으므로 `Target/` 층은 예외 대신 결과 구조체를
 반환한다. 다이얼렉트 헤더에 `mlir/Bytecode/BytecodeOpInterface.h`가 필수다.
-`Target/`의 `::plena`와 다이얼렉트의 `::mlir::plena`가 `using namespace mlir;` 아래서
+`Target/`의 `::npu`와 다이얼렉트의 `::mlir::npu`가 `using namespace mlir;` 아래서
 모호해지므로 완전 한정이 필요하다.
 
 ---
@@ -577,16 +577,16 @@ DRAM↔L2는 Unified Program v5의 GDMA 레코드, L2↔L1은 `L2_LOAD/STORE`다
 |---|---|
 | 표준 파이프라인 순서(fuse→tile→bufferize) | Hexagon-MLIR, MiniNPU, XLA, IREE, TVM이 모두 같음 |
 | 텐서 레벨에 최대한 오래 머문다 | 텐서는 SSA라 변환이 안전. Hexagon은 더블버퍼링까지 텐서에서 |
-| 더블버퍼링을 구조 변환(2막)과 DMA 삽입(3막)으로 분리 | 루프 변환은 주소가 필요 없고, DMA는 필요함 |
+| 더블버퍼링을 구조 변환(Stage 2)과 DMA 삽입(Stage 3)으로 분리 | 루프 변환은 주소가 필요 없고, DMA는 필요함 |
 | 패턴 인식 대신 일반 커널을 기본으로 | 일반 컴파일러에서 패턴은 최적화이지 정확성 전제가 아님 |
 | 다이얼렉트 1개, op 수 유동 | VPU·제어 lowering도 검증 가능한 형태로 표현 |
 | 메모리 공간을 타입에 | v2가 안 해서 백엔드 2-pass 해킹 발생 |
 | spill을 배치 패스 안에 | 배치해봐야 모자란지 알 수 있음. v1은 밖으로 빼서 두 번 호출 |
 | 타일 탐색을 IR 변환과 분리 | 계획서만 비교·강제할 수 있어야 함 |
 | 융합 그룹 결정 후 L2 예산 확정 | 중간 텐서 실체화와 타일 가용량을 함께 반영 |
-| prefill/decode를 0막에서 분리 | 시그니처가 다름. 이후 패스가 모드를 몰라도 됨 |
+| prefill/decode를 Stage 0에서 분리 | 시그니처가 다름. 이후 패스가 모드를 몰라도 됨 |
 | 막마다 검사, 저장·재파싱은 디버그 옵션 | 단계 재시작과 대형 IR 입출력 비용 절감 양립 |
-| 4막부터 구현 | 하드웨어 제약이 앞쪽 설계를 결정 |
+| Stage 4부터 구현 | 하드웨어 제약이 앞쪽 설계를 결정 |
 | 단순 기본값으로 시작하고 슬라이스로 푼다 | 정책은 나중에 넣어도 공짜, 구조·순서·타입은 재작성. v1·v2·NPU-compiler가 후자에서 다침 |
 
 ---
@@ -596,7 +596,7 @@ DRAM↔L2는 Unified Program v5의 GDMA 레코드, L2↔L1은 `L2_LOAD/STORE`다
 **목표:** 아래 한 줄이 도는 것.
 
 ```sh
-echo 'func.func @f() { return }' | ./build/bin/plena-opt
+echo 'func.func @f() { return }' | ./build/bin/npu-opt
 ```
 
 **체크리스트**
@@ -607,16 +607,16 @@ echo 'func.func @f() { return }' | ./build/bin/plena-opt
     -DMLIR_DIR=/home/jjh4777/third_party/torch-mlir/build-llvm/lib/cmake/mlir \
     -DLLVM_DIR=/home/jjh4777/third_party/torch-mlir/build-llvm/lib/cmake/llvm
   ```
-- [x] `include/plena/Dialect/PlenaDialect.td` — 다이얼렉트 등록만. op은 나중
-- [x] `lib/Dialect/PlenaDialect.cpp`
-- [x] `tools/plena-opt/plena-opt.cpp` — `MlirOptMain` 호출
+- [x] `include/npu/Dialect/NPUDialect.td` — 다이얼렉트 등록만. op은 나중
+- [x] `lib/Dialect/NPUDialect.cpp`
+- [x] `tools/npu-opt/npu-opt.cpp` — `MlirOptMain` 호출
 - [x] `test/lit.cfg.py`, `test/CMakeLists.txt` — lit + FileCheck
 - [x] `test/roundtrip.mlir` — 빈 함수 왕복 테스트
 - [x] `.gitignore` — `build/`
 
 **S0에서 하지 않는 것:** op 정의, 패스, Python. 빌드가 서는 것만 확인한다.
 
-**S1도 완료:** `Target/` ISA 인코더·`plena-asm`, Unified Program v5 패키징,
+**S1도 완료:** `Target/` ISA 인코더·`npu-asm`, Unified Program v5 패키징,
 타깃 IR 인코딩과 32×32 시뮬레이터 정답 비교를 구현했다. 전체 구현 여부는
 [IMPLEMENTATION.md](IMPLEMENTATION.md)의 슬라이스별 상태를 기준으로 한다.
 
@@ -626,7 +626,7 @@ echo 'func.func @f() { return }' | ./build/bin/plena-opt
 
 - Hexagon-MLIR: An AI Compilation Stack For Qualcomm's NPUs — arxiv.org/html/2602.19762v1
 - mininpu-compiler — github.com/fuxiangdu/mininpu-compiler
-- kimjongjip/NPU-compiler — 같은 PLENA 타깃의 외부 구현
+- kimjongjip/NPU-compiler — 같은 NPU 타깃의 외부 구현
 - `~/LLM_Compiler` (v1), `~/LLM_Compiler_v2` (v2)
 
 ## 17. 구현 계약 보완 (2026-09-17)
@@ -635,13 +635,13 @@ echo 'func.func @f() { return }' | ./build/bin/plena-opt
   판정한다. reduction의 projected output map은 identity가 아니어도 허용한다.
 - 표현 가능성 진단은 “하드웨어 불가능”, “현재 lowering 미구현”, “수치 계약 불일치”를
   구분한다. 구현하지 않은 연산을 단순히 검사 통과시키지 않는다.
-- 1막은 메모리 요구를 분석하고, 그룹 경계 선택 후 예산·타일·버퍼 요구를 계획한다.
-  3막 배치 실패 시 명시된 후보 목록에서 최대 3개를 시도하고 실패 원인을 보고한다.
+- Stage 1은 메모리 요구를 분석하고, 그룹 경계 선택 후 예산·타일·버퍼 요구를 계획한다.
+  Stage 3 배치 실패 시 명시된 후보 목록에서 최대 3개를 시도하고 실패 원인을 보고한다.
   무제한 되돌림은 하지 않는다. 선택 전 후보 비교와 확정된 IR 재변환을 구분한다.
 - 계층별 주소뿐 아니라 core 소유권·alignment·allocation 크기·비동기 완료 시점·
   재계산 가능 여부가 버퍼 계약이다. accumulator는 일반 load/store 가능한 memref로
   취급하지 않고 전용 상태로 검증한다.
-- VPU/제어 명령은 타깃 단계에서 ISA 스키마를 검증하는 `plena.instruction`으로
+- VPU/제어 명령은 타깃 단계에서 ISA 스키마를 검증하는 `npu.instruction`으로
   표현할 수 있다. 고수준 scalar semantics는 lowering 전까지 arith/math에 남긴다.
 - ABI는 weights 심볼, 입력/출력 shape와 dtype, 캐시 alias 및 수치 정책을 버전과 함께
   기록한다. “모델별 코드 없음”은 지원하는 캡처 ABI와 연산 집합 내에서의 목표다.

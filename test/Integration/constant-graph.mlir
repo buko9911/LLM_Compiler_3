@@ -1,5 +1,5 @@
 // A constant tensor. The ISA has no way to write a register into memory, so the
-// compiler cannot build one at runtime: 1막 hoists it to an entry argument and
+// compiler cannot build one at runtime: Stage 1 hoists it to an entry argument and
 // metadata.json carries its bytes for whoever assembles the image.
 func.func @main(%a: tensor<32x32xf16>) -> tensor<32x32xf16> {
   %two = arith.constant dense<2.0> : tensor<32x32xf16>

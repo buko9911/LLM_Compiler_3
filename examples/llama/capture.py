@@ -3,7 +3,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python"))
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
-from plena.capture import capture
+from npu.capture import capture
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B")

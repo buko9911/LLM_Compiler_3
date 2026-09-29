@@ -3,10 +3,10 @@
 NPU_Simulator main (ISA ver 1.0) dumps each core's L1 and the shared L2 but not
 DRAM, so an output is read from ``l2_sram_dump.bin``:
 
-* a compiled graph asks for this with ``plena-compile --readback``; the
+* a compiled graph asks for this with ``npu-compile --readback``; the
   compiler appends GDMA loads that copy every output from DRAM into an L2
   window and records it as ``outputs[].readback_l2_address`` in metadata.json;
-* hand-written target IR ends with the same kind of ``plena.dma`` load itself
+* hand-written target IR ends with the same kind of ``npu.dma`` load itself
   and the caller passes the L2 address it chose.
 """
 import json

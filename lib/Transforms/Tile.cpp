@@ -1,17 +1,17 @@
 //===----------------------------------------------------------------------===//
-// Tile.cpp — 2막 — 타일 계획을 고르고 타일 루프를 세운다
+// Tile.cpp — Stage 2 — 타일 계획을 고르고 타일 루프를 세운다
 //===----------------------------------------------------------------------===//
 #include "GraphInternal.h"
 #include <map>
 #include <tuple>
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 //===----------------------------------------------------------------------===//
-// 2막 — 쪼개기
+// Stage 2 — 쪼개기
 //
 // 큰 행렬곱 하나를 타일 루프 중첩으로 바꾼다. 전부 텐서 레벨에서 일어나고,
-// memref 와 주소는 3막이 붙인다.
+// memref 와 주소는 Stage 3이 붙인다.
 //===----------------------------------------------------------------------===//
 namespace {
 
@@ -44,7 +44,7 @@ FailureOr<linalg::MatmulOp> tile(IRRewriter &r, linalg::MatmulOp mm, ArrayRef<in
 }
 
 /// 메모리 공간을 지정한 텐서 자리를 잡는다. space 1 = L2, 2 = L1.
-/// 이 공간 표시가 3막에서 memref 타입에 박히고, 그것으로 주소가 정해진다.
+/// 이 공간 표시가 Stage 3에서 memref 타입에 박히고, 그것으로 주소가 정해진다.
 Value allocTensor(IRRewriter &r, Location loc, RankedTensorType type, unsigned space) {
   return r.create<bufferization::AllocTensorOp>(loc, type, ValueRange{}, Value{},
                                                 r.getI64IntegerAttr(space));
@@ -60,7 +60,7 @@ Value copyTensor(IRRewriter &r, Location loc, Value src, Value dst) {
 ///
 /// 자르기만 해서는 조각이 어디 있는지 정해지지 않는다. 여기서 "이 조각을
 /// space 로 복사해 온 뒤 거기서 계산하라"는 alloc + copy 를 끼워 넣는다.
-/// 3막 버퍼화가 그 alloc 을 실제 버퍼로 만들고 주소를 배정한다.
+/// Stage 3 버퍼화가 그 alloc 을 실제 버퍼로 만들고 주소를 배정한다.
 LogicalResult promote(IRRewriter &r, linalg::MatmulOp mm, unsigned space, bool inputs,
                       bool output) {
   r.setInsertionPoint(mm);
@@ -89,12 +89,12 @@ LogicalResult promote(IRRewriter &r, linalg::MatmulOp mm, unsigned space, bool i
     Value buffer = allocTensor(r, mm.getLoc(), destType, space);
 
     // 새로 잡은 자리에는 allocator 가 남긴 값이 들어 있다. 누산기는 0 에서
-    // 시작해야 하므로 명시적으로 채운다. plena.tile_zero 표시는 뒤 단계가
+    // 시작해야 하므로 명시적으로 채운다. npu.tile_zero 표시는 뒤 단계가
     // "이 fill 은 타일 초기화"임을 알아보는 데 쓴다.
     auto zero = r.create<arith::ConstantOp>(mm.getLoc(),
                                             r.getFloatAttr(destType.getElementType(), 0));
     auto filled = r.create<linalg::FillOp>(mm.getLoc(), ValueRange{zero}, ValueRange{buffer});
-    filled->setAttr("plena.tile_zero", r.getUnitAttr());
+    filled->setAttr("npu.tile_zero", r.getUnitAttr());
     mm.getDpsInitOperand(0)->set(filled.getResult(0));
 
     // 계산이 끝난 뒤 원래 자리로 되돌린다. replaceAllUsesExcept 로 방금 만든
@@ -156,12 +156,12 @@ bool hoistStaging(IRRewriter &r, scf::ForOp loop, Value value) {
 // 코어 분할이 경계다 — L1 은 코어마다 따로이므로 각 코어가 자기 사본을 올려야 한다.
 LogicalResult hoistActivations(ModuleOp m, IRRewriter &r) {
   SmallVector<Operation *> staged;
-  m.walk([&](Operation *op) { if (op->hasAttr("plena.stage_activation")) staged.push_back(op); });
+  m.walk([&](Operation *op) { if (op->hasAttr("npu.stage_activation")) staged.push_back(op); });
   for (auto *op : staged) {
     while (auto loop = op->getParentOfType<scf::ForOp>()) {
-      if (loop->hasAttr("plena.core_split") || !hoistStaging(r,loop,op->getResult(0))) break;
+      if (loop->hasAttr("npu.core_split") || !hoistStaging(r,loop,op->getResult(0))) break;
     }
-    op->removeAttr("plena.stage_activation");
+    op->removeAttr("npu.stage_activation");
   }
   return success();
 }
@@ -230,7 +230,7 @@ LogicalResult tileReduction(IRRewriter &r, linalg::GenericOp gen, const Hardware
   explanations.push_back(r.getStringAttr("Reduction rows L2=" + std::to_string(panel) +
                                          " L1=" + std::to_string(tileRows) +
                                          " cols=" + std::to_string(cols)));
-  gen->setAttr("plena.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
+  gen->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
   auto outer = tileElementwise(r,gen,panel);
   if (failed(outer) || failed(promoteElementwise(r,*outer,1))) return failure();
   auto inner = tileElementwise(r,*outer,tileRows);
@@ -251,7 +251,7 @@ LogicalResult tileElementwiseGraph(ModuleOp m, const HardwareConfig &hw, IRRewri
       // 스칼라 슬롯 하나가 레인 하나를 담으므로 타일은 원소 하나다. 남아 있는
       // 단위 차원이 있어도 마찬가지다.
       explanations.push_back(r.getStringAttr("Scalar lane elements=" + std::to_string(lane.getDimSize(0))));
-      gen->setAttr("plena.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
+      gen->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
       auto outer = tileElementwise(r,gen,lane.getDimSize(0));
       if (failed(outer) || failed(promoteElementwise(r,*outer,1))) return failure();
       auto inner = tileElementwise(r,*outer,1);
@@ -280,7 +280,7 @@ LogicalResult tileElementwiseGraph(ModuleOp m, const HardwareConfig &hw, IRRewri
     explanations.push_back(r.getStringAttr("Elementwise rows L2=" + std::to_string(panel) +
                                            " L1=" + std::to_string(tileRows) +
                                            " cols=" + std::to_string(cols)));
-    gen->setAttr("plena.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
+    gen->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
     auto outer = tileElementwise(r,gen,panel);
     if (failed(outer) || failed(promoteElementwise(r,*outer,1))) return failure();
     auto inner = tileElementwise(r,*outer,tileRows);
@@ -305,7 +305,7 @@ LogicalResult tileTransposes(ModuleOp m, IRRewriter &r, SmallVectorImpl<Attribut
     for (; cols > 1 && type.getDimSize(1) % cols; --cols) {}
     explanations.push_back(r.getStringAttr("Transpose tile " + std::to_string(rows) + "x" +
                                            std::to_string(cols)));
-    t->setAttr("plena.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
+    t->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
     scf::SCFTilingOptions options;
     options.setTileSizes({r.getIndexAttr(rows), r.getIndexAttr(cols)});
     auto tiled = scf::tileUsingSCF(r, cast<TilingInterface>(t.getOperation()), options);
@@ -379,13 +379,13 @@ LogicalResult packWeightPanels(OpBuilder &b, linalg::MatmulOp mm, uint64_t panel
       reachable.push_back(user->getResult(0));
     }
   auto function = cast<func::FuncOp>(arg.getOwner()->getParentOp());
-  if (function.getArgAttr(arg.getArgNumber(),"plena.packed_panel")) return success();
-  function.setArgAttr(arg.getArgNumber(),"plena.packed_panel",b.getI64IntegerAttr(panel));
+  if (function.getArgAttr(arg.getArgNumber(),"npu.packed_panel")) return success();
+  function.setArgAttr(arg.getArgNumber(),"npu.packed_panel",b.getI64IntegerAttr(panel));
   return success();
 }
 } // namespace
 
-/// 2막 — 타일 계획을 고르고 타일 루프를 세운다.
+/// Stage 2 — 타일 계획을 고르고 타일 루프를 세운다.
 ///
 /// L2 패널 → 코어 구간 → L1 패널 → 배열 → K 조각 순으로 타일링한다.
 /// 전체 K가 L1에 들어가면 L1 패널의 입력을 여러 배열 타일에서 재사용한다.
@@ -442,10 +442,10 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     }
     const auto &p = found->second;
 
-    // 고른 계획을 사람이 읽을 문자열로 남긴다 — 단계 파일의 plena.plans.
+    // 고른 계획을 사람이 읽을 문자열로 남긴다 — 단계 파일의 npu.plans.
     explanations.push_back(r.getStringAttr(describe(p)));
     // 이 첫 텐서 조각에서는 융합 그룹 경계가 곧 op 하나다.
-    mm->setAttr("plena.fusion_group", r.getI64IntegerAttr(explanations.size() - 1));
+    mm->setAttr("npu.fusion_group", r.getI64IntegerAttr(explanations.size() - 1));
 
     // 원래 누산기 자리를 빈 텐서로 갈아 끼운다. 타일마다 자기 누산기를
     // 새로 잡을 것이므로 여기 있던 0 채움은 더 이상 쓰이지 않는다.
@@ -474,7 +474,7 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     if (failed(group)) return failure();
     if (lane != p.l2.n)
       if (auto independent = (*group)->getParentOfType<scf::ForOp>())
-        independent->setAttr("plena.core_split", r.getUnitAttr());
+        independent->setAttr("npu.core_split", r.getUnitAttr());
 
     // Full-K L1 panels reuse both operands across several array tiles. Never
     // move a K loop outside these tiles: the machine has one accumulator.
@@ -490,19 +490,19 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     // ── ④ K 조각: 누적 축을 나눈다 ──────────────────────────────────
     auto chunk = tile(r, *array, {0, 0, int64_t(p.l1.k)});
     if (failed(chunk) || (!residentPanel && failed(promote(r, *chunk, 2, true, false)))) return failure();
-    (*chunk)->setAttr("plena.accumulate", r.getUnitAttr());
+    (*chunk)->setAttr("npu.accumulate", r.getUnitAttr());
     if (!residentPanel) {
       if (auto *weight = (*chunk).getDpsInputOperand(1)->get().getDefiningOp())
-        weight->setAttr("plena.prefetch_weight",r.getUnitAttr());
+        weight->setAttr("npu.prefetch_weight",r.getUnitAttr());
       // 활성값은 타일이 어느 열에 쓰는지와 무관하다. 그래서 타일마다 올리면 같은
       // 바이트를 타일 수만큼 L2 에서 다시 읽게 된다. 코어당 한 번이면 충분하고,
       // 코어가 맡은 열 구간이 정확히 그 범위다.
       if (auto *activation = (*chunk).getDpsInputOperand(0)->get().getDefiningOp()) {
-        activation->setAttr("plena.stage_activation",r.getUnitAttr());
+        activation->setAttr("npu.stage_activation",r.getUnitAttr());
         // 패널 안의 재사용은 hoist가 처리한다. 전체 K 활성값이 N 패널 사이에서
         // 반복될 때만 별도 L1 캐시를 사용한다.
         if (request.shape.m <= 32 && p.l1.k == request.shape.k && p.l2.n < request.shape.n)
-          activation->setAttr("plena.cache_activation",r.getUnitAttr());
+          activation->setAttr("npu.cache_activation",r.getUnitAttr());
       }
     }
     // 패널 루프를 스테이지 수만큼 펼치는 것이 곧 스테이징을 그 수만큼 존재하게
@@ -517,8 +517,8 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
   // generic 은 행렬곱 타일링이 끝난 뒤에 모은다. 그래야 그 피연산자가 교체되어
   // 사라진 값이 아니라 잘린 결과를 가리킨다.
   if (failed(tileElementwiseGraph(m,hw,r,explanations))) return failure();
-  m->setAttr("plena.plans",r.getArrayAttr(explanations));
-  m->setAttr("plena.stage",r.getStringAttr("tiled"));
+  m->setAttr("npu.plans",r.getArrayAttr(explanations));
+  m->setAttr("npu.stage",r.getStringAttr("tiled"));
   return cleanIR(m);
 }
-} // namespace plena
+} // namespace npu

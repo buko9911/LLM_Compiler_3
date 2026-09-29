@@ -1,7 +1,7 @@
-#include "plena/Analysis/MemoryPlan.h"
+#include "npu/Analysis/MemoryPlan.h"
 #include <gtest/gtest.h>
 namespace {
-using namespace plena;
+using namespace npu;
 BufferRequirement buffer(const char *name, uint64_t begin, uint64_t end) {
   BufferRequirement r; r.name = name; r.bytes = 64; r.begin = begin; r.end = end; return r;
 }

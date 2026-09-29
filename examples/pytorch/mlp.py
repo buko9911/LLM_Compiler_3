@@ -2,8 +2,8 @@
 
 The whole flow on one small model:
 
-  0막  plena.capture      torch.export + torch-mlir -> linalg IR, weights as bytes
-  1-5막 plena-compile      linalg IR -> program.bin / system.json / hbm.bin
+  Stage 0  npu.capture      torch.export + torch-mlir -> linalg IR, weights as bytes
+  Stage 1-5 npu-compile      linalg IR -> program.bin / system.json / hbm.bin
        NPU_Simulator      runs the package; the output is read from its L2 dump
 
 The model is Linear -> ReLU -> Linear with biases, so the program exercises the
@@ -22,13 +22,13 @@ sys.path.insert(0, str(ROOT / "python"))
 sys.path.insert(0, str(ROOT / "test/Integration"))
 import numpy as np
 import torch
-from plena.capture import capture
+from npu.capture import capture
 import harness
 
 SIMULATOR = Path.home() / "NPU_Simulator"
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", type=Path, required=True)
-ap.add_argument("--compiler", default=str(ROOT / "build/bin/plena-compile"))
+ap.add_argument("--compiler", default=str(ROOT / "build/bin/npu-compile"))
 ap.add_argument("--emulator", default=str(SIMULATOR / "transactional_emulator/target/release/transactional_emulator"))
 ap.add_argument("--settings", default=str(SIMULATOR / "plena_settings.toml"))
 ap.add_argument("--rows", type=int, default=32, help="tokens (rows of the input)")
@@ -60,13 +60,13 @@ with torch.no_grad():
     expected = model.float()(x.float()).numpy()
 model = model.to(torch.float16)
 
-# 0막
+# Stage 0
 captured = capture(model, (x,))
 source = out / "capture"
 captured.write(source)
 (source / "arg0.bin").write_bytes(x.contiguous().numpy().tobytes())
 
-# 1-5막
+# Stage 1-5
 package = out / "package"
 subprocess.run([a.compiler, "--from=graph", str(source / "00-imported.mlir"),
                 "--settings", str(settings), "-o", str(package), "--fp16", "--readback",

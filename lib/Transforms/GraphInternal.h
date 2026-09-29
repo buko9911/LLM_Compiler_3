@@ -1,17 +1,17 @@
 //===----------------------------------------------------------------------===//
-// GraphInternal.h — 1막·2막이 공유하는 인클루드와 헬퍼
+// GraphInternal.h — Stage 1·2이 공유하는 인클루드와 헬퍼
 //
 // lib/Transforms 안에서만 쓰는 내부 헤더다. 공개 API 는 Pipeline.h 다.
 //
 // 아래 넷은 파일 경계를 넘나들어 anonymous namespace 에 둘 수 없었다.
 // 정의는 Pipeline.cpp 에 모여 있다.
 //===----------------------------------------------------------------------===//
-#ifndef PLENA_LIB_TRANSFORMS_GRAPHINTERNAL_H
-#define PLENA_LIB_TRANSFORMS_GRAPHINTERNAL_H
+#ifndef NPU_LIB_TRANSFORMS_GRAPHINTERNAL_H
+#define NPU_LIB_TRANSFORMS_GRAPHINTERNAL_H
 
-#include "plena/Transforms/Pipeline.h"
-#include "plena/Analysis/TilingPlan.h"
-#include "plena/Dialect/PlenaDialect.h"
+#include "npu/Transforms/Pipeline.h"
+#include "npu/Analysis/TilingPlan.h"
+#include "npu/Dialect/NPUDialect.h"
 
 // 다이얼렉트 본체
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
@@ -55,9 +55,9 @@
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 
-namespace plena {
+namespace npu {
 
-/// 1막 전반. legalizeGraph 가 맨 먼저 부른다(Normalize.cpp).
+/// Stage 1 전반. legalizeGraph 가 맨 먼저 부른다(Normalize.cpp).
 mlir::LogicalResult normalizeGraph(mlir::ModuleOp m);
 
 /// 행 벡터인가 — 마지막 축을 줄인 리덕션이 남기는 모양(N 또는 Nx1).
@@ -72,5 +72,5 @@ bool isExactReciprocal(mlir::Operation *op);
 /// 행 리덕션이면 그 V_REDUCE 명령 이름, 아니면 nullptr.
 const char *reductionOf(mlir::linalg::GenericOp gen);
 
-} // namespace plena
+} // namespace npu
 #endif

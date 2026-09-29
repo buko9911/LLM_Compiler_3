@@ -4,7 +4,7 @@
 
 | 범위 | 상태 | 검증 |
 |---|---|---|
-| S0 빌드·다이얼렉트·plena-opt | 완료 | lit 왕복 |
+| S0 빌드·다이얼렉트·npu-opt | 완료 | lit 왕복 |
 | S1 타깃 IR→ISA→실행 패키지 | 완료 | 시뮬레이터 32×32, PyTorch FP32 matmul→FP16 비트 일치 |
 | ISA 인코더·디코더 | 구현 | 시뮬레이터 op.rs 검증 벡터, 전 명령 왕복, 잘못된 인코딩 거부 |
 | 메모리 요구량·배치 분석 | 독립 라이브러리 구현 | 생존·정렬·용량·core별 L1·spill/remat 선택 |
@@ -24,7 +24,7 @@
 | FlashAttention (손으로 쓴 타깃 IR) | 참조 구현 | 조밀 attention 대비 9.8e-05 |
 | FlashAttention (일반 경로 lowering) | **구현** | 조밀 attention 대비 6.3e-05, 전용 op 없음 |
 | S5 디코더 층 (손으로 쓴 그래프) | 구현 | FP32 오라클 대비 상대 1.9e-03 |
-| S5 캡처(0막) | 구현 | `python/plena/capture`, linalg 출력 + 가중치 바이트 |
+| S5 캡처(Stage 0) | 구현 | `python/npu/capture`, linalg 출력 + 가중치 바이트 |
 | S5 캡처 그래프 정규화 | 구현 | PyTorch 층 캡처→컴파일→시뮬레이터, 상대오차 2.7e-04 |
 | S5 실제 Llama-3.1-8B 층 1개 | **구현** | 캡처→컴파일→시뮬레이터, PyTorch 대비 상대 1.3e-03 |
 | S6 멀티코어·L2 더블버퍼·가중치 패널 패킹 | 구현 | 통합 테스트; 실제 모델 성능은 별도 측정 필요 |
@@ -36,7 +36,7 @@
 ISA 테이블의 초기 필드 목록은 v2에서 가져와 현행 시뮬레이터 `op.rs`와 대조했다.
 파서·검증·프로그램 구성은 v3 코드이며, v1/v2 파일을 빌드·런타임에 참조하지 않는다.
 
-`plena-asm`은 코어 ISA 텍스트와 `.mem`을 변환한다. 코어 ISA 인코딩은 전체 등록
+`npu-asm`은 코어 ISA 텍스트와 `.mem`을 변환한다. 코어 ISA 인코딩은 전체 등록
 명령을 지원한다.
 
 **하드웨어 루프를 CORE 패키징이 받는다.** `C_LOOP_BEGIN`은 반복 횟수를 GP 레지스터에서
@@ -60,13 +60,13 @@ ISA로부터 임의 주소를 복원하는 분석은 아직 없으므로, 이 �
 
 ## IR과 재시작
 
-S1은 `plena.instruction`, `plena.core_block`, `plena.dma`, `plena.program`을 사용한다.
+S1은 `npu.instruction`, `npu.core_block`, `npu.dma`, `npu.program`을 사용한다.
 VPU 명령도 ISA 스키마를 통해 검증한다. 더 높은 수준의 MMA·writeout op은 후속
 lowering에서 필요할 때 추가한다. 현재 타깃 IR 입력에는 memref가 없으며,
 공간별 memref 배정은 S3에서 연결한다.
 
-드라이버는 `--from=target`을 명시해야 한다. `plena.stage = "target"`,
-`plena.schema = 1`, cores/L1/L2/DRAM 요구량을 검사한다. `--settings`로 실제
+드라이버는 `--from=target`을 명시해야 한다. `npu.stage = "target"`,
+`npu.schema = 1`, cores/L1/L2/DRAM 요구량을 검사한다. `--settings`로 실제
 하드웨어 용량을 확인하고 전체 설정 파일의 FNV-1a 지문을 중간 IR에 기록한다.
 이 지문은 캐시 무효화 식별자이며 보안 해시가 아니다. 다른 설정의 중간 IR은 거부한다.
 
@@ -76,7 +76,7 @@ S1 진입점인 `03-target.mlir`은 전체 파이프라인의 `03-placed.mlir`�
 
 ## 그래프 경로 (`--from=graph`)
 
-1막~4막을 관통한다. 받는 것은 **`linalg.matmul` 하나와 그 주변뿐**이다 —
+Stage 1~Stage 4을 관통한다. 받는 것은 **`linalg.matmul` 하나와 그 주변뿐**이다 —
 `linalg.fill`, `tensor.empty`, `arith.constant`, `func.func`/`return`. rank-2 정적 FP16,
 C 초기값 0, 함수 하나. 그 밖은 진단과 함께 거부한다. 타일 후보는 축을 나누어떨어뜨려야 한다.
 
@@ -141,7 +141,7 @@ ISA 선택이 같은 표를 쓰므로, 명령이 없는 연산이 통과할 수 
 **알고리즘은 컴파일러가 만들지 않는다.** online softmax 는 reduction 의 결합법칙을
 이용한 재작성이고, 일반 커널 lowering 으로는 나오지 않는다. 패턴 인식으로 표준
 softmax 를 알아보고 바꾸는 것은 v3 가 기본 경로에서 버린 방식이다. 따라서
-**0막이 attention 을 타일링된 online-softmax 루프 형태로 캡처한다.** 1막 이후는 평범한
+**Stage 0이 attention 을 타일링된 online-softmax 루프 형태로 캡처한다.** Stage 1 이후는 평범한
 matmul·리덕션·elementwise 만 보고 FlashAttention 인 줄 모른다.
 
 ### 하드웨어 귀결 — O 누적이 SA 로 안 된다
@@ -173,7 +173,7 @@ FlashAttention 을 고르는 것은 DRAM 트래픽과 이 비용을 맞바꾸는
 
 ### 전용 op 을 만들지 않는다
 
-v1·v2 는 `plena.flash_attention` op 하나와 109 줄짜리 전용 백엔드로 풀었다. v3 는
+v1·v2 는 `npu.flash_attention` op 하나와 109 줄짜리 전용 백엔드로 풀었다. v3 는
 그렇게 하지 않는다 — 0절의 "새 아키텍처를 위해 코드를 추가하지 않는다"와 2.1절의
 "패턴 인식 대신 일반 커널"에 정면으로 어긋나기 때문이다. attention 은 matmul·리덕션·
 elementwise·루프라는 **평범한 연산들**로 들어오고 일반 경로가 낮춘다.
@@ -224,7 +224,7 @@ FP16 최소값 -65504 를 쓴다.
 없는 것은 둘이다.
 
 1. **그래프 수준의 루프 반송 상태** — **구현됨.** `scf.for` 가 텐서 iter_args 를 들고
-   1막~4막을 통과한다(`test/Integration/carry-graph.mlir`, 비트 일치). 다만 lowering 은
+   Stage 1~Stage 4을 통과한다(`test/Integration/carry-graph.mlir`, 비트 일치). 다만 lowering 은
    아직 그 루프를 **전개한다** — 반송 값의 의미는 서지만 루프는 접히지 않는다.
    타깃 층의 하드웨어 루프는
    이제 선다 — `test/Integration/loop32.mlir` 가 32행 리덕션을 81워드로 돌린다(전개판
@@ -254,7 +254,7 @@ FP16 최소값 -65504 를 쓴다.
 
 v2 서술자는 `row_bytes`, `rows`, 그리고 양쪽 stride 를 들고 있다. 한동안 `rows` 를
 리터럴 1 로 박아두고 **행마다 명령을 하나씩** 냈다 — 32×32 타일 하나에 명령 32 개였다.
-`plena.dma` op 도 `bytes` 만 들고 있어서 IR 을 왕복하며 나머지가 사라졌다.
+`npu.dma` op 도 `bytes` 만 들고 있어서 IR 을 왕복하며 나머지가 사라졌다.
 
 | | 이전 | 지금 |
 |---|---|---|
@@ -281,7 +281,7 @@ v1 은 이걸 우회한다 — 프론트엔드가 놓은 유한 상수를 읽어
 빼야 한다. 같은 이유로 마스킹도 뺄셈이 아니라 `V_MAX_SCALAR`/`V_MIN_SCALAR` 로
 [0,0] 클램프한다 — fmax/fmin 의 NaN 규칙이 필요하다.
 
-**상수 텐서는 1막이 진입 인자로 승격한다.** `arith.constant dense<...>` 는 함수 인자가
+**상수 텐서는 Stage 1이 진입 인자로 승격한다.** `arith.constant dense<...>` 는 함수 인자가
 되고, `metadata.json` 의 `constants` 배열이 각 인자에 무엇이 들어가야 하는지
 (index, bytes, base64) 적는다. 이미지를 만드는 쪽이 그걸 채운다 — 컴파일러는 끝까지
 값을 쓰지 않는다.
@@ -321,15 +321,15 @@ region 이 `%out` 을 읽으면 그 타일은 **실행 중인 값을 담고 도�
 같은 원칙이 concat·reshape·slice 로도 이어진다 — 뷰로 두고 전파하다가, 연속 데이터를
 요구하는 소비자의 **타일 경계**에서만 실체화한다.
 
-## 0막 — 캡처는 되고, 정규화가 남았다
+## Stage 0 — 캡처는 되고, 정규화가 남았다
 
-`python/plena/capture` 가 `torch.export` → torch-mlir → linalg 을 돌린다. 파라미터는
+`python/npu/capture` 가 `torch.export` → torch-mlir → linalg 을 돌린다. 파라미터는
 `functional_call` 로 함수 인자로 빠진다 — 등록한 채 내보내면 8B 모델 IR 이 16GB 가 된다.
 RoPE 의 `inv_freq` 가 비영속 버퍼라 export 가 매핑하지 못하므로 미리 비운다.
 결과는 IR 과 `arg<N>.bin` 으로 저장된다.
 
 32×64 디코더 층을 캡처하면 matmul 9, **전치 8**(`nn.Linear` 가 `x @ W.T` 라서),
-generic 25, truncf 10 이 나온다. 그 그래프를 1막이 받으려면 여섯 가지를 정규화해야 했다.
+generic 25, truncf 10 이 나온다. 그 그래프를 Stage 1이 받으려면 여섯 가지를 정규화해야 했다.
 **전부 캡처된 IR 을 처음 먹여보고 나서야 드러났다** — 그 전까지의 테스트는 전부 이
 저장소가 직접 쓴 IR 이었고, 모양을 고르는 쪽과 받는 쪽이 같았다.
 
@@ -381,7 +381,7 @@ seq 32, 4코어 설정, 최대 오차 1.61e-02 / 최대값 12.17 → 상대 1.32
 디코더 층(1.9e-03)과 같은 자리수이고, 원인도 같다. 4096 폭 리덕션이 FP16 을 거친다.
 
 패키지는 program.bin 745KB, 코어 명령 147,720 개, GDMA 명령 2,231 개, L2 요구량
-8,339,456 B, DRAM 419.7 MB 다. `plena.cores` 는 아직 1 로 고정되어 있으므로
+8,339,456 B, DRAM 419.7 MB 다. `npu.cores` 는 아직 1 로 고정되어 있으므로
 `num_cores = 4` 설정으로 컴파일해도 한 코어만 쓴다.
 
 여기까지 오는 데 필요했던 정규화는 전치 접기(`pretransposeWeights`), 3축 이상

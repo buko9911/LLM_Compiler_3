@@ -4,7 +4,7 @@
 #include "GraphInternal.h"
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 /// 이 파이프라인이 쓸 다이얼렉트와 인터페이스 구현을 장부(DialectRegistry)에
 /// 올린다. MLIR 은 라이브러리 묶음이라 기본으로 켜져 있는 것이 없다.
 ///
@@ -15,12 +15,12 @@ namespace plena {
 /// 새 MLIR 라이브러리 호출을 추가하면 여기 등록도 함께 본다.
 void registerPipelineDialects(DialectRegistry &r) {
   // 파일에 나올 수 있는 방언들. 하나라도 빠지면 그 op 을 파싱조차 못 한다.
-  r.insert<mlir::plena::PlenaDialect, affine::AffineDialect, arith::ArithDialect,
+  r.insert<mlir::npu::NPUDialect, affine::AffineDialect, arith::ArithDialect,
            bufferization::BufferizationDialect, func::FuncDialect,
            linalg::LinalgDialect, math::MathDialect, memref::MemRefDialect,
            scf::SCFDialect, tensor::TensorDialect>();
 
-  // ── 3막 버퍼화(tensor → memref)가 묻는 것 ──────────────────────────
+  // ── Stage 3 버퍼화(tensor → memref)가 묻는 것 ──────────────────────────
   arith::registerBufferizableOpInterfaceExternalModels(r);
   bufferization::func_ext::registerBufferizableOpInterfaceExternalModels(r);
   linalg::registerBufferizableOpInterfaceExternalModels(r);
@@ -31,7 +31,7 @@ void registerPipelineDialects(DialectRegistry &r) {
   linalg::registerSubsetOpInterfaceExternalModels(r);
   tensor::registerSubsetOpInterfaceExternalModels(r);
 
-  // ── 2막 타일링이 묻는 것 ───────────────────────────────────────────
+  // ── Stage 2 타일링이 묻는 것 ───────────────────────────────────────────
   // tileUsingSCF 는 op 이 무엇인지 모르고 TilingInterface 로만 대화한다.
   // 이것이 없으면 첫 타일링 시도에서 "promised by dialect but never
   // implemented" 로 죽는다.
@@ -48,7 +48,7 @@ void registerPipelineDialects(DialectRegistry &r) {
   scf::registerValueBoundsOpInterfaceExternalModels(r);
   tensor::registerValueBoundsOpInterfaceExternalModels(r);
 
-  // ── 1막 정규화가 묻는 것 ───────────────────────────────────────────
+  // ── Stage 1 정규화가 묻는 것 ───────────────────────────────────────────
   // 단위 차원을 접으면 텐서 모양이 바뀌므로 새 모양을 되물어야 한다.
   tensor::registerInferTypeOpInterfaceExternalModels(r);
 }
@@ -61,18 +61,18 @@ void attachHardware(ModuleOp m, const HardwareConfig &h) {
   OpBuilder b(m.getContext());
 
   // 설정 파일 전문의 지문. 다른 설정으로 만든 단계 파일을 드라이버가 거부한다.
-  m->setAttr("plena.hardware", b.getStringAttr(h.fingerprint));
-  m->setAttr("plena.schema", b.getI64IntegerAttr(1));
+  m->setAttr("npu.hardware", b.getStringAttr(h.fingerprint));
+  m->setAttr("npu.schema", b.getI64IntegerAttr(1));
 
   struct Capacity {
     const char *attribute;
     uint64_t value;
   };
   const Capacity capacities[] = {
-      {"plena.cores", h.cores},
-      {"plena.l1_bytes", h.l1Bytes},
-      {"plena.l2_bytes", h.l2Bytes},
-      {"plena.dram_bytes", h.dramBytes},
+      {"npu.cores", h.cores},
+      {"npu.l1_bytes", h.l1Bytes},
+      {"npu.l2_bytes", h.l2Bytes},
+      {"npu.dram_bytes", h.dramBytes},
   };
   for (const auto &c : capacities)
     m->setAttr(c.attribute, b.getI64IntegerAttr(c.value));
@@ -182,4 +182,4 @@ const char *reductionOf(linalg::GenericOp gen) {
   if (isa<arith::MaximumFOp>(combine)) return "V_REDUCE_MAX_F16_F32";
   return nullptr;
 }
-} // namespace plena
+} // namespace npu

@@ -10,7 +10,7 @@
     python examples/llama/capture.py --out /tmp/llama1
 
     # 컴파일만
-    ./build/bin/plena-compile --from=graph /tmp/llama1/00-imported.mlir \
+    ./build/bin/npu-compile --from=graph /tmp/llama1/00-imported.mlir \
       --settings examples/llama/hardware4.toml -o /tmp/l1out \
       --fp16 --reciprocal-division
 
@@ -23,8 +23,8 @@
 - `--time-stages` — legalize/tile/place/lower/encode 각각의 경과 시간을 stderr로 출력한다.
 - `--save-stages` — `01-legal` `02-tiled` `03-placed` `03-target` `04-isa` 를 남긴다.
 - `--inputs <캡처 디렉터리>` — `hbm.bin` 까지 만든다. 전치된 채로 요구한 가중치는
-  여기서 돌려놓고, 1막이 인자로 올린 상수는 패키지 안의 바이트에서 꺼낸다.
-- `PLENA_DUMP_NORMALIZED=1` — 정규화 직후 IR 을 stderr 로 낸다. 합법성 검사에서
+  여기서 돌려놓고, Stage 1이 인자로 올린 상수는 패키지 안의 바이트에서 꺼낸다.
+- `NPU_DUMP_NORMALIZED=1` — 정규화 직후 IR 을 stderr 로 낸다. 합법성 검사에서
   막히면 스테이지 파일이 나오기 전이라 이것 말고는 볼 방법이 없다.
 
 `verify.py` 는 시뮬레이터와 설정 파일 경로를 기본값으로 들고 있다.

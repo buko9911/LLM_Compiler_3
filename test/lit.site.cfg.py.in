@@ -1,4 +1,4 @@
-config.plena_tools_dir = r"@CMAKE_RUNTIME_OUTPUT_DIRECTORY@"
-config.filecheck = r"@PLENA_FILECHECK@"
+config.npu_tools_dir = r"@CMAKE_RUNTIME_OUTPUT_DIRECTORY@"
+config.filecheck = r"@NPU_FILECHECK@"
 config.test_exec_root = r"@CMAKE_CURRENT_BINARY_DIR@"
 lit_config.load_config(config, r"@CMAKE_CURRENT_SOURCE_DIR@/lit.cfg.py")

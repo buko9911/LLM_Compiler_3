@@ -1,5 +1,5 @@
-add_mlir_dialect_library(PlenaDialect
-  PlenaDialect.cpp
-  DEPENDS PlenaDialectIncGen
-  LINK_LIBS PUBLIC MLIRIR PlenaTarget
+add_mlir_dialect_library(NPUDialect
+  NPUDialect.cpp
+  DEPENDS NPUDialectIncGen
+  LINK_LIBS PUBLIC MLIRIR NPUTarget
 )

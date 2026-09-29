@@ -1,10 +1,10 @@
 //===----------------------------------------------------------------------===//
-// Legalize.cpp — 1막 후반 — 받을 수 있는 그래프인지 검사
+// Legalize.cpp — Stage 1 후반 — 받을 수 있는 그래프인지 검사
 //===----------------------------------------------------------------------===//
 #include "GraphInternal.h"
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 namespace {
 // 합법성 검사와 ISA 선택이 같은 표 하나를 쓴다. 그래서 대응하는 VPU 명령이
 // 없는 스칼라 연산은 통과할 수가 없다.
@@ -38,7 +38,7 @@ bool isStreamWidthCast(Operation *op) { return isa<arith::ExtFOp,arith::TruncFOp
 // 따로 --reciprocal-division 으로 켜야 한다.
 bool divisionIsReciprocal(Operation *op) {
   auto module = op->getParentOfType<ModuleOp>();
-  return module && module->getAttrOfType<StringAttr>("plena.division") ==
+  return module && module->getAttrOfType<StringAttr>("npu.division") ==
                        StringAttr::get(op->getContext(),"reciprocal");
 }
 const char *scalarUnitInstruction(Operation *op) {
@@ -99,11 +99,11 @@ LogicalResult hoistConstants(ModuleOp m) {
     constant.erase();
     values.push_back(dense);
   }
-  m->setAttr("plena.constants",b.getArrayAttr(values));
+  m->setAttr("npu.constants",b.getArrayAttr(values));
   return success();
 }
 
-/// 1막 후반 — 이 그래프를 받을 수 있는지 검사한다.
+/// Stage 1 후반 — 이 그래프를 받을 수 있는지 검사한다.
 ///
 /// 먼저 normalizeGraph 로 모양을 고친 뒤, 고쳐도 다룰 수 없는 것을 진단과
 /// 함께 거부한다. **거부는 실패가 아니라 계약이다** — 여기서 막지 않으면
@@ -116,7 +116,7 @@ LogicalResult legalizeGraph(ModuleOp m) {
 
   // FP16 중간 반올림은 수치 정책이므로 사용자가 --fp16 으로 명시해야 한다.
   // 컴파일러가 마음대로 정밀도를 낮추지 않는다.
-  if (m->getAttrOfType<StringAttr>("plena.numerical") != StringAttr::get(m.getContext(), "fp16"))
+  if (m->getAttrOfType<StringAttr>("npu.numerical") != StringAttr::get(m.getContext(), "fp16"))
     return m.emitError("graph lowering requires --fp16 (explicit intermediate rounding policy)");
 
   unsigned functions = 0, matmuls = 0, generics = 0;
@@ -286,7 +286,7 @@ LogicalResult legalizeGraph(ModuleOp m) {
   if (functions != 1 || (!matmuls && !generics))
     return m.emitError("requires one entry function containing a matmul or elementwise generic");
   if (failed(hoistConstants(m))) return failure();
-  m->setAttr("plena.stage",StringAttr::get(m.getContext(),"legal"));
+  m->setAttr("npu.stage",StringAttr::get(m.getContext(),"legal"));
   return success();
 }
-} // namespace plena
+} // namespace npu

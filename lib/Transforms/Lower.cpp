@@ -1,7 +1,7 @@
-#include "plena/Transforms/Pipeline.h"
-#include "plena/Dialect/PlenaDialect.h"
-#include "plena/Target/ISA.h"
-#include "plena/Target/Program.h"
+#include "npu/Transforms/Pipeline.h"
+#include "npu/Dialect/NPUDialect.h"
+#include "npu/Target/ISA.h"
+#include "npu/Target/Program.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -15,7 +15,7 @@
 #include <optional>
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 namespace {
 struct View {
   unsigned space = 0;
@@ -209,8 +209,8 @@ class Lowering {
     return true;
   }
   bool stagedCopy(Operation *op, Value source, Value destination) {
-    if (op->hasAttr("plena.cache_activation")) return copyActivation(source,destination);
-    if (op->hasAttr("plena.prefetch_weight")) return copyWeight(source,destination);
+    if (op->hasAttr("npu.cache_activation")) return copyActivation(source,destination);
+    if (op->hasAttr("npu.prefetch_weight")) return copyWeight(source,destination);
     return copy(view(source),view(destination));
   }
   bool copy(View src,View dst) {
@@ -361,7 +361,7 @@ class Lowering {
     v.origin=v.address;
     if (auto arg=dyn_cast<BlockArgument>(value))
       if (auto panel=cast<func::FuncOp>(arg.getOwner()->getParentOp())
-              .getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"plena.packed_panel")) {
+              .getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"npu.packed_panel")) {
         if (panel.getInt()<=0 || cols%uint64_t(panel.getInt()))
           return fail("a packed panel must divide the buffer");
         v.packed=uint64_t(panel.getInt()) == cols ? 0 : uint64_t(panel.getInt());
@@ -703,7 +703,7 @@ class Lowering {
         continue;
       }
       if (auto alloc=dyn_cast<memref::AllocOp>(op)) {
-        if (!bind(alloc,alloc->getAttrOfType<IntegerAttr>("plena.address"))) return false;
+        if (!bind(alloc,alloc->getAttrOfType<IntegerAttr>("npu.address"))) return false;
       } else if (auto castOp=dyn_cast<memref::CastOp>(op)) views[castOp.getResult()]=view(castOp.getSource());
       else if (isa<memref::CollapseShapeOp,memref::ExpandShapeOp>(op)) {
         // A reshape of contiguous memory moves nothing: the same bytes, renamed.
@@ -799,7 +799,7 @@ class Lowering {
         if (loop.getNumRegionIterArgs()) return fail("bufferized loops must not retain tensor iter_args");
         auto begin=integer(loop.getLowerBound()),end=integer(loop.getUpperBound()),step=integer(loop.getStep());
         if (begin<0 || end<begin || step<=0) return fail("invalid static loop range");
-        bool split=cores>1 && loop->hasAttr("plena.core_split");
+        bool split=cores>1 && loop->hasAttr("npu.core_split");
         uint64_t turn=0;
         for (auto i=begin;i<end;i+=step,++turn) {
           if (split && !setCore(unsigned(turn%cores))) return false;
@@ -830,7 +830,7 @@ class Lowering {
       else if (auto fill=dyn_cast<linalg::FillOp>(op)) {
         // The tensor tiler produces only complete output overwrites. No load of
         // C occurs: the hardware accumulator starts empty for each output tile.
-        if (!fill->hasAttr("plena.tile_zero")) return fail("unproven fill cannot be omitted");
+        if (!fill->hasAttr("npu.tile_zero")) return fail("unproven fill cannot be omitted");
         if (live) return fail("output initialization while accumulator is live");
       } else if (auto ret=dyn_cast<func::ReturnOp>(op)) {
         for (auto v:ret.getOperands()) { outputs.push_back(descriptor(view(v))); outputViews.push_back(view(v)); }
@@ -855,23 +855,23 @@ public:
     auto funcs=module.getOps<func::FuncOp>();
     if (!llvm::hasSingleElement(funcs)) return module.emitError("requires one entry function");
     auto f=*funcs.begin();
-    if (auto at=module->getAttrOfType<IntegerAttr>("plena.l2_staging"))
+    if (auto at=module->getAttrOfType<IntegerAttr>("npu.l2_staging"))
       stagingAddress=uint64_t(at.getInt());
-    if (auto size=module->getAttrOfType<IntegerAttr>("plena.l2_staging_bytes"))
+    if (auto size=module->getAttrOfType<IntegerAttr>("npu.l2_staging_bytes"))
       stagingBytes=uint64_t(size.getInt());
-    if (auto count=module->getAttrOfType<IntegerAttr>("plena.cores"))
+    if (auto count=module->getAttrOfType<IntegerAttr>("npu.cores"))
       cores=unsigned(std::max<int64_t>(1,count.getInt()));
     activationKeys.resize(cores);
-    activationBase = (uint64_t(module->getAttrOfType<IntegerAttr>("plena.l1_bytes").getInt()) + 63) & ~uint64_t(63);
-    if (auto capacity = module->getAttrOfType<IntegerAttr>("plena.l1_capacity"))
+    activationBase = (uint64_t(module->getAttrOfType<IntegerAttr>("npu.l1_bytes").getInt()) + 63) & ~uint64_t(63);
+    if (auto capacity = module->getAttrOfType<IntegerAttr>("npu.l1_capacity"))
       if (capacity.getInt() > 0 && uint64_t(capacity.getInt()) > activationBase)
         activationCapacity = uint64_t(capacity.getInt()) - activationBase;
     for (auto arg:f.getArguments()) {
-      if (!bind(arg,f.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"plena.address"))) return module.emitError(error);
+      if (!bind(arg,f.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"npu.address"))) return module.emitError(error);
       auto d=descriptor(view(arg)); d["index"]=arg.getArgNumber();
       // Whoever builds the image has to lay this weight out panel by panel; the
       // declared shape alone does not say so.
-      if (auto panel=f.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"plena.packed_panel"))
+      if (auto panel=f.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"npu.packed_panel"))
         d["packed"]=panel.getInt();
       arguments.push_back(std::move(d));
     }
@@ -881,7 +881,7 @@ public:
     // statement, so a checker reads it from l2_sram_dump.bin. The copies are
     // plain GDMA loads; encoding orders them after the stores that wrote the
     // outputs through the DRAM access frontier.
-    if (auto window = module->getAttrOfType<IntegerAttr>("plena.readback_l2")) {
+    if (auto window = module->getAttrOfType<IntegerAttr>("npu.readback_l2")) {
       uint64_t at = uint64_t(window.getInt());
       for (auto [i, v] : llvm::enumerate(outputViews)) {
         if (v.space != 0 || v.colStride != v.bytes || v.rowStride < v.cols * v.bytes)
@@ -898,19 +898,19 @@ public:
       }
     }
     Program p; p.cores=cores;
-    p.l1Bytes=module->getAttrOfType<IntegerAttr>("plena.l1_bytes").getInt();
+    p.l1Bytes=module->getAttrOfType<IntegerAttr>("npu.l1_bytes").getInt();
     if (activationUsed) {
       p.l1Bytes = activationBase + activationUsed;
-      module->setAttr("plena.l1_bytes",IntegerAttr::get(IntegerType::get(module.getContext(),64),p.l1Bytes));
+      module->setAttr("npu.l1_bytes",IntegerAttr::get(IntegerType::get(module.getContext(),64),p.l1Bytes));
     }
-    p.l2Bytes=module->getAttrOfType<IntegerAttr>("plena.l2_bytes").getInt();
-    p.dramBytes=module->getAttrOfType<IntegerAttr>("plena.dram_bytes").getInt(); p.commands=commands;
+    p.l2Bytes=module->getAttrOfType<IntegerAttr>("npu.l2_bytes").getInt();
+    p.dramBytes=module->getAttrOfType<IntegerAttr>("npu.dram_bytes").getInt(); p.commands=commands;
     // Encoding validates capacities and computes dependencies once. Lowering
     // only emits access summaries; scheduling here discarded the entire result.
-    // Constants became entry arguments in 1막, so the package has to say what
+    // Constants became entry arguments in Stage 1, so the package has to say what
     // belongs in them. The compiler never writes the image itself.
     llvm::json::Array constants;
-    if (auto held = module->getAttrOfType<ArrayAttr>("plena.constants")) {
+    if (auto held = module->getAttrOfType<ArrayAttr>("npu.constants")) {
       unsigned first = unsigned(arguments.size()) - unsigned(held.size());
       for (auto [i,value] : llvm::enumerate(held)) {
         auto dense = cast<DenseElementsAttr>(value);
@@ -926,12 +926,12 @@ public:
             {"base64", llvm::encodeBase64(StringRef(raw.data(), raw.size()))}});
       }
     }
-    // 1막 asked for some weights already transposed; whoever builds the image
+    // Stage 1 asked for some weights already transposed; whoever builds the image
     // has to be told, because the declared shape is the only other clue.
     llvm::json::Array pretransposed;
-    if (auto flipped = module->getAttrOfType<DenseI64ArrayAttr>("plena.pretransposed"))
+    if (auto flipped = module->getAttrOfType<DenseI64ArrayAttr>("npu.pretransposed"))
       for (auto index : flipped.asArrayRef()) pretransposed.push_back(int64_t(index));
-    llvm::json::Object metadata{{"schema","plena.compiler.package.v1"},{"numerical_policy","fp16"},
+    llvm::json::Object metadata{{"schema","npu.compiler.package.v1"},{"numerical_policy","fp16"},
       {"local_optimizations",llvm::json::Object{{"activation_cache_hits",activationHits},
           {"activation_saved_bytes",activationSavedBytes},{"activation_cache_bytes_per_core",activationUsed},
           {"weight_prefetches",weightPrefetches},{"weight_prefetch_bytes",weightPrefetchBytes}}},
@@ -942,7 +942,7 @@ public:
     module.getBody()->clear(); OpBuilder b(module.getContext()); b.setInsertionPointToStart(module.getBody());
     for (const auto &c:commands) {
       if (c.kind!=Command::Kind::Core) {
-        OperationState state(module.getLoc(),"plena.dma");
+        OperationState state(module.getLoc(),"npu.dma");
         state.addAttribute("direction",b.getStringAttr(c.kind==Command::Kind::Load?"load":"store"));
         state.addAttribute("dram",b.getI64IntegerAttr(c.dramOffset)); state.addAttribute("l2",b.getI64IntegerAttr(c.l2Offset));
         state.addAttribute("bytes",b.getI64IntegerAttr(c.bytes));
@@ -953,7 +953,7 @@ public:
         }
         b.create(state);
       } else {
-        OperationState state(module.getLoc(),"plena.core_block"); state.addAttribute("core",b.getI64IntegerAttr(c.core));
+        OperationState state(module.getLoc(),"npu.core_block"); state.addAttribute("core",b.getI64IntegerAttr(c.core));
         SmallVector<int64_t> reads,writes,readRects,writeRects;
         for (const auto &a : c.accesses) {
           auto &v = a.rows > 1 ? (a.write ? writeRects : readRects) : (a.write ? writes : reads);
@@ -966,13 +966,13 @@ public:
         auto region=state.addRegion(); region->push_back(new Block());
         auto core=b.create(state);
         OpBuilder inside(&core->getRegion(0).front(),core->getRegion(0).front().begin());
-        if (failed(mlir::plena::buildCoreBody(inside,module.getLoc(),c.words))) return failure();
+        if (failed(mlir::npu::buildCoreBody(inside,module.getLoc(),c.words))) return failure();
       }
     }
-    module->setAttr("plena.stage",b.getStringAttr("target")); module->setAttr("plena.metadata",b.getStringAttr(json));
+    module->setAttr("npu.stage",b.getStringAttr("target")); module->setAttr("npu.metadata",b.getStringAttr(json));
     return success();
   }
 };
 }
 LogicalResult lowerPlacedGraph(ModuleOp m) { return Lowering(m).run(); }
-} // namespace plena
+} // namespace npu

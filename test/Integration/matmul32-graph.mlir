@@ -1,4 +1,4 @@
-// Graph-stage entry point: tensor linalg in, full 1..4막 pipeline out.
+// Graph-stage entry point: tensor linalg in, full Stage 1..4 pipeline out.
 // Verified against the same PyTorch oracle as the target-stage source, so the
 // two entry points must agree bit for bit.
 func.func @main(%a: tensor<32x32xf16>, %b: tensor<32x32xf16>) -> tensor<32x32xf16> {

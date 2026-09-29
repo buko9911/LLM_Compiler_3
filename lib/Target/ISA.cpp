@@ -1,4 +1,4 @@
-#include "plena/Target/ISA.h"
+#include "npu/Target/ISA.h"
 #include <algorithm>
 #include <charconv>
 #include <cctype>
@@ -7,7 +7,7 @@
 #include <array>
 #include <unordered_map>
 
-namespace plena {
+namespace npu {
 namespace {
 enum class Slot { Rd = 6, Rs1 = 10, Rs2 = 14, Rs3 = 18 };
 struct Spec { const char *name; uint32_t opcode, funct; std::vector<Slot> slots; };
@@ -335,4 +335,4 @@ std::vector<InstructionInfo> instructionSet() {
   for (const auto &m : matrixNames) out.push_back({m.name, m.opcode == kMma ? 1u : 4u});
   return out;
 }
-} // namespace plena
+} // namespace npu

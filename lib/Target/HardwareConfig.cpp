@@ -1,4 +1,4 @@
-#include "plena/Target/HardwareConfig.h"
+#include "npu/Target/HardwareConfig.h"
 #include <algorithm>
 #include <charconv>
 #include <fstream>
@@ -7,7 +7,7 @@
 #include <map>
 #include <sstream>
 
-namespace plena {
+namespace npu {
 namespace {
 std::string trim(std::string s) {
   auto first = s.find_first_not_of(" \t\r\n");
@@ -76,4 +76,4 @@ Result<HardwareConfig> loadHardwareConfig(const std::string &path) {
   std::string source{std::istreambuf_iterator<char>(in), {}};
   return parseHardwareConfig(source);
 }
-} // namespace plena
+} // namespace npu

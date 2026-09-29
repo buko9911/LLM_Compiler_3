@@ -1,19 +1,19 @@
-#include "plena/Transforms/Passes.h"
-#include "plena/Dialect/PlenaDialect.h"
-#include "plena/Target/ISA.h"
-#include "plena/Target/Program.h"
+#include "npu/Transforms/Passes.h"
+#include "npu/Dialect/NPUDialect.h"
+#include "npu/Target/ISA.h"
+#include "npu/Target/Program.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Builders.h"
 
-namespace plena {
+namespace npu {
 namespace {
 class EncodePass : public mlir::PassWrapper<EncodePass, mlir::OperationPass<mlir::ModuleOp>> {
 public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EncodePass)
-  llvm::StringRef getArgument() const final { return "encode-plena"; }
-  llvm::StringRef getName() const override { return "encode-plena"; }
-  llvm::StringRef getDescription() const final { return "Verify and encode PLENA target blocks into a Unified Program (ISA ver 1.0)"; }
-  void getDependentDialects(mlir::DialectRegistry &r) const override { r.insert<mlir::plena::PlenaDialect>(); }
+  llvm::StringRef getArgument() const final { return "encode-npu"; }
+  llvm::StringRef getName() const override { return "encode-npu"; }
+  llvm::StringRef getDescription() const final { return "Verify and encode NPU target blocks into a Unified Program (ISA ver 1.0)"; }
+  void getDependentDialects(mlir::DialectRegistry &r) const override { r.insert<mlir::npu::NPUDialect>(); }
   void runOnOperation() override {
     auto module = getOperation();
     Program p;
@@ -25,16 +25,16 @@ public:
       }
       return uint64_t(attr.getInt());
     };
-    p.cores = get("plena.cores", 65536);
-    p.l1Bytes = get("plena.l1_bytes", UINT32_MAX);
-    p.l2Bytes = get("plena.l2_bytes", UINT32_MAX);
-    p.dramBytes = get("plena.dram_bytes", INT64_MAX);
+    p.cores = get("npu.cores", 65536);
+    p.l1Bytes = get("npu.l1_bytes", UINT32_MAX);
+    p.l2Bytes = get("npu.l2_bytes", UINT32_MAX);
+    p.dramBytes = get("npu.dram_bytes", INT64_MAX);
     if (!p.cores || !p.l1Bytes || !p.l2Bytes || !p.dramBytes) return signalPassFailure();
     for (auto &op : module.getBody()->getOperations()) {
       Command c;
-      if (auto core = mlir::dyn_cast<mlir::plena::CoreBlockOp>(op)) {
+      if (auto core = mlir::dyn_cast<mlir::npu::CoreBlockOp>(op)) {
         c.core = core.getCore();
-        auto words = mlir::plena::encodeCoreBody(core.getBody().front());
+        auto words = mlir::npu::encodeCoreBody(core.getBody().front());
         if (!words) { core.emitError(words.error); return signalPassFailure(); }
         c.words = std::move(words.value);
         for (bool write : {false, true}) {
@@ -49,13 +49,13 @@ public:
                                     uint64_t(r[i+2]), uint64_t(r[i+3])});
           }
         }
-      } else if (auto dma = mlir::dyn_cast<mlir::plena::DMAOp>(op)) {
+      } else if (auto dma = mlir::dyn_cast<mlir::npu::DMAOp>(op)) {
         c.kind = dma.getDirection() == "load" ? Command::Kind::Load : Command::Kind::Store;
         c.dramOffset = dma.getDram(); c.l2Offset = dma.getL2(); c.bytes = dma.getBytes();
         c.rows = uint32_t(dma.getRows());
         c.dramStride = uint32_t(dma.getDramStride().value_or(dma.getBytes()));
         c.l2Stride = uint32_t(dma.getL2Stride().value_or(dma.getBytes()));
-      } else { op.emitError("target encoding only accepts plena.core_block and plena.dma"); return signalPassFailure(); }
+      } else { op.emitError("target encoding only accepts npu.core_block and npu.dma"); return signalPassFailure(); }
       p.commands.push_back(std::move(c));
     }
     auto encoded = encodeProgram(p);
@@ -70,13 +70,13 @@ public:
     module.getBody()->clear();
     mlir::OpBuilder builder(module.getContext());
     builder.setInsertionPointToStart(module.getBody());
-    mlir::OperationState state(module.getLoc(), "plena.program");
+    mlir::OperationState state(module.getLoc(), "npu.program");
     state.addAttribute("words", builder.getDenseI32ArrayAttr(words));
     state.addAttribute("manifest", builder.getStringAttr(manifest));
     builder.create(state);
-    module->setAttr("plena.stage", builder.getStringAttr("encoded"));
+    module->setAttr("npu.stage", builder.getStringAttr("encoded"));
   }
 };
 } // namespace
 std::unique_ptr<mlir::Pass> createEncodePass() { return std::make_unique<EncodePass>(); }
-} // namespace plena
+} // namespace npu

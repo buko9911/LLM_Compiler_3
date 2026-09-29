@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT / "test/Integration"))
 import numpy as np
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
-from plena.capture import capture
+from npu.capture import capture
 import harness
 
 SIMULATOR = Path.home() / "NPU_Simulator"
@@ -22,7 +22,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="NousResearch/Meta-Llama-3.1-8B")
 ap.add_argument("--seq", type=int, default=32)
 ap.add_argument("--out", required=True, type=Path)
-ap.add_argument("--compiler", default=str(ROOT / "build/bin/plena-compile"))
+ap.add_argument("--compiler", default=str(ROOT / "build/bin/npu-compile"))
 ap.add_argument("--emulator", default=str(SIMULATOR / "transactional_emulator/target/release/transactional_emulator"))
 ap.add_argument("--settings", default=str(SIMULATOR / "plena_settings.toml"))
 ap.add_argument("--hardware", help="settings the compile uses (default: --settings)")

@@ -1,23 +1,23 @@
-#include "plena/Target/ISA.h"
-#include "plena/Target/Program.h"
+#include "npu/Target/ISA.h"
+#include "npu/Target/Program.h"
 #include <gtest/gtest.h>
 #include <random>
 #include <set>
 
 namespace {
-plena::Command core(std::vector<plena::Access> accesses = {}) {
-  plena::Command c; c.words = plena::assemble("C_FENCE_ALL").value; c.accesses = std::move(accesses); return c;
+npu::Command core(std::vector<npu::Access> accesses = {}) {
+  npu::Command c; c.words = npu::assemble("C_FENCE_ALL").value; c.accesses = std::move(accesses); return c;
 }
-plena::Command load(unsigned offset) {
-  plena::Command c; c.kind = plena::Command::Kind::Load; c.dramOffset = offset; c.l2Offset = offset; c.bytes = 64; return c;
+npu::Command load(unsigned offset) {
+  npu::Command c; c.kind = npu::Command::Kind::Load; c.dramOffset = offset; c.l2Offset = offset; c.bytes = 64; return c;
 }
 // A hardware loop body runs at least once and every iteration continues where
 // the previous one stopped, so verification checks the body from its entry state
 // and again from the state that pass produces.
-plena::Result<bool> verifyAssembly(const std::string &text) {
-  auto words = plena::assemble(text);
-  if (!words) return plena::Result<bool>::failure(words.error);
-  return plena::verifyCore(words.value);
+npu::Result<bool> verifyAssembly(const std::string &text) {
+  auto words = npu::assemble(text);
+  if (!words) return npu::Result<bool>::failure(words.error);
+  return npu::verifyCore(words.value);
 }
 // ISA ver 1.0: W [K,N] and A [M,K] stay in the operand buffer; each fixed
 // 32x32x32 M_MMA consumes one K slice, INIT first, ACC after.
@@ -65,54 +65,54 @@ TEST(CoreLoop, StillRejectsOperandLoadCrossingTheBoundary) {
   EXPECT_NE(result.error.find("already holds an unconsumed weight"), std::string::npos) << result.error;
 }
 TEST(Program, HazardsWithoutGlobalSerialization) {
-  using M = plena::MemorySpace;
-  plena::Program p{1, 256, 256, 1024, {load(0), core({{M::L2,0,64,false}}), load(64), load(0)}};
-  auto s = plena::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
+  using M = npu::MemorySpace;
+  npu::Program p{1, 256, 256, 1024, {load(0), core({{M::L2,0,64,false}}), load(64), load(0)}};
+  auto s = npu::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
   EXPECT_EQ(s.value.commands[1].dependencies, std::vector<uint32_t>({0}));
   EXPECT_TRUE(s.value.commands[2].dependencies.empty());
   EXPECT_EQ(s.value.commands[3].dependencies, std::vector<uint32_t>({0,1}));
-  auto bytes = plena::encodeProgram(s.value); ASSERT_TRUE(bool(bytes));
+  auto bytes = npu::encodeProgram(s.value); ASSERT_TRUE(bool(bytes));
   EXPECT_EQ(std::string(bytes.value.begin(), bytes.value.begin()+4), "PLNA");
 }
 TEST(Program, PartialOverlapAndCoreOrder) {
-  using M = plena::MemorySpace;
-  plena::Program p{2, 256, 256, 1024, {core({{M::L2,0,64,true}}), core({{M::L2,32,64,false}}), core()}};
+  using M = npu::MemorySpace;
+  npu::Program p{2, 256, 256, 1024, {core({{M::L2,0,64,true}}), core({{M::L2,32,64,false}}), core()}};
   p.commands[1].core = 1;
-  auto s = plena::schedule(p); ASSERT_TRUE(bool(s));
+  auto s = npu::schedule(p); ASSERT_TRUE(bool(s));
   EXPECT_EQ(s.value.commands[1].dependencies, std::vector<uint32_t>({0}));
   EXPECT_EQ(s.value.commands[2].dependencies, std::vector<uint32_t>({0}));
   p.commands[0].accesses[0].offset = 255;
-  EXPECT_FALSE(bool(plena::schedule(p)));
+  EXPECT_FALSE(bool(npu::schedule(p)));
 }
 TEST(Program, StridedColumnsStayIndependentButRealHazardsRemain) {
-  using M = plena::MemorySpace;
-  plena::Program p{2, 256, 512, 1024, {
+  using M = npu::MemorySpace;
+  npu::Program p{2, 256, 512, 1024, {
       core({{M::L2,0,32,true,4,128}}), core({{M::L2,32,32,true,4,128}}),
       core({{M::L2,256,32,false}})}};
   p.commands[1].core = 1;
-  auto s = plena::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
+  auto s = npu::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
   EXPECT_TRUE(s.value.commands[1].dependencies.empty());
   EXPECT_EQ(s.value.commands[2].dependencies, std::vector<uint32_t>({0}));
   p.commands[1].accesses[0].offset = 16;
-  s = plena::schedule(p); ASSERT_TRUE(bool(s));
+  s = npu::schedule(p); ASSERT_TRUE(bool(s));
   EXPECT_EQ(s.value.commands[1].dependencies, std::vector<uint32_t>({0}));
   p.commands[1].accesses[0].rows = UINT64_MAX;
-  EXPECT_FALSE(bool(plena::schedule(p)));
+  EXPECT_FALSE(bool(npu::schedule(p)));
 }
 TEST(Program, DMAHolesDoNotCreateDependencies) {
   auto dma = load(0); dma.bytes = 32; dma.rows = 4; dma.dramStride = dma.l2Stride = 128;
-  plena::Program p{1, 256, 512, 1024, {dma, core({{plena::MemorySpace::L2,32,32,true,4,128}})}};
-  auto s = plena::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
+  npu::Program p{1, 256, 512, 1024, {dma, core({{npu::MemorySpace::L2,32,32,true,4,128}})}};
+  auto s = npu::schedule(p); ASSERT_TRUE(bool(s)) << s.error;
   EXPECT_TRUE(s.value.commands[1].dependencies.empty());
   p.commands[1].accesses[0].offset = 128;
   p.commands[1].accesses[0].rows = 1;
-  s = plena::schedule(p); ASSERT_TRUE(bool(s));
+  s = npu::schedule(p); ASSERT_TRUE(bool(s));
   EXPECT_EQ(s.value.commands[1].dependencies, std::vector<uint32_t>({0}));
 }
 TEST(Program, AccumulatorAndOperandLifetimes) {
   auto check = [](const std::string &s) {
-    auto words = plena::assemble(s);
-    return words ? plena::verifyCore(words.value) : plena::Result<bool>::failure(words.error);
+    auto words = npu::assemble(s);
+    return words ? npu::verifyCore(words.value) : npu::Result<bool>::failure(words.error);
   };
   const std::string pair64 = "M_LOAD_WEIGHT_F16 1, 64, 32, 64\nM_LOAD_ACT_F16 2, 32, 64, 128\n";
   const std::string out = "M_WRITEOUT_F16 3, 32, 32, 64\nC_FENCE_ALL";
@@ -129,27 +129,27 @@ TEST(Program, AccumulatorAndOperandLifetimes) {
   EXPECT_FALSE(bool(check(out)));
 }
 TEST(Program, RejectsCorruptedProgramAndTruncation) {
-  plena::Program p{1,64,64,64,{core()}};
-  auto encoded = plena::encodeProgram(p); ASSERT_TRUE(bool(encoded));
+  npu::Program p{1,64,64,64,{core()}};
+  auto encoded = npu::encodeProgram(p); ASSERT_TRUE(bool(encoded));
   std::vector<uint32_t> words;
   for (size_t i = 0; i < encoded.value.size(); i += 4) {
     uint32_t w = 0;
     for (unsigned b = 0; b < 4; ++b) w |= uint32_t(encoded.value[i+b]) << (8*b);
     words.push_back(w);
   }
-  ASSERT_TRUE(bool(plena::verifyProgramWords(words)));
+  ASSERT_TRUE(bool(npu::verifyProgramWords(words)));
   auto corrupt = words; corrupt[23] = 0x1; // core instruction after the L1 span
-  EXPECT_FALSE(bool(plena::verifyProgramWords(corrupt)));
+  EXPECT_FALSE(bool(npu::verifyProgramWords(corrupt)));
   for (size_t size = 0; size < words.size(); ++size) {
     auto shortWords = std::vector<uint32_t>(words.begin(),words.begin()+size);
     if (size > 2) shortWords[2] = uint32_t(size);
-    EXPECT_FALSE(bool(plena::verifyProgramWords(shortWords))) << size;
+    EXPECT_FALSE(bool(npu::verifyProgramWords(shortWords))) << size;
   }
 }
 TEST(Program, RectangularHazardsMatchBytewiseOracle) {
-  using M = plena::MemorySpace;
+  using M = npu::MemorySpace;
   std::mt19937 rng(109);
-  plena::Program p{4,256,256,256,{}};
+  npu::Program p{4,256,256,256,{}};
   std::vector<std::set<unsigned>> ancestors;
   std::vector<std::set<unsigned>> readers(256);
   std::vector<int> writers(256,-1), previous(4,-1);
@@ -181,7 +181,7 @@ TEST(Program, RectangularHazardsMatchBytewiseOracle) {
     for (auto d : deps) reachable.insert(ancestors[d].begin(),ancestors[d].end());
     ancestors.push_back(std::move(reachable)); p.commands.push_back(std::move(c));
   }
-  auto result = plena::schedule(p); ASSERT_TRUE(bool(result)) << result.error;
+  auto result = npu::schedule(p); ASSERT_TRUE(bool(result)) << result.error;
   std::vector<std::set<unsigned>> actual;
   for (unsigned id = 0; id < p.commands.size(); ++id) {
     std::set<unsigned> reachable;

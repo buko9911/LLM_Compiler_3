@@ -1,4 +1,4 @@
-#include "plena/Target/ISA.h"
+#include "npu/Target/ISA.h"
 #include <gtest/gtest.h>
 #include <array>
 
@@ -21,11 +21,11 @@ TEST(ISA, SimulatorDecoderVectors) {
     {"C_WAIT_LDMA", r(0x3f,0,0,0,0,1)},
   };
   for (const auto &v : vectors) {
-    auto encoded = plena::assembleLine(v.first);
+    auto encoded = npu::assembleLine(v.first);
     ASSERT_TRUE(bool(encoded)) << encoded.error;
     EXPECT_EQ(encoded.value, v.second) << v.first;
-    EXPECT_TRUE(plena::isValidInstruction(v.second));
-    auto decoded = plena::disassemble(v.second);
+    EXPECT_TRUE(npu::isValidInstruction(v.second));
+    auto decoded = npu::disassemble(v.second);
     ASSERT_TRUE(bool(decoded)); EXPECT_EQ(decoded.value, v.first);
   }
 }
@@ -35,19 +35,19 @@ TEST(ISA, RejectsReservedFields) {
     r(0x3b,1,0,0,0,3), r(0x3b,0,1,0,0,3), r(0x37,1,2,0,0,3),
     r(0x3f,1,0,0,0,4), r(0x3f,0,0,0,0,6), r(0x3d,1,2,3,4,6), r(0x3e,1,2,3,4,1)};
   for (auto w : invalid) {
-    EXPECT_FALSE(bool(plena::disassemble(w))) << w;
-    EXPECT_FALSE(plena::isValidInstruction(w)) << w;
+    EXPECT_FALSE(bool(npu::disassemble(w))) << w;
+    EXPECT_FALSE(npu::isValidInstruction(w)) << w;
   }
-  for (unsigned fn = 6; fn <= 15; ++fn) EXPECT_FALSE(bool(plena::disassemble(r(0x30,1,2,3,0,fn))));
+  for (unsigned fn = 6; fn <= 15; ++fn) EXPECT_FALSE(bool(npu::disassemble(r(0x30,1,2,3,0,fn))));
 }
 TEST(ISA, EveryInstructionRoundTripsAtRegisterBoundary) {
-  for (const auto &info : plena::instructionSet()) {
+  for (const auto &info : npu::instructionSet()) {
     if (info.name.rfind("M_", 0) == 0) continue; // matrix records: MatrixRecords* tests
     std::string line = info.name;
     for (unsigned i = 0; i < info.operands; ++i) line += (i ? ", " : " ") + std::string("15");
-    auto encoded = plena::assembleLine(line); ASSERT_TRUE(bool(encoded)) << line;
-    auto decoded = plena::disassemble(encoded.value); ASSERT_TRUE(bool(decoded)) << line;
-    EXPECT_EQ(plena::assembleLine(decoded.value).value, encoded.value);
+    auto encoded = npu::assembleLine(line); ASSERT_TRUE(bool(encoded)) << line;
+    auto decoded = npu::disassemble(encoded.value); ASSERT_TRUE(bool(decoded)) << line;
+    EXPECT_EQ(npu::assembleLine(decoded.value).value, encoded.value);
   }
 }
 // ISA ver 1.0 matrix records, transcribed from NPU_Simulator main
@@ -65,21 +65,21 @@ TEST(ISA, MatrixRecordsMatchSimulator) {
     {"M_WRITEOUT_F32 6, 32, 32, 128", {r(0x3c,6,0,0,0,4), 32, 32, 128}},
   };
   for (const auto &[text, words] : records) {
-    auto encoded = plena::assembleInstruction(text);
+    auto encoded = npu::assembleInstruction(text);
     ASSERT_TRUE(bool(encoded)) << text << ": " << encoded.error;
     EXPECT_EQ(encoded.value, words) << text;
-    EXPECT_EQ(plena::recordWords(words[0]), words.size()) << text;
-    auto decoded = plena::disassembleRecord(words.data(), words.size());
+    EXPECT_EQ(npu::recordWords(words[0]), words.size()) << text;
+    auto decoded = npu::disassembleRecord(words.data(), words.size());
     ASSERT_TRUE(bool(decoded)) << text;
     EXPECT_EQ(decoded.value, text);
   }
-  auto load = plena::encodeMatrixLoad(plena::MatrixOperand::Weight, plena::MatrixType::F16, 2, 64, 4, 8);
+  auto load = npu::encodeMatrixLoad(npu::MatrixOperand::Weight, npu::MatrixType::F16, 2, 64, 4, 8);
   ASSERT_TRUE(bool(load)); EXPECT_EQ(load.value, records[0].second);
-  auto out = plena::encodeMatrixWriteout(plena::WriteoutType::F16, 6, 4, 4, 8);
+  auto out = npu::encodeMatrixWriteout(npu::WriteoutType::F16, 6, 4, 4, 8);
   ASSERT_TRUE(bool(out)); EXPECT_EQ(out.value, records[6].second);
   // A multi-word record never passes as one word.
-  EXPECT_FALSE(bool(plena::assembleLine("M_WRITEOUT_F16 6, 4, 4, 8")));
-  EXPECT_FALSE(bool(plena::disassemble(r(0x37,0,2,0,0,3))));
+  EXPECT_FALSE(bool(npu::assembleLine("M_WRITEOUT_F16 6, 4, 4, 8")));
+  EXPECT_FALSE(bool(npu::disassemble(r(0x37,0,2,0,0,3))));
 }
 TEST(ISA, MatrixRecordsRejectWhatTheSimulatorRejects) {
   for (const char *line : {
@@ -92,43 +92,43 @@ TEST(ISA, MatrixRecordsRejectWhatTheSimulatorRejects) {
          "M_WRITEOUT_F32 6, 4, 4, 8",        // FP32 needs 4 bytes per element
          "M_LOAD_ACT_F16 16, 4, 64, 128",    // register index
          "M_MMA_F16F16F32", "M_MMA_F16F16F32 1", "M_LOAD_ACT_F16 4, 4, 64"})
-    EXPECT_FALSE(bool(plena::assembleInstruction(line))) << line;
+    EXPECT_FALSE(bool(npu::assembleInstruction(line))) << line;
   const uint32_t reservedMma[] = {0x3bu | 3u << 22 | 1u << 27, 0x3bu | 3u << 22 | 1u << 6, 0x3bu | 2u << 22};
-  for (auto w : reservedMma) EXPECT_FALSE(bool(plena::disassembleRecord(&w, 1))) << w;
+  for (auto w : reservedMma) EXPECT_FALSE(bool(npu::disassembleRecord(&w, 1))) << w;
 }
 TEST(ISA, MmaSequenceCoversKInFixedSlices) {
   const uint32_t init = 0x3bu | 3u << 22, acc = init | 1u << 26;
   using W = std::vector<uint32_t>;
-  EXPECT_EQ(plena::mmaSequence(plena::MatrixType::F16, 32, false), W({init}));
-  EXPECT_EQ(plena::mmaSequence(plena::MatrixType::F16, 40, false), W({init, acc}));
-  EXPECT_EQ(plena::mmaSequence(plena::MatrixType::F16, 96, false), W({init, acc, acc}));
-  EXPECT_EQ(plena::mmaSequence(plena::MatrixType::F16, 64, true), W({acc, acc}));
+  EXPECT_EQ(npu::mmaSequence(npu::MatrixType::F16, 32, false), W({init}));
+  EXPECT_EQ(npu::mmaSequence(npu::MatrixType::F16, 40, false), W({init, acc}));
+  EXPECT_EQ(npu::mmaSequence(npu::MatrixType::F16, 96, false), W({init, acc, acc}));
+  EXPECT_EQ(npu::mmaSequence(npu::MatrixType::F16, 64, true), W({acc, acc}));
 }
 TEST(ISA, MatrixPayloadWordsAreNotInstructions) {
   // Mirrors op.rs matrix_payload_words_are_not_instructions: the payload word
   // 0x24 must not be taken for C_LOOP_END.
   std::vector<uint32_t> words{r(0x37,0,1,0,0,7), 1, 0x24, 0x48, r(0x3f,0,0,0,0,4)};
-  auto records = plena::splitRecords(words);
+  auto records = npu::splitRecords(words);
   ASSERT_TRUE(bool(records)) << records.error;
   EXPECT_EQ(records.value.size(), 2u);
   words.pop_back(); words.pop_back();
-  EXPECT_FALSE(bool(plena::splitRecords(words))); // truncated record
+  EXPECT_FALSE(bool(npu::splitRecords(words))); // truncated record
 }
 TEST(ISA, StrictParsingAndImmediates) {
   for (const char *line : {"C_LUI_U32 16, 0", "C_LUI_U32 0, 1048576", "C_ADDI_U32 0, 0, 262144",
        "M_LOAD_ACT_F16 -1", "M_LOAD_ACT_F16 1junk", "M_LOAD_ACT_F16 1,", "C_LUI_U32 0,,1",
        "C_LUI_U32 0 1", "M_MMA_F16F16F32 0", "UNKNOWN", "C_LUI_U32 0, 4294967296"})
-    EXPECT_FALSE(bool(plena::assembleLine(line))) << line;
-  EXPECT_EQ(plena::assembleLine("C_ADDI_U32 15, 15, 262143").value, 0xffffffe2u);
-  auto source = plena::assemble("; comment\nC_LUI_U32 0, 0xabc // comment\nC_FENCE_ALL\n");
+    EXPECT_FALSE(bool(npu::assembleLine(line))) << line;
+  EXPECT_EQ(npu::assembleLine("C_ADDI_U32 15, 15, 262143").value, 0xffffffe2u);
+  auto source = npu::assemble("; comment\nC_LUI_U32 0, 0xabc // comment\nC_FENCE_ALL\n");
   ASSERT_TRUE(bool(source)); EXPECT_EQ(source.value.size(), 2u);
-  EXPECT_EQ(plena::parseMem(plena::formatMem(source.value)).value, source.value);
+  EXPECT_EQ(npu::parseMem(npu::formatMem(source.value)).value, source.value);
 }
 TEST(ISA, ConstantsDoNotDependOnGPZero) {
   for (uint32_t value : {0u, 1u, 4095u, 4096u, 0x80000000u, 0xffffffffu}) {
     for (unsigned dst : {0u, 7u, 15u}) {
       std::array<uint32_t,16> gp; gp.fill(0xdeadbeef);
-      auto words = plena::materialize(dst, value); ASSERT_TRUE(bool(words));
+      auto words = npu::materialize(dst, value); ASSERT_TRUE(bool(words));
       for (auto word : words.value) {
         unsigned rd = word >> 6 & 15, rs = word >> 10 & 15;
         if ((word & 63) == 0x25) gp[rd] = ((word >> 10) & 0xfffff) << 12;

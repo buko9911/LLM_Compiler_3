@@ -1,9 +1,9 @@
-#include "plena/Analysis/MemoryPlan.h"
+#include "npu/Analysis/MemoryPlan.h"
 #include <algorithm>
 #include <limits>
 #include <set>
 
-namespace plena {
+namespace npu {
 namespace {
 bool overlap(uint64_t a, uint64_t ae, uint64_t b, uint64_t be) { return a < be && b < ae; }
 uint64_t capacity(MemorySpace s, const MemoryLimits &l) {
@@ -126,4 +126,4 @@ Result<bool> verifyMemoryPlan(const MemoryPlan &plan, const MemoryLimits &limits
     return R::failure("incorrect high water marks");
   return R::success(true);
 }
-} // namespace plena
+} // namespace npu

@@ -1,10 +1,10 @@
 //===----------------------------------------------------------------------===//
-// Normalize.cpp — 1막 전반 — 캡처를 이 컴파일러가 아는 모양으로
+// Normalize.cpp — Stage 1 전반 — 캡처를 이 컴파일러가 아는 모양으로
 //===----------------------------------------------------------------------===//
 #include "GraphInternal.h"
 
 using namespace mlir;
-namespace plena {
+namespace npu {
 // 그래서 전역 패스 대신 리덕션 자체를 겨냥해 손으로 쓴다.
 //===----------------------------------------------------------------------===//
 namespace {
@@ -571,7 +571,7 @@ void populateBroadcastFusion(RewritePatternSet &patterns) {
 // back for its users. That is one intermediate FP16 rounding, the policy --fp16
 // grants; narrowMatrixChains then runs the users in FP16.
 LogicalResult roundAccumulatorsAtWriteout(OpBuilder &b, ModuleOp m) {
-  if (m->getAttrOfType<StringAttr>("plena.numerical") != StringAttr::get(m.getContext(), "fp16"))
+  if (m->getAttrOfType<StringAttr>("npu.numerical") != StringAttr::get(m.getContext(), "fp16"))
     return success();
   SmallVector<linalg::MatmulOp> work;
   m.walk([&](linalg::MatmulOp mm) { work.push_back(mm); });
@@ -690,7 +690,7 @@ LogicalResult pretransposeWeights(OpBuilder &b, ModuleOp m) {
   SmallVector<Type> inputs(function.getFunctionType().getInputs());
   for (auto i : indices) inputs[i] = function.getArgument(i).getType();
   function.setType(b.getFunctionType(inputs, function.getFunctionType().getResults()));
-  m->setAttr("plena.pretransposed", b.getDenseI64ArrayAttr(indices));
+  m->setAttr("npu.pretransposed", b.getDenseI64ArrayAttr(indices));
   return success();
 }
 
@@ -970,13 +970,13 @@ LogicalResult markOverwrittenFills(OpBuilder &b, ModuleOp m) {
     });
     if (feedsMatmul && !zero) return;
     if (covered(result, SmallVector<bool>(type.getDimSize(0), false)))
-      fill->setAttr("plena.tile_zero", b.getUnitAttr());
+      fill->setAttr("npu.tile_zero", b.getUnitAttr());
   });
   return success();
 }
 } // namespace
 
-/// 1막 전반 — 0막 캡처를 이 컴파일러가 아는 모양으로 바꾼다.
+/// Stage 1 전반 — Stage 0 캡처를 이 컴파일러가 아는 모양으로 바꾼다.
 ///
 /// **순서가 의미를 가진다.** 한 재작성이 다른 재작성의 전제를 만들거나 깨뜨리고,
 /// 그래서 같은 재작성이 여러 번 나오기도 한다. 아래 각 단계의 주석은 "왜 지금
@@ -984,7 +984,7 @@ LogicalResult markOverwrittenFills(OpBuilder &b, ModuleOp m) {
 ///
 /// 이 함수가 남긴 IR 은 곧바로 legalizeGraph 가 검사한다. 거기서 거부되면
 /// 단계 파일이 하나도 안 써지므로, 무엇이 나왔는지 보려면 환경변수
-/// `PLENA_DUMP_NORMALIZED=1` 을 쓴다(맨 아래).
+/// `NPU_DUMP_NORMALIZED=1` 을 쓴다(맨 아래).
 LogicalResult normalizeGraph(ModuleOp m) {
   OpBuilder batched(m.getContext());
 
@@ -1102,10 +1102,10 @@ LogicalResult normalizeGraph(ModuleOp m) {
 
   // legalizeGraph 는 단계 파일이 하나라도 써지기 전에 거부하므로, 정규화가
   // 실제로 무엇을 만들었는지 볼 방법은 이것뿐이다.
-  if (const char *dump = getenv("PLENA_DUMP_NORMALIZED"); dump && *dump) {
+  if (const char *dump = getenv("NPU_DUMP_NORMALIZED"); dump && *dump) {
     llvm::errs() << "// --- after normalisation ---\n";
     m.print(llvm::errs());
   }
   return success();
 }
-} // namespace plena
+} // namespace npu

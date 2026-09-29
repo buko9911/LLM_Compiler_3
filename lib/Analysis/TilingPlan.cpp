@@ -1,9 +1,9 @@
-#include "plena/Analysis/TilingPlan.h"
+#include "npu/Analysis/TilingPlan.h"
 #include <algorithm>
 #include <set>
 #include <sstream>
 
-namespace plena {
+namespace npu {
 namespace {
 uint64_t ceilDiv(uint64_t n, uint64_t d) { return n/d + (n%d != 0); }
 uint64_t arrayDivisor(uint64_t extent) {
@@ -131,4 +131,4 @@ std::string describe(const TilingPlan &p) {
       << " L2_high_water=" << p.placement.l2HighWater;
   return out.str();
 }
-} // namespace plena
+} // namespace npu

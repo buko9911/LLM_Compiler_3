@@ -1,3 +1,3 @@
-add_subdirectory(plena-opt)
-add_subdirectory(plena-asm)
-add_subdirectory(plena-compile)
+add_subdirectory(npu-opt)
+add_subdirectory(npu-asm)
+add_subdirectory(npu-compile)

@@ -95,8 +95,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     emulator, settings = args.emulator.resolve(), args.settings.resolve()
 
-    # The target path enters at 4막 with hand-written IR; the graph path runs
-    # 1..4막. Each is also re-read from its saved stage files.
+    # The target path enters at Stage 4 with hand-written IR; the graph path runs
+    # Stage 1..4. Each is also re-read from its saved stage files.
     jobs = [("memory", args.source, ["--from=target"], TARGET_LAYOUT),
             ("reparse", args.source, ["--from=target", "--reparse-stages"], TARGET_LAYOUT)]
     for source in args.graph:
@@ -171,8 +171,8 @@ def main():
     # Same placement, no cache/prefetch: a numerical control and stage-restart check.
     plain = out / "pipeline-plain.mlir"
     plain.write_text((package / "03-placed.mlir").read_text()
-                     .replace("plena.cache_activation", "test.disabled_cache")
-                     .replace("plena.prefetch_weight", "test.disabled_prefetch"))
+                     .replace("npu.cache_activation", "test.disabled_cache")
+                     .replace("npu.prefetch_weight", "test.disabled_prefetch"))
     control = out / "pipeline-control"
     subprocess.run([str(args.compiler), "--from=placed", str(plain), "--settings",
                     str(pipeline_settings), "-o", str(control)], check=True)
