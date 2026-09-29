@@ -405,6 +405,69 @@ LogicalResult packWeightPanels(OpBuilder &b, linalg::MatmulOp mm, uint64_t panel
 }
 } // namespace
 
+namespace {
+// 이 텐서의 바이트가 어느 메모리 공간에 놓이는가 — 계산해 넣은 목적지를
+// 따라 올라가 그 할당이 정한다. 진입 인자와 표시 없는 빈 텐서는 DRAM(0)이다.
+std::optional<int64_t> spaceOf(Value v) {
+  for (unsigned hops = 0; hops < 256; ++hops) {
+    if (auto alloc = v.getDefiningOp<bufferization::AllocTensorOp>()) {
+      auto space = alloc.getMemorySpace();
+      return space ? std::optional<int64_t>(cast<IntegerAttr>(*space).getInt()) : std::optional<int64_t>(0);
+    }
+    if (v.getDefiningOp<tensor::EmptyOp>()) return 0;
+    if (auto loop = v.getDefiningOp<scf::ForOp>()) {
+      v = loop.getInitArgs()[cast<OpResult>(v).getResultNumber()];
+      continue;
+    }
+    if (auto insert = v.getDefiningOp<tensor::InsertSliceOp>()) {
+      v = insert.getDest();
+      continue;
+    }
+    if (auto dps = v.getDefiningOp<DestinationStyleOpInterface>()) {
+      v = dps.getDpsInitOperand(cast<OpResult>(v).getResultNumber())->get();
+      continue;
+    }
+    if (auto arg = dyn_cast<BlockArgument>(v)) {
+      if (auto loop = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp())) {
+        if (arg.getArgNumber() == 0) return std::nullopt;   // the induction variable
+        v = loop.getInitArgs()[arg.getArgNumber() - 1];
+        continue;
+      }
+      return 0;
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+// 한 fusion group 의 결과는 L2 패널에서 DRAM 으로 저장되고, 다음 group 은 그
+// DRAM 을 새 L2 패널로 다시 읽는다. 둘이 같은 모양(텐서 전체가 패널 하나)이면
+// 다시 읽는 대신 원래 패널을 그대로 읽힌다 — decode 의 1xH 활성값이 그렇다.
+// DRAM 저장은 다른 곳(결과, 다른 모양의 읽기)이 없으면 죽은 코드가 된다.
+// 패널이 오래 살아 L2 를 더 차지하므로 작은 패널만 넘긴다.
+constexpr int64_t kForwardedPanelBytes = 256 * 1024;
+void forwardPanels(ModuleOp m) {
+  SmallVector<std::pair<linalg::CopyOp, Value>> work;
+  m.walk([&](linalg::CopyOp load) {
+    auto fresh = load.getOutputs()[0].getDefiningOp<bufferization::AllocTensorOp>();
+    if (!fresh || spaceOf(fresh.getResult()) != std::optional<int64_t>(1)) return;
+    auto store = load.getInputs()[0].getDefiningOp<linalg::CopyOp>();
+    if (!store || store->getBlock() != load->getBlock()) return;
+    Value panel = store.getInputs()[0];
+    auto type = dyn_cast<RankedTensorType>(panel.getType());
+    if (!type || type != load.getResult(0).getType() || !type.hasStaticShape() ||
+        spaceOf(panel) != std::optional<int64_t>(1) ||
+        type.getNumElements() * int64_t(elementBytes(type.getElementType())) > kForwardedPanelBytes)
+      return;
+    work.push_back({load, panel});
+  });
+  for (auto [load, panel] : work) {
+    load.getResult(0).replaceAllUsesWith(panel);
+    load.erase();
+  }
+}
+} // namespace
+
 /// Stage 2 — 타일 계획을 고르고 타일 루프를 세운다.
 ///
 /// L2 패널 → 코어 구간 → L1 패널 → 배열 → K 조각 순으로 타일링한다.
@@ -542,6 +605,9 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
   if (failed(tileElementwiseGraph(m,hw,r,explanations))) return failure();
   m->setAttr("npu.plans",r.getArrayAttr(explanations));
   m->setAttr("npu.stage",r.getStringAttr("tiled"));
+  // 한 번 도는 루프가 접힌 뒤라야 저장과 다시 읽기가 나란히 보인다.
+  if (failed(cleanIR(m))) return failure();
+  forwardPanels(m);
   return cleanIR(m);
 }
 } // namespace npu
