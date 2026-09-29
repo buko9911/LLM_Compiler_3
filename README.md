@@ -14,6 +14,11 @@ matmul·elementwise·리덕션·전치·ReLU와 캡처한 Llama 디코더 층을
 멀티코어 타일 분배·L2 더블버퍼·가중치 패널 패킹이 구현되어 있다.
 지원 연산과 정적 형상에는 제약이 있으며, 임의 HF 모델의 자동 컴파일을 보장하지 않는다.
 
+**브랜치 `jongjip/PIM-hybrid`**: Qwen3 디코드 스텝(`examples/qwen3`), W8A8 양자화(`--quantize=w8a8`,
+INT8 MMA·양자화·역양자화 lowering), 그리고 가중치 GEMV 묶음을 비용 모델로 NPU와 LPDDR6-PIM에
+나눠 싣는 하이브리드 컴파일러 `npu-hybrid`(NPU 페이즈 + PIM 레코드 + 호스트 스케줄)를 더했다.
+설계·사용법·결과는 [docs/HYBRID.md](docs/HYBRID.md)에 있다.
+
 ## LLM_Compiler_2 에서 달라진 점
 
 | 영역 | LLM_Compiler_2 | LLM_Compiler_3 |
