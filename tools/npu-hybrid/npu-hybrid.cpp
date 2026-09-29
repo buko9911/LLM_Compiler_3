@@ -132,29 +132,46 @@ void emitDma(OpBuilder &b, Location loc, const Dma &d) {
   b.create(state);
 }
 
-// The INT8 activation [M, K] of a PIM group: DRAM -> L2, then one 2-D store per
-// (partition, PU, DRAM row): packet i of the vector goes to column i of the
-// PU's bank, 256 B apart (rarobacobgch).
+// The INT8 activation [M, K] of a PIM group into the activation rows.
+//
+// Under rarobacobgch the column is above the bank group and the subchannel, so
+// one column of one bank is a 256 B block: 4 bank groups x 2 subchannels x 32 B.
+// The even PUs 0,2,4,6 sit in bank 0 of bank groups 0..3 and the odd PUs in
+// bank 2, and every PU reads the same packet from its own bank. So packet i,
+// copied 8 times into a 256 B block, is what column i of bank 0 and of bank 2
+// hold in every rank the group computes on. Eight GDMA loads build those blocks
+// in L2 (the packet 32 B apart in DRAM, 256 B apart in L2), and then one store
+// per bank and DRAM row writes n whole columns as 256 n contiguous bytes. The
+// slots of a subchannel the group does not use belong to this activation too
+// (its tile id owns that column in every partition), so writing them is free.
 std::vector<Dma> scatter(const pim::Program &program, const ::npu::PimGroup &group,
                          const std::vector<int64_t> &activations, const ::npu::HybridGlobal &input,
                          uint64_t staging, uint64_t stagingBytes, std::string &error) {
   std::vector<Dma> out;
-  if (uint64_t(group.k) > stagingBytes) {
-    error = "PIM activation row larger than the L2 staging window";
+  const int64_t block = pim::kColBytes, perChunk = int64_t(stagingBytes) / block;
+  if (!perChunk) {
+    error = "L2 staging window smaller than one column block";
     return out;
   }
   for (int64_t m = 0; m < group.tokens; ++m) {
     const pim::Activation &a = program.activations[size_t(activations[size_t(m)])];
-    out.push_back({true, input.address + uint64_t(m * group.k), staging, uint64_t(group.k)});
-    for (int part : a.parts)
-      for (int pu = 0; pu < pim::kPUs; ++pu)
-        for (int64_t first = 0; first < a.packets();) {
-          int64_t packet = a.packetBase() + first;
-          int64_t n = std::min(a.packets() - first, pim::kPacketsPerRow - packet % pim::kPacketsPerRow);
-          out.push_back({false, program.activationPacketAddress(a, first, pu, part), staging + uint64_t(first) * 32,
-                         32, uint64_t(n), uint64_t(pim::kColBytes), 32});
-          first += n;
-        }
+    std::set<int> ranks;
+    for (int part : a.parts) ranks.insert(program.partRank(part));
+    for (int64_t chunk = 0; chunk < a.packets(); chunk += perChunk) {
+      const int64_t count = std::min(perChunk, a.packets() - chunk);
+      const uint64_t source = input.address + uint64_t(m * group.k + chunk * 32);
+      for (int slot = 0; slot < 8; ++slot)   // bank group slot / 2, subchannel slot % 2
+        out.push_back({true, source, staging + uint64_t(slot) * 32, 32, uint64_t(count), 32, uint64_t(block)});
+      for (int rank : ranks)
+        for (int parity = 0; parity < 2; ++parity)   // PU 0 -> bank 0 of group 0, PU 1 -> bank 2 of group 0
+          for (int64_t first = chunk; first < chunk + count;) {
+            int64_t packet = a.packetBase() + first;
+            int64_t n = std::min(chunk + count - first, pim::kPacketsPerRow - packet % pim::kPacketsPerRow);
+            out.push_back({false, program.activationPacketAddress(a, first, parity, rank * pim::kChannels),
+                           staging + uint64_t((first - chunk) * block), uint64_t(n * block)});
+            first += n;
+          }
+    }
   }
   return out;
 }
