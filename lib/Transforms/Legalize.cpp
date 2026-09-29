@@ -113,6 +113,9 @@ LogicalResult hoistConstants(ModuleOp m) {
 /// 구현하지 않은 것은 구분해서 쓴다.
 LogicalResult legalizeGraph(ModuleOp m) {
   if (failed(normalizeGraph(m))) return failure();
+  // --quantize=w8a8 이면 가중치 행렬곱을 INT8 로. 정규화가 전치를 접고 모양을
+  // 고친 뒤라야 "B 가 진입 인자인 rank-2 행렬곱"을 곧바로 알아볼 수 있다.
+  if (failed(quantizeGraph(m))) return failure();
 
   // FP16 중간 반올림은 수치 정책이므로 사용자가 --fp16 으로 명시해야 한다.
   // 컴파일러가 마음대로 정밀도를 낮추지 않는다.
@@ -140,11 +143,17 @@ LogicalResult legalizeGraph(ModuleOp m) {
 
       // 크기가 컴파일 시점에 정해져 있어야 타일 계획을 세우고 주소를 배정할
       // 수 있다. 동적 모양은 이 파이프라인이 다루지 않는다.
+      // 원소 타입은 FP16 x FP16 -> FP16(M_MMA_F16F16F32 후 FP16 writeout) 또는
+      // INT8 x INT8 -> INT32(M_MMA_I8I8I32, INT32 writeout) 둘 중 하나다.
+      auto elementOf = [](Value v) { return cast<ShapedType>(v.getType()).getElementType(); };
+      bool integer = elementOf(mm.getDpsInputOperand(0)->get()).isInteger(8);
       for (auto v : mm->getOperands()) {
         auto t = dyn_cast<RankedTensorType>(v.getType());
-        if (!t || !t.hasStaticShape() || t.getRank() != 2 ||
-            !t.getElementType().isF16() || t.getNumElements() <= 0) {
-          mm.emitError("current matmul lowering requires positive static rank-2 FP16 tensors, got ")
+        bool accumulator = v == mm.getDpsInitOperand(0)->get();
+        bool typed = t && (integer ? t.getElementType().isInteger(accumulator ? 32 : 8)
+                                   : t.getElementType().isF16());
+        if (!t || !t.hasStaticShape() || t.getRank() != 2 || !typed || t.getNumElements() <= 0) {
+          mm.emitError("current matmul lowering requires positive static rank-2 FP16 or INT8/INT32 tensors, got ")
               << v.getType();
           return WalkResult::interrupt();
         }
@@ -177,11 +186,15 @@ LogicalResult legalizeGraph(ModuleOp m) {
         return WalkResult::interrupt();
       }
 
+      // 양자화·역양자화는 전용 명령 하나씩이다(V_QUANT_F16_I8, V_DEQUANT_I32_F16).
+      // 모양과 region 이 그 명령의 계약과 정확히 같을 때만 알아본다.
+      if (isQuantizeGeneric(gen) || isDequantizeGeneric(gen)) return WalkResult::advance();
+
       if (reductionOf(gen)) {
         // V_REDUCE 는 스트림 전체를 다시 계산한다. 그래서 초기값이 이미
         // 결합 연산의 항등원이어야 결과가 그래프가 말하는 것과 같아진다
-        // (합이면 0, 최댓값이면 -inf).
-        bool sum = StringRef(reductionOf(gen)) == "V_REDUCE_SUM_F16_F32";
+        // (합이면 0, 최댓값이면 -inf). 제곱합(V_DOT)도 합이다.
+        bool sum = !StringRef(reductionOf(gen)).contains("MAX");
         auto fill = gen.getDpsInitOperand(0)->get().getDefiningOp<linalg::FillOp>();
         auto seed = fill ? fill.getInputs()[0].getDefiningOp<arith::ConstantOp>() : arith::ConstantOp();
         auto attr = seed ? dyn_cast<FloatAttr>(seed.getValue()) : FloatAttr();

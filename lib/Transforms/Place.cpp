@@ -63,9 +63,9 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
   };
   for (auto value : allocations) {
     auto t = dyn_cast<MemRefType>(value.getType());
-    unsigned width = t && t.getElementType().isF16() ? 2 : t && t.getElementType().isF32() ? 4 : 0;
+    unsigned width = t ? elementBytes(t.getElementType()) : 0;
     if (!t || !t.hasStaticShape() || !width || !t.getLayout().isIdentity())
-      return m.emitError("placement requires static contiguous FP16/FP32 allocations");
+      return m.emitError("placement requires static contiguous FP16/FP32/INT8/INT32 allocations");
     uint64_t bytes = uint64_t(t.getNumElements())*width;
     BufferRequirement r; r.name = "buffer" + std::to_string(requirements.size());
     r.bytes = bytes; r.space = MemorySpace(t.getMemorySpaceAsInt());
@@ -86,7 +86,7 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
     entry.walk([&](func::ReturnOp ret) {
       for (auto v : ret.getOperands())
         if (auto t = dyn_cast<MemRefType>(v.getType()))
-          bytes += uint64_t(t.getNumElements()) * (t.getElementType().isF32() ? 4 : 2);
+          bytes += uint64_t(t.getNumElements()) * elementBytes(t.getElementType());
     });
     if (bytes) {
       BufferRequirement readback;

@@ -199,6 +199,49 @@ def load(step: DecodeStep, checkpoint: Checkpoint, first_layer: int = 0) -> None
             parameter.copy_(checkpoint.get(key).to(parameter.dtype))
 
 
+class W8A8Linear(nn.Module):
+    """A linear layer under the compiler's W8A8 contract (npu-compile --quantize=w8a8).
+
+    Weight, per output channel n:  s[n] = fl32(max_k |W[n,k]|) / 127,
+                                   q = clamp(rne(W / s[n]), -127, 127), 0 where s[n] = 0.
+    Activation, per row m:         alpha[m] = fl32(max_k |x[m,k]|) * fl32(1/127),
+                                   qx = clamp(rne(x / alpha[m]), -127, 127), 0 where alpha[m] = 0.
+    Output:                        y = fp16((fp32(qx @ q^T) * alpha[m]) * s[n]).
+
+    x is taken at FP16, as the NPU holds it. Given the same FP16 x this is the
+    compiled program's result bit for bit: the integer product is exact, and
+    every FP32 step is one IEEE operation in the same order.
+    """
+
+    def __init__(self, linear: nn.Linear):
+        super().__init__()
+        w = linear.weight.detach().to(torch.float16).float()
+        s = w.abs().amax(1) / torch.tensor(127.0)
+        q = torch.where(s[:, None] > 0, torch.clamp(torch.round(w / torch.where(s > 0, s, 1.0)[:, None]), -127, 127),
+                        torch.zeros_like(w))
+        self.register_buffer("q", q.to(torch.int8))
+        self.register_buffer("s", s)
+
+    def forward(self, x):
+        dtype = x.dtype
+        x = x.to(torch.float16).float()
+        alpha = x.abs().amax(-1, keepdim=True) * torch.tensor(1 / 127, dtype=torch.float32)
+        qx = torch.where(alpha > 0, torch.clamp(torch.round(x / torch.where(alpha > 0, alpha, 1.0)), -127, 127),
+                         torch.zeros_like(x))
+        acc = (qx.double() @ self.q.double().t()).float()
+        return ((acc * alpha) * self.s).to(torch.float16).to(dtype)
+
+
+def w8a8(module: nn.Module) -> nn.Module:
+    """Every nn.Linear of module replaced by its W8A8Linear."""
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            setattr(module, name, W8A8Linear(child))
+        else:
+            w8a8(child)
+    return module
+
+
 def rope_tables(c: Config, positions) -> tuple[torch.Tensor, torch.Tensor]:
     inverse = 1.0 / (c.rope_theta ** (torch.arange(0, c.head_dim, 2, dtype=torch.float64) / c.head_dim))
     angles = torch.tensor(positions, dtype=torch.float64)[:, None] * inverse[None, :]

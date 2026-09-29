@@ -118,6 +118,8 @@ bool isZeroFilled(Value value) {
   for (unsigned hops = 0; value && hops < 8; ++hops) {
     if (auto fill = value.getDefiningOp<linalg::FillOp>()) {
       auto seed = fill.getInputs()[0].getDefiningOp<arith::ConstantOp>();
+      if (auto integer = seed ? dyn_cast<IntegerAttr>(seed.getValue()) : IntegerAttr())
+        return integer.getValue().isZero();
       auto attr = seed ? dyn_cast<FloatAttr>(seed.getValue()) : FloatAttr();
       return attr && attr.getValue().isZero();
     }
@@ -171,15 +173,33 @@ const char *reductionOf(linalg::GenericOp gen) {
     return nullptr;
   Block &body = gen.getRegion().front();
   auto scalars = llvm::to_vector(llvm::map_range(body.without_terminator(), [](Operation &o) { return &o; }));
-  if (scalars.size() != 2 || !isa<arith::ExtFOp>(scalars[0]) ||
-      scalars[0]->getOperand(0) != body.getArgument(0)) return nullptr;
-  auto *combine = scalars[1];
-  if (combine->getNumOperands() != 2 ||
-      cast<linalg::YieldOp>(body.getTerminator()).getValues()[0] != combine->getResult(0) ||
-      !llvm::is_contained(combine->getOperands(), scalars[0]->getResult(0)) ||
-      !llvm::is_contained(combine->getOperands(), body.getArgument(1))) return nullptr;
-  if (isa<arith::AddFOp>(combine)) return "V_REDUCE_SUM_F16_F32";
-  if (isa<arith::MaximumFOp>(combine)) return "V_REDUCE_MAX_F16_F32";
+  Value element = body.getArgument(0), acc = body.getArgument(1);
+  Value yielded = cast<linalg::YieldOp>(body.getTerminator()).getValues()[0];
+  // combine 이 (value, acc) 두 피연산자를 순서와 무관하게 받고 결과를 내놓는가.
+  auto folds = [&](Operation *combine, Value value) {
+    return combine->getNumOperands() == 2 && yielded == combine->getResult(0) &&
+           llvm::is_contained(combine->getOperands(), value) &&
+           llvm::is_contained(combine->getOperands(), acc);
+  };
+  if (scalars.size() == 2 && isa<arith::ExtFOp>(scalars[0]) && scalars[0]->getOperand(0) == element &&
+      folds(scalars[1], scalars[0]->getResult(0))) {
+    if (isa<arith::AddFOp>(scalars[1])) return "V_REDUCE_SUM_F16_F32";
+    if (isa<arith::MaximumFOp>(scalars[1])) return "V_REDUCE_MAX_F16_F32";
+    return nullptr;
+  }
+  if (scalars.size() != 3) return nullptr;
+  // 넓힌 값의 제곱합. 곱이 FP32 에서 일어나므로 FP16 제곱처럼 256 을 넘는
+  // 값에서 넘치지 않는다. V_DOT_F16_F32 에 같은 스트림을 두 번 준다.
+  if (isa<arith::ExtFOp>(scalars[0]) && scalars[0]->getOperand(0) == element &&
+      isa<arith::MulFOp>(scalars[1]) && scalars[1]->getOperand(0) == scalars[0]->getResult(0) &&
+      scalars[1]->getOperand(1) == scalars[0]->getResult(0) && isa<arith::AddFOp>(scalars[2]) &&
+      folds(scalars[2], scalars[1]->getResult(0)))
+    return "V_DOT_F16_F32";
+  // 절댓값의 최댓값 — 행마다의 양자화 스케일이 여기서 나온다.
+  if (isa<math::AbsFOp>(scalars[0]) && scalars[0]->getOperand(0) == element &&
+      isa<arith::ExtFOp>(scalars[1]) && scalars[1]->getOperand(0) == scalars[0]->getResult(0) &&
+      isa<arith::MaximumFOp>(scalars[2]) && folds(scalars[2], scalars[1]->getResult(0)))
+    return kAbsMaxReduction;
   return nullptr;
 }
 } // namespace npu

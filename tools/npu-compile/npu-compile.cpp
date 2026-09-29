@@ -28,6 +28,7 @@
 #include "npu/Transforms/Passes.h"
 #include "npu/Transforms/Pipeline.h"
 #include "npu/Target/HardwareConfig.h"
+#include "npu/Target/Quantize.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -37,6 +38,7 @@
 #include "llvm/Support/Base64.h"
 #include "llvm/Support/JSON.h"
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -99,6 +101,11 @@ struct Options {
   /// 주소는 metadata.json의 outputs[].readback_l2_address에 적힌다.
   bool readback = false;
 
+  /// --quantize=w8a8 : 가중치 행렬곱을 W8A8 로. 가중치는 출력 채널별 INT8 과
+  /// FP32 스케일, 활성값은 행별 INT8 이 된다(lib/Transforms/Quantize.cpp).
+  /// 원본 FP16 가중치를 INT8 로 바꾸는 일은 --inputs 로 이미지를 만들 때 한다.
+  std::string quantize;
+
   /// --save-stages : 단계마다 .mlir 을 출력 디렉터리에 남긴다.
   bool saveStages = false;
 
@@ -125,6 +132,7 @@ int main(int argc, char **argv) {
                    "  --reciprocal-division  lower a/b as a * (1/b); the hardware has no divide\n"
                    "  --inputs directory  pack contiguous FP16 arg0.bin, arg1.bin, ... into hbm.bin\n"
                    "  --readback          copy outputs back into L2 at the end (read from l2_sram_dump.bin)\n"
+                   "  --quantize=w8a8     INT8 weights per output channel, INT8 activations per row\n"
                    "  --time-stages        report pass wall times\n"
                    "  --save-stages | --reparse-stages\n";
       return 0;
@@ -141,6 +149,12 @@ int main(int argc, char **argv) {
       options.reciprocalDivision = true;
     } else if (arg == "--readback") {
       options.readback = true;
+    } else if (arg.rfind("--quantize=", 0) == 0) {
+      options.quantize = arg.substr(11);
+      if (options.quantize != "w8a8") {
+        std::cerr << "unsupported quantization: " << options.quantize << '\n';
+        return 2;
+      }
     } else if (arg == "--save-stages") {
       options.saveStages = true;
     } else if (arg == "--reparse-stages") {
@@ -256,6 +270,9 @@ int main(int argc, char **argv) {
 
     if (options.readback)
       (*module)->setAttr("npu.readback", mlir::UnitAttr::get(&context));
+
+    if (!options.quantize.empty())
+      (*module)->setAttr("npu.quantize", mlir::StringAttr::get(&context, options.quantize));
   }
 
   //===--------------------------------------------------------------------===//
@@ -523,6 +540,32 @@ int main(int argc, char **argv) {
     image.seekp(*dramBytes - 1);
     image.put(0);
 
+    // W8A8: 양자화된 가중치와 스케일은 원본 FP16 가중치 파일에서 만든다.
+    // 한 원본의 두 몫(가중치, 스케일)은 서로 다른 인자라, 스케일만 기억해 둔다.
+    std::map<int64_t, std::vector<float>> scalesOf;
+    auto quantizeSource = [&](int64_t source, uint64_t outputs, std::vector<int8_t> *q,
+                              std::vector<float> &scales) -> bool {
+      auto from = std::filesystem::path(options.inputsDir) / ("arg" + std::to_string(source) + ".bin");
+      auto size = std::filesystem::file_size(from, ec);
+      if (ec || !outputs || size % (2 * outputs)) {
+        std::cerr << "wrong weight size for quantization: " << from << '\n';
+        return false;
+      }
+      const uint64_t inputs = size / (2 * outputs);
+      std::vector<uint16_t> weights(size / 2);
+      std::ifstream data(from, std::ios::binary);
+      data.read(reinterpret_cast<char *>(weights.data()), std::streamsize(size));
+      if (!data) return false;
+      std::vector<int8_t> local;
+      auto &target = q ? *q : local;
+      target.resize(outputs * inputs);
+      scales.resize(outputs);
+      // 전치를 접어 넣은 가중치는 모델 그대로 [N][K] 로 저장되어 있다.
+      ::npu::quantizeChannels(weights.data(), outputs, inputs, flipped.count(source) != 0,
+                              target.data(), scales.data());
+      return true;
+    };
+
     for (const auto &value : *args) {
       auto *argument = value.getAsObject();
       if (!argument)
@@ -536,13 +579,38 @@ int main(int argc, char **argv) {
         return 1;
 
       auto dtype = argument->getString("dtype");
-      const uint64_t width = dtype && *dtype == "float32" ? 4 : 2;
+      const uint64_t width = !dtype || *dtype == "float16" ? 2 : *dtype == "int8" ? 1 : 4;
       const uint64_t expected = uint64_t(*rows) * uint64_t(*cols) * width;
       auto path = std::filesystem::path(options.inputsDir) / ("arg" + std::to_string(*index) + ".bin");
       auto panel = argument->getInteger("packed");
       std::vector<char> raw;
+      // 선언된 모양 그대로의 바이트인가, 아니면 전치해서 놓아야 하는가.
+      bool transposed = flipped.count(*index) != 0;
       // Constants and external inputs obey the same physical-layout contract.
-      if (auto found = held.find(*index); found != held.end()) {
+      if (auto *origin = argument->getObject("quantized")) {
+        auto source = origin->getInteger("source");
+        auto part = origin->getString("part");
+        if (!source || !part) return 1;
+        if (*part == "weight") {
+          // 선언된 모양 [K, N] 의 INT8. 양자화기는 채널 우선 [N][K] 로 낸다.
+          const uint64_t inputs = uint64_t(*rows), outputs = uint64_t(*cols);
+          std::vector<int8_t> q;
+          auto &scales = scalesOf[*source];
+          if (!quantizeSource(*source, outputs, &q, scales) || q.size() != inputs * outputs) return 1;
+          raw.resize(inputs * outputs);
+          for (uint64_t k = 0; k < inputs; ++k)
+            for (uint64_t n = 0; n < outputs; ++n) raw[k * outputs + n] = char(q[n * inputs + k]);
+        } else if (*part == "scale") {
+          auto &scales = scalesOf[*source];
+          if (scales.empty() && !quantizeSource(*source, uint64_t(*cols), nullptr, scales)) return 1;
+          raw.resize(scales.size() * sizeof(float));
+          std::memcpy(raw.data(), scales.data(), raw.size());
+        } else {
+          std::cerr << "unknown quantized part for argument " << *index << '\n';
+          return 1;
+        }
+        transposed = false;
+      } else if (auto found = held.find(*index); found != held.end()) {
         raw = found->second;
       } else {
         auto size = std::filesystem::file_size(path, ec);
@@ -551,7 +619,7 @@ int main(int argc, char **argv) {
           return 1;
         }
         std::ifstream data(path, std::ios::binary);
-        if (!flipped.count(*index) && !panel) {
+        if (!transposed && !panel) {
           image.seekp(*address);
           image << data.rdbuf();
           if (!data || !image) return 1;
@@ -569,7 +637,7 @@ int main(int argc, char **argv) {
 
       // 패널 단위로 모아 달라고 한 가중치. 그래야 패널 하나가 전송 하나가 된다.
 
-      if (!flipped.count(*index) && !panel) {
+      if (!transposed && !panel) {
         image.write(raw.data(), std::streamsize(raw.size()));
       } else {
         const int64_t rowCount = *rows;
@@ -578,8 +646,8 @@ int main(int argc, char **argv) {
         // 파일에는 모델이 들고 있는 대로 들어 있다. 전치를 접어 넣은 가중치는
         // rows 개짜리 행이 cols 줄이므로 반대로 읽는다.
         auto source = [&](int64_t row, int64_t column) {
-          return flipped.count(*index) ? size_t(column * rowCount + row)
-                                       : size_t(row * columnCount + column);
+          return transposed ? size_t(column * rowCount + row)
+                            : size_t(row * columnCount + column);
         };
 
         std::vector<char> laid(raw.size());

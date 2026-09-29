@@ -31,6 +31,9 @@ Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &reques
       !h.nocBytesPerCycle || !h.matrixMACsPerCycle || h.matrixLatency > (1ull<<20))
     return R::failure("invalid hardware cost model");
   if (request.graphResidentBytes >= h.l2Bytes) return R::failure("graph residency leaves no L2 staging capacity");
+  // A and B share one element width, C has its own: FP16/FP16/FP16 or INT8/INT8/INT32.
+  const uint64_t in = request.inputBytes, out = request.outputBytes;
+  if (!in || !out) return R::failure("invalid matmul element widths");
   MemoryLimits limits{h.l1Bytes,h.l2Bytes,h.dramBytes,1,h.dramBytesPerCycle,0};
   std::vector<TilingPlan> plans;
   auto ms = candidates(s.m,32), ns = candidates(s.n,32), ks = candidates(s.k,32);
@@ -51,7 +54,7 @@ Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &reques
       if (lm <= 32 && ln > 32) continue;
       const uint64_t innerPanels = ceilDiv(s.n,n) > 1 ? ceilDiv(s.n,n) : ceilDiv(s.m,m);
       const uint64_t l1Stages = std::min<uint64_t>(innerPanels,std::max(1u,request.stages));
-      if (2*l1Stages*(lm*k+k*ln+std::min(lm,32ul)*std::min(ln,32ul)) > h.l1Bytes) continue;
+      if (l1Stages*(in*(lm*k+k*ln)+out*std::min(lm,32ul)*std::min(ln,32ul)) > h.l1Bytes) continue;
       TilingPlan p;
       p.schedule = k == s.k ? Schedule::ResidentPanels : Schedule::Hybrid;
       p.numerical = request.numerical;
@@ -63,23 +66,23 @@ Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &reques
       // L2 stages and the L1 allocations inside the unrolled panel loop are
       // simultaneously live. Reserve both; the accumulator is dedicated state.
       p.stages = std::max(1u,request.stages);
-      const uint64_t stageBytes = uint64_t(p.stages) * 2;
+      const uint64_t stageBytes = uint64_t(p.stages) * std::max(in,out);
       if (m*s.k > UINT64_MAX/stageBytes || s.k*n > UINT64_MAX/stageBytes ||
           m*n > UINT64_MAX/stageBytes) continue;
-      p.memory.push_back(buffer("l2.activation",MemorySpace::L2,stageBytes*m*s.k));
-      p.memory.push_back(buffer("l2.weight",MemorySpace::L2,stageBytes*s.k*n));
-      p.memory.push_back(buffer("l2.output",MemorySpace::L2,stageBytes*m*n));
-      p.memory.push_back(buffer("l1.activation",MemorySpace::L1,2*l1Stages*p.l1.m*k));
-      p.memory.push_back(buffer("l1.weight",MemorySpace::L1,2*l1Stages*k*p.l1.n));
-      p.memory.push_back(buffer("l1.output",MemorySpace::L1,2*l1Stages*p.array.m*p.array.n));
+      p.memory.push_back(buffer("l2.activation",MemorySpace::L2,p.stages*in*m*s.k));
+      p.memory.push_back(buffer("l2.weight",MemorySpace::L2,p.stages*in*s.k*n));
+      p.memory.push_back(buffer("l2.output",MemorySpace::L2,p.stages*out*m*n));
+      p.memory.push_back(buffer("l1.activation",MemorySpace::L1,in*l1Stages*p.l1.m*k));
+      p.memory.push_back(buffer("l1.weight",MemorySpace::L1,in*l1Stages*k*p.l1.n));
+      p.memory.push_back(buffer("l1.output",MemorySpace::L1,out*l1Stages*p.array.m*p.array.n));
       auto memory = planMemory(p.memory,limits);
       if (!memory) continue;
       p.placement = std::move(memory.value);
       // Each L2 MxN panel is fetched once, and reused over its array-sized tiles.
-      p.dramTrafficBytes = 2*(s.m*s.k*ceilDiv(s.n,n) + s.k*s.n*ceilDiv(s.m,m) + s.m*s.n);
+      p.dramTrafficBytes = in*(s.m*s.k*ceilDiv(s.n,n) + s.k*s.n*ceilDiv(s.m,m)) + out*s.m*s.n;
       const uint64_t activationN = lm <= 32 && k == s.k ? lane : ln;
-      p.localTrafficBytes = 2*(s.m*s.k*ceilDiv(s.n,activationN) +
-                              s.k*s.n*ceilDiv(s.m,lm) + s.m*s.n);
+      p.localTrafficBytes = in*(s.m*s.k*ceilDiv(s.n,activationN) + s.k*s.n*ceilDiv(s.m,lm)) +
+                            out*s.m*s.n;
       auto tiles = ceilDiv(s.m,p.array.m)*ceilDiv(s.n,p.array.n);
       auto kChunks = ceilDiv(s.k,k);
       // Array work includes startup for each K chunk.

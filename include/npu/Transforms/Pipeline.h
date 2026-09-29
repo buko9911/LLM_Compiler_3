@@ -18,7 +18,23 @@ mlir::LogicalResult cleanIR(mlir::ModuleOp module);
 bool isSupportedElementwiseScalar(mlir::Operation *op);
 const char *elementwiseInstruction(mlir::Operation *op);
 // Non-null when the op is a recognised row reduction; names its V_REDUCE variant.
+// V_DOT_F16_F32 means a sum of squares (the stream dotted with itself), and
+// kAbsMaxReduction the largest magnitude, V_ABS_F16 then V_REDUCE_MAX_F16_F32.
 const char *reductionInstruction(mlir::Operation *op);
+inline constexpr const char *kAbsMaxReduction = "V_ABS_F16+V_REDUCE_MAX_F16_F32";
+// Bytes per element of the types a placed buffer may hold (f16, f32, i8, i32);
+// 0 for any other type.
+unsigned elementBytes(mlir::Type type);
+// W8A8 (npu.quantize = "w8a8"): every matmul whose B operand is an entry
+// argument becomes per-row activation quantization, an INT8 x INT8 -> INT32
+// matmul on a per-output-channel INT8 weight, and a dequantization. Runs inside
+// legalizeGraph, after normalisation.
+mlir::LogicalResult quantizeGraph(mlir::ModuleOp module);
+// The two elementwise generics quantizeGraph emits, recognised by their bodies:
+// FP16 [M,K] and per-row FP32 scale -> INT8 (V_QUANT_F16_I8), and INT32 [M,N]
+// with a per-row and a per-channel FP32 scale -> FP16 (V_DEQUANT_I32_F16).
+bool isQuantizeGeneric(mlir::Operation *op);
+bool isDequantizeGeneric(mlir::Operation *op);
 // Non-null when the scalar op can apply a broadcast FP32 scalar to an FP16 stream.
 const char *broadcastInstruction(mlir::Operation *op);
 // A width cast names an existing stream: FP16 streams and FP32 scalars are what

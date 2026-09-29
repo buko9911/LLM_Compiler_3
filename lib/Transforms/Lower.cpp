@@ -22,6 +22,9 @@ struct View {
   uint64_t address = 0, rows = 0, cols = 0, rowStride = 0, colStride = 2;
   // Reductions produce FP32, so the element width is carried rather than assumed.
   uint64_t bytes = 2;
+  // INT8 activations and weights, INT32 accumulators: same widths as some float
+  // types, different instructions.
+  bool integer = false;
   // A packed buffer holds each `packed`-wide column panel contiguously instead of
   // row by row, so one panel is one transfer. `origin` is where panel zero starts.
   uint64_t origin = 0, packed = 0;
@@ -69,7 +72,7 @@ class Lowering {
   }
   bool same(const View &a,const View &b) {
     return a.space==b.space && a.address==b.address && a.rows==b.rows && a.cols==b.cols && a.rowStride==b.rowStride && a.colStride==b.colStride &&
-           a.bytes==b.bytes && a.packed==b.packed;
+           a.bytes==b.bytes && a.packed==b.packed && a.integer==b.integer;
   }
   bool inst(const std::string &text) {
     auto w=assembleLine(text);
@@ -124,7 +127,8 @@ class Lowering {
     auto v=*live;
     // ISA ver 1.0: M_WRITEOUT carries the tile shape and byte stride inline.
     if (!imm(12,v.address)) return false;
-    auto out=encodeMatrixWriteout(WriteoutType::F16,12,uint32_t(v.rows),uint32_t(v.cols),uint32_t(v.rowStride));
+    auto out=encodeMatrixWriteout(v.integer ? WriteoutType::I32 : WriteoutType::F16,12,uint32_t(v.rows),
+                                  uint32_t(v.cols),uint32_t(v.rowStride));
     if (!out) return fail(out.error);
     current.words.insert(current.words.end(),out.value.begin(),out.value.end());
     if (!inst("C_WAIT_MATRIX")) return false;
@@ -307,25 +311,29 @@ class Lowering {
   bool matrix(linalg::MatmulOp mm) {
     auto a=view(mm.getDpsInputOperand(0)->get()), b=view(mm.getDpsInputOperand(1)->get()), c=view(mm.getDpsInitOperand(0)->get());
     if (!error.empty()) return false;
+    // FP16 x FP16 -> FP16 writeout, or INT8 x INT8 -> INT32 writeout.
+    const bool quantized = a.integer;
+    const uint64_t in = quantized ? 1 : 2, out = quantized ? 4 : 2;
     if (a.space!=2 || b.space!=2 || c.space!=2 || a.cols!=b.rows || a.rows!=c.rows || b.cols!=c.cols ||
-        c.rows>32 || c.cols>32 || a.colStride!=2 || b.colStride!=2 || c.colStride!=2 ||
-        a.bytes!=2 || b.bytes!=2 || c.bytes!=2)
-      return fail("matmul operands must be compatible FP16 L1 array tiles");
+        c.rows>32 || c.cols>32 || a.colStride!=in || b.colStride!=in || c.colStride!=out ||
+        a.bytes!=in || b.bytes!=in || c.bytes!=out || b.integer!=quantized || c.integer!=quantized)
+      return fail("matmul operands must be compatible FP16 or INT8/INT32 L1 array tiles");
+    const auto type = quantized ? MatrixType::I8 : MatrixType::F16;
     if (live && !same(*live,c)) return fail("two simultaneously live accumulator tiles");
     // ISA ver 1.0: the loads carry W [K,N] and A [M,K] with byte strides; the
     // fixed 32x32x32 M_MMA is then issued once per 32-element K slice. The
     // first slice INITs an empty accumulator; a K-split tile into the same
     // live output continues it with ACC (the tile_zero fill emits nothing).
     const bool accumulate=live.has_value();
-    auto weight=encodeMatrixLoad(MatrixOperand::Weight,MatrixType::F16,12,uint32_t(b.rows),uint32_t(b.cols),uint32_t(b.rowStride));
+    auto weight=encodeMatrixLoad(MatrixOperand::Weight,type,12,uint32_t(b.rows),uint32_t(b.cols),uint32_t(b.rowStride));
     if (!weight) return fail(weight.error);
-    auto activation=encodeMatrixLoad(MatrixOperand::Activation,MatrixType::F16,13,uint32_t(a.rows),uint32_t(a.cols),uint32_t(a.rowStride));
+    auto activation=encodeMatrixLoad(MatrixOperand::Activation,type,13,uint32_t(a.rows),uint32_t(a.cols),uint32_t(a.rowStride));
     if (!activation) return fail(activation.error);
     if (!imm(12,b.address)) return false;
     current.words.insert(current.words.end(),weight.value.begin(),weight.value.end());
     if (!imm(13,a.address)) return false;
     current.words.insert(current.words.end(),activation.value.begin(),activation.value.end());
-    auto mma=mmaSequence(MatrixType::F16,uint32_t(a.cols),accumulate);
+    auto mma=mmaSequence(type,uint32_t(a.cols),accumulate);
     current.words.insert(current.words.end(),mma.begin(),mma.end());
     live=c;
     prefetchPoint = current.words.size(); prefetchOutput = c; crossedCopies.clear();
@@ -334,14 +342,14 @@ class Lowering {
   llvm::json::Object descriptor(const View &v) {
     return llvm::json::Object{{"space",v.space},{"address",v.address},{"rows",v.rows},{"cols",v.cols},
             {"row_stride_bytes",v.rowStride},{"column_stride_bytes",v.colStride},
-            {"dtype",v.bytes==4 ? "float32" : "float16"}};
+            {"dtype",v.integer ? (v.bytes==1 ? "int8" : "int32") : v.bytes==4 ? "float32" : "float16"}};
   }
   // A rank-1 buffer is one row, so every later stage sees the same 2-D view.
   bool bind(Value value,IntegerAttr address) {
     auto t=dyn_cast<MemRefType>(value.getType());
-    uint64_t width = t && t.getElementType().isF16() ? 2 : t && t.getElementType().isF32() ? 4 : 0;
+    uint64_t width = t ? elementBytes(t.getElementType()) : 0;
     if (!address || address.getInt()<0 || !t || !t.hasStaticShape() || !width || t.getRank()<1)
-      return fail("requires a placed FP16/FP32 buffer");
+      return fail("requires a placed FP16/FP32/INT8/INT32 buffer");
     SmallVector<int64_t> strides; int64_t offset;
     if (failed(t.getStridesAndOffset(strides,offset)) || offset!=0 || strides.back()!=1 ||
         (t.getRank()==2 && strides[0]<=0))
@@ -359,6 +367,7 @@ class Lowering {
     uint64_t rowStride = t.getRank()==1 ? cols*width : uint64_t(strides[t.getRank()-2])*width;
     View v{unsigned(t.getMemorySpaceAsInt()),uint64_t(address.getInt()),rows,cols,rowStride,width,width};
     v.origin=v.address;
+    v.integer=t.getElementType().isInteger();
     if (auto arg=dyn_cast<BlockArgument>(value))
       if (auto panel=cast<func::FuncOp>(arg.getOwner()->getParentOp())
               .getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"npu.packed_panel")) {
@@ -571,6 +580,80 @@ class Lowering {
     if (stride >= (1u<<18)) return fail("pointer stride exceeds the C_ADDI_U32 immediate");
     return inst("C_ADDI_U32 "+std::to_string(reg)+", "+std::to_string(reg)+", "+std::to_string(stride));
   }
+  // Per-row scalar operand (one FP32 value per row, a row of N or N rows of one):
+  // how many lanes it has and how far apart they are.
+  static std::pair<uint64_t,uint64_t> lanesOf(const View &v) {
+    return {v.rows==1 ? v.cols : v.rows, v.rows==1 ? v.colStride : v.rowStride};
+  }
+  // qx = V_QUANT_F16_I8(x, alpha[row]): FP16 [rows, cols] and one FP32 scale per
+  // row -> INT8 [rows, cols]. A hardware loop walks the rows, each with its scale.
+  bool quantize(linalg::GenericOp gen) {
+    prefetchPoint.reset();
+    if (!error.empty()) return false;
+    if (live && !drain()) return false;
+    View x = view(gen.getDpsInputs()[0]), alpha = view(gen.getDpsInputs()[1]), out = view(gen.getDpsInits()[0]);
+    if (!error.empty()) return false;
+    auto [lanes, laneStride] = lanesOf(alpha);
+    if (x.space!=2 || !x.contiguous() || x.bytes!=2 || x.integer ||
+        out.space!=2 || !out.contiguous() || out.bytes!=1 || !out.integer || out.rows!=x.rows || out.cols!=x.cols ||
+        alpha.space!=2 || alpha.bytes!=4 || alpha.integer || lanes!=x.rows)
+      return fail("quantization takes a contiguous FP16 L1 tile and one FP32 L1 scale per row");
+    if (!x.rows || !x.cols) return true;
+    const uint64_t chunk = chunkOf(x.cols, kF16PerRegister), chunks = x.cols / chunk;
+    if (!control("C_SET_VECTOR_ELEMENTS",chunk) || !imm(1,x.address) || !imm(2,alpha.address) ||
+        !imm(10,out.address)) return false;
+    if (chunks > 1 && !imm(13,chunks)) return false;
+    const bool rows = x.rows > 1;
+    if (rows && (!imm(14,x.rows) || !inst("C_LOOP_BEGIN 14"))) return false;
+    if (!inst("S_LOAD_F32 0, 2")) return false;
+    if (chunks > 1 && !inst("C_LOOP_BEGIN 13")) return false;
+    if (!inst("V_LOAD_F16 0, 1") || !inst("V_QUANT_F16_I8 1, 0, 0") || !inst("V_STORE_I8 10, 1")) return false;
+    if (chunks > 1 && (!advance(1,chunk*2) || !advance(10,chunk) || !inst("C_LOOP_END"))) return false;
+    const uint64_t walked = chunks > 1 ? x.cols : 0;
+    if (rows && (!advance(1,x.rowStride - walked*2) || !advance(10,out.rowStride - walked) ||
+                 !advance(2,laneStride) || !inst("C_LOOP_END")))
+      return false;
+    return inst("C_WAIT_VPU");
+  }
+  // y = V_DEQUANT_I32_F16(acc, alpha[row], s[col]): INT32 [rows, cols], one FP32
+  // scale per row and one per column -> FP16. An INT32 or FP32 register holds 16
+  // elements, so the chunk is at most 16 and the column scales walk with it.
+  bool dequantize(linalg::GenericOp gen) {
+    prefetchPoint.reset();
+    if (!error.empty()) return false;
+    if (live && !drain()) return false;
+    View acc = view(gen.getDpsInputs()[0]), alpha = view(gen.getDpsInputs()[1]),
+         scale = view(gen.getDpsInputs()[2]), out = view(gen.getDpsInits()[0]);
+    if (!error.empty()) return false;
+    auto [lanes, laneStride] = lanesOf(alpha);
+    if (acc.space!=2 || !acc.contiguous() || acc.bytes!=4 || !acc.integer ||
+        alpha.space!=2 || alpha.bytes!=4 || alpha.integer || lanes!=acc.rows ||
+        scale.space!=2 || scale.bytes!=4 || scale.integer || scale.rows!=1 || scale.cols!=acc.cols ||
+        scale.colStride!=4 ||
+        out.space!=2 || !out.contiguous() || out.bytes!=2 || out.integer || out.rows!=acc.rows || out.cols!=acc.cols)
+      return fail("dequantization takes a contiguous INT32 L1 tile, one FP32 scale per row and one per column");
+    if (!acc.rows || !acc.cols) return true;
+    constexpr uint64_t kWordsPerRegister = 16;
+    const uint64_t chunk = chunkOf(acc.cols, kWordsPerRegister), chunks = acc.cols / chunk;
+    if (!control("C_SET_VECTOR_ELEMENTS",chunk) || !imm(1,acc.address) || !imm(2,alpha.address) ||
+        !imm(3,scale.address) || !imm(10,out.address)) return false;
+    if (chunks > 1 && !imm(13,chunks)) return false;
+    const bool rows = acc.rows > 1;
+    if (rows && (!imm(14,acc.rows) || !inst("C_LOOP_BEGIN 14"))) return false;
+    if (!inst("S_LOAD_F32 0, 2")) return false;
+    // Every row reads the same column scales from their start.
+    if (rows && chunks > 1 && !imm(3,scale.address)) return false;
+    if (chunks > 1 && !inst("C_LOOP_BEGIN 13")) return false;
+    if (!inst("V_LOAD_I32 0, 1") || !inst("V_LOAD_F32 1, 3") || !inst("V_DEQUANT_I32_F16 2, 0, 0, 1") ||
+        !inst("V_STORE_F16 10, 2")) return false;
+    if (chunks > 1 && (!advance(1,chunk*4) || !advance(3,chunk*4) || !advance(10,chunk*2) ||
+                       !inst("C_LOOP_END"))) return false;
+    const uint64_t walked = chunks > 1 ? acc.cols : 0;
+    if (rows && (!advance(1,acc.rowStride - walked*4) || !advance(10,out.rowStride - walked*2) ||
+                 !advance(2,laneStride) || !inst("C_LOOP_END")))
+      return false;
+    return inst("C_WAIT_VPU");
+  }
   // V_REDUCE turns one whole stream into one scalar, so every row needs its own
   // stream. A hardware loop walks them instead of unrolling one triple per row:
   // attention row counts make full unrolling untenable.
@@ -594,17 +677,27 @@ class Lowering {
     // straight into scalar 0, every further chunk into scalar 1 and folded in
     // with the scalar unit. FP32 all the way, like the one-stream reduction.
     const uint64_t chunk = chunkOf(in.cols, kF16PerRegister), chunks = in.cols / chunk;
-    const bool sum = llvm::StringRef(instruction).contains("SUM");
+    const llvm::StringRef name(instruction);
+    const bool sum = !name.contains("MAX");
+    // One chunk into scalar `slot`. A sum of squares dots the stream with itself
+    // (products in FP32); the largest magnitude takes V_ABS first.
+    auto chunkInto = [&](const char *slot) {
+      if (!inst("V_LOAD_F16 0, 1")) return false;
+      if (name == "V_DOT_F16_F32") return inst(std::string("V_DOT_F16_F32 ")+slot+", 0, 0");
+      if (name == kAbsMaxReduction)
+        return inst("V_ABS_F16 1, 0") && inst(std::string("V_REDUCE_MAX_F16_F32 ")+slot+", 1");
+      return inst(std::string(instruction)+" "+slot+", 0");
+    };
     if (!control("C_SET_VECTOR_ELEMENTS",chunk) || !imm(1,in.address) || !imm(2,out.address))
       return false;
     if (chunks > 2 && !imm(13,chunks-1)) return false;
     bool loop = in.rows > 1;
     if (loop && (!imm(14,in.rows) || !inst("C_LOOP_BEGIN 14"))) return false;
-    if (!inst("V_LOAD_F16 0, 1") || !inst(std::string(instruction)+" 0, 0")) return false;
+    if (!chunkInto("0")) return false;
     if (chunks > 1) {
       if (!advance(1,chunk*2)) return false;
       if (chunks > 2 && !inst("C_LOOP_BEGIN 13")) return false;
-      if (!inst("V_LOAD_F16 0, 1") || !inst(std::string(instruction)+" 1, 0") ||
+      if (!chunkInto("1") ||
           !inst(std::string(sum ? "S_ADD_F32" : "S_MAX_F32")+" 0, 0, 1") || !advance(1,chunk*2))
         return false;
       if (chunks > 2 && !inst("C_LOOP_END")) return false;
@@ -819,7 +912,9 @@ class Lowering {
       }
       else if (auto mm=dyn_cast<linalg::MatmulOp>(op)) { if(!matrix(mm)) return false; }
       else if (auto gen=dyn_cast<linalg::GenericOp>(op)) {
-        if (auto *reduction=reductionInstruction(gen)) { if(!reduce(gen,reduction)) return false; }
+        if (isQuantizeGeneric(gen)) { if(!quantize(gen)) return false; }
+        else if (isDequantizeGeneric(gen)) { if(!dequantize(gen)) return false; }
+        else if (auto *reduction=reductionInstruction(gen)) { if(!reduce(gen,reduction)) return false; }
         else if (auto init=cast<MemRefType>(gen.getDpsInits()[0].getType());
                  init.getElementType().isF32() &&
                  (init.getRank()==1 || (init.getRank()==2 && init.getDimSize(1)==1))) {
@@ -873,6 +968,12 @@ public:
       // declared shape alone does not say so.
       if (auto panel=f.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(),"npu.packed_panel"))
         d["packed"]=panel.getInt();
+      // W8A8: the image builder derives this argument from another one's FP16
+      // weight (npu-compile --inputs, lib/Target/Quantize.cpp).
+      if (auto origin=f.getArgAttrOfType<DictionaryAttr>(arg.getArgNumber(),"npu.quantized"))
+        d["quantized"]=llvm::json::Object{
+            {"source",origin.getAs<IntegerAttr>("source").getInt()},
+            {"part",origin.getAs<StringAttr>("part").getValue().str()}};
       arguments.push_back(std::move(d));
     }
     if (!block(f.front()) || !drain() || !flush()) return module.emitError(error);

@@ -930,6 +930,48 @@ LogicalResult decomposeConcats(ModuleOp m) {
   return applyPatternsGreedily(m, std::move(patterns));
 }
 
+// RMSNorm 은 FP32 로 제곱해 FP32 로 더한다. FP16 좁히기는 그 제곱을 FP16 원소별
+// 연산으로 떼어 내는데, |x| 가 256 을 넘으면 x*x 가 FP16 최댓값을 넘는다.
+// 깊은 층의 잔차 스트림에는 그런 값이 있다. V_DOT_F16_F32 는 FP16 두 스트림을
+// FP32 에서 곱해 더하므로, 제곱과 합을 다시 하나로 합쳐 그 명령에 맡긴다.
+// 곱은 FP16 두 값의 곱이라 FP32 에서 정확하고, 원 그래프의 FP32 제곱과 같다.
+LogicalResult fuseSquareSums(OpBuilder &b, ModuleOp m) {
+  SmallVector<linalg::GenericOp> sums;
+  m.walk([&](linalg::GenericOp gen) {
+    if (StringRef(reductionOf(gen) ? reductionOf(gen) : "") == "V_REDUCE_SUM_F16_F32") sums.push_back(gen);
+  });
+  for (auto sum : sums) {
+    auto square = sum.getDpsInputOperand(0)->get().getDefiningOp<linalg::GenericOp>();
+    if (!square || !square->hasOneUse() || square.getNumDpsInputs() != 1 || square.getNumDpsInits() != 1 ||
+        square.getNumLoops() != 2 ||
+        !llvm::all_of(square.getIndexingMapsArray(), [](AffineMap map) { return map.isIdentity(); }) ||
+        !llvm::all_of(square.getIteratorTypesArray(),
+                      [](utils::IteratorType t) { return t == utils::IteratorType::parallel; }))
+      continue;
+    Block &body = square.getRegion().front();
+    auto product = dyn_cast<arith::MulFOp>(&body.front());
+    if (!product || std::next(body.begin()) != std::prev(body.end()) ||
+        product.getLhs() != body.getArgument(0) || product.getRhs() != body.getArgument(0) ||
+        cast<linalg::YieldOp>(body.getTerminator()).getValues()[0] != product.getResult() ||
+        !cast<ShapedType>(square.getDpsInputs()[0].getType()).getElementType().isF16())
+      continue;
+    b.setInsertionPoint(sum);
+    auto f32 = b.getF32Type();
+    auto fused = b.create<linalg::GenericOp>(
+        sum.getLoc(), sum.getResultTypes(), square.getDpsInputs(), sum.getDpsInits(),
+        sum.getIndexingMapsArray(), sum.getIteratorTypesArray(),
+        [&](OpBuilder &nb, Location nl, ValueRange args) {
+          Value wide = nb.create<arith::ExtFOp>(nl, f32, args[0]);
+          Value squared = nb.create<arith::MulFOp>(nl, wide, wide);
+          nb.create<linalg::YieldOp>(nl, ValueRange{nb.create<arith::AddFOp>(nl, squared, args[1])});
+        });
+    sum.getResult(0).replaceAllUsesWith(fused.getResult(0));
+    sum.erase();
+    square.erase();
+  }
+  return success();
+}
+
 // 배열은 출력 타일마다 누산기를 스스로 지우고, V_REDUCE 는 행에 더하는 게
 // 아니라 새로 쓴다. 그러므로 **아무도 읽기 전에 모든 바이트가 다시 쓰이는**
 // 초기화는 실제로 돌 필요가 없다.
@@ -1126,6 +1168,10 @@ LogicalResult normalizeGraph(ModuleOp m) {
   // 좁히기는 새 원소 타입을 reshape 를 통해 나르므로 축이 다시 늘어난다.
   // 이것이 마지막 재작성이다 — 여기서 남은 모양이 곧 lowering 이 받는 모양이다.
   if (failed(flattenElementwise(b, m))) return failure();
+  if (failed(cleanIR(m))) return failure();
+
+  // ── ⑦' FP32 제곱합을 V_DOT 하나로 ─────────────────────────────────
+  if (failed(fuseSquareSums(b, m))) return failure();
   if (failed(cleanIR(m))) return failure();
 
   // ── ⑧ 덮어쓰이는 fill 표시 ────────────────────────────────────────

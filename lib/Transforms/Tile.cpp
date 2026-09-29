@@ -92,7 +92,7 @@ LogicalResult promote(IRRewriter &r, linalg::MatmulOp mm, unsigned space, bool i
     // 시작해야 하므로 명시적으로 채운다. npu.tile_zero 표시는 뒤 단계가
     // "이 fill 은 타일 초기화"임을 알아보는 데 쓴다.
     auto zero = r.create<arith::ConstantOp>(mm.getLoc(),
-                                            r.getFloatAttr(destType.getElementType(), 0));
+                                            cast<TypedAttr>(r.getZeroAttr(destType.getElementType())));
     auto filled = r.create<linalg::FillOp>(mm.getLoc(), ValueRange{zero}, ValueRange{buffer});
     filled->setAttr("npu.tile_zero", r.getUnitAttr());
     mm.getDpsInitOperand(0)->set(filled.getResult(0));
@@ -408,7 +408,7 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
   SmallVector<Attribute> explanations;
   // Attention heads repeat identical shapes. Search once per shape in this
   // module; hardware and numerical policy are fixed throughout this pass.
-  std::map<std::tuple<uint64_t,uint64_t,uint64_t>,TilingPlan> selectedPlans;
+  std::map<std::tuple<uint64_t,uint64_t,uint64_t,uint64_t>,TilingPlan> selectedPlans;
 
   for (auto mm : work) {
     auto a = cast<RankedTensorType>(mm.getDpsInputOperand(0)->get().getType());
@@ -425,8 +425,11 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     request.searchStages = true;
     request.shape = {uint64_t(a.getDimSize(0)), uint64_t(b.getDimSize(1)),
                      uint64_t(a.getDimSize(1))};
+    auto c = cast<RankedTensorType>(mm.getDpsInitOperand(0)->get().getType());
+    request.inputBytes = elementBytes(a.getElementType());
+    request.outputBytes = elementBytes(c.getElementType());
 
-    auto key = std::make_tuple(request.shape.m,request.shape.n,request.shape.k);
+    auto key = std::make_tuple(request.shape.m,request.shape.n,request.shape.k,request.inputBytes);
     auto found = selectedPlans.find(key);
     if (found == selectedPlans.end()) {
       auto candidates = enumerateTilingPlans(request);
@@ -452,7 +455,7 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     auto init = mm.getDpsInitOperand(0)->get();
     r.setInsertionPoint(mm);
     auto empty = r.create<tensor::EmptyOp>(
-        mm.getLoc(), cast<RankedTensorType>(init.getType()).getShape(), a.getElementType());
+        mm.getLoc(), cast<RankedTensorType>(init.getType()).getShape(), c.getElementType());
     mm.getDpsInitOperand(0)->set(empty);
 
     // 가중치를 패널 단위로 모아 달라고 표시한다.

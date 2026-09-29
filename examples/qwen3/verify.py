@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "test/Integration"))
 import numpy as np
 import torch
 import harness
-from qwen3 import Checkpoint, Config, DecodeStep, MASK_MIN, load, rope_tables, step_mask
+from qwen3 import Checkpoint, Config, DecodeStep, MASK_MIN, load, rope_tables, step_mask, w8a8
 
 LP6 = Path("/home/jongjip/LP6")
 ap = argparse.ArgumentParser()
@@ -38,6 +38,8 @@ ap.add_argument("--compiler", type=Path, default=ROOT / "build/bin/npu-compile")
 ap.add_argument("--emulator", type=Path,
                 default=LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator")
 ap.add_argument("--backend", type=Path, default=LP6 / "lp6-pim-main", help="LP6_DRAMSIM3_ROOT")
+ap.add_argument("--quantize", action="store_true",
+                help="compile with --quantize=w8a8; the reference uses the same W8A8 linears")
 a = ap.parse_args()
 a.out = a.out.resolve()
 a.out.mkdir(parents=True, exist_ok=True)
@@ -57,6 +59,8 @@ embed = checkpoint.get("model.embed_tokens.weight")
 # FP32 reference module with the same weights.
 reference = DecodeStep(c, L, manifest["head"]).float()
 load(reference, checkpoint, manifest["first_layer"])
+if a.quantize:
+    w8a8(reference)
 
 
 def run_step(x, position, past, windows):
@@ -96,7 +100,8 @@ for index, tensor in enumerate(inputs16):
 package = a.out / "package"
 subprocess.run([str(a.compiler), "--from=graph", str(a.capture / "00-imported.mlir"),
                 "--settings", str(a.hardware), "-o", str(package), "--fp16", "--reciprocal-division",
-                "--readback", "--inputs", str(source)], check=True)
+                "--readback", "--inputs", str(source)] + (["--quantize=w8a8"] if a.quantize else []),
+               check=True)
 
 cores = re.search(r"(?m)^num_cores\s*=\s*(\d+)", a.hardware.read_text())
 settings = a.out / "settings.toml"

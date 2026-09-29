@@ -28,8 +28,12 @@ struct TilingRequest {
   // Rank single staging alongside the requested count, rather than only using
   // it as a capacity fallback. Graph lowering currently requests at most two.
   bool searchStages = false;
+  // Element widths: A and B share one, C has its own. FP16 is 2/2; the W8A8
+  // integer matmul is INT8 x INT8 -> INT32, 1/4.
+  uint64_t inputBytes = 2, outputBytes = 2;
 };
-// FP16 A/B, FP32 accumulator, one final FP16 conversion. No C initial value.
+// FP16 A/B, FP32 accumulator, one final FP16 conversion; or INT8 A/B with an
+// INT32 accumulator written out as INT32. No C initial value.
 // These are planning candidates, not an implicit permission to change source
 // arithmetic. Graph legalization must prove this numerical contract separately.
 Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &request);
