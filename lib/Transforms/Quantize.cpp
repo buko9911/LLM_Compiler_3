@@ -135,7 +135,6 @@ QuantizedActivation quantizeActivation(OpBuilder &b, Location loc, Value x) {
   auto *context = b.getContext();
   auto type = cast<RankedTensorType>(x.getType());
   int64_t rows = type.getDimSize(0), cols = type.getDimSize(1);
-  auto f16 = Float16Type::get(context);
   auto f32 = Float32Type::get(context);
   auto i8 = IntegerType::get(context, 8);
   auto rowType = RankedTensorType::get({rows}, f32);
@@ -189,7 +188,6 @@ QuantizedActivation quantizeActivation(OpBuilder &b, Location loc, Value x) {
                         nb.create<linalg::YieldOp>(nl, ValueRange{nb.create<arith::FPToSIOp>(nl, i8, clamped)});
                       })
                      .getResult(0);
-  (void)f16;
   return {alpha, values};
 }
 } // namespace
