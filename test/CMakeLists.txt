@@ -45,4 +45,19 @@ if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
     --layer "${CMAKE_CURRENT_SOURCE_DIR}/Integration/decoder-layer.mlir"
     --out "${CMAKE_CURRENT_BINARY_DIR}/vpu32")
   set_tests_properties(npu-vpu32 PROPERTIES TIMEOUT 600 LABELS integration)
+  # NPU only against NPU + PIM on one W8A8 graph. The PIM phases need the
+  # lp6-pim-main DRAMSim3 backend: NPU_TEST_LP6_ROOT, or LP6_DRAMSIM3_ROOT
+  # in the environment ctest runs in.
+  set(NPU_TEST_LP6_ROOT "" CACHE PATH "lp6-pim-main checkout for the PIM integration test")
+  add_test(NAME npu-hybrid COMMAND "${NPU_TEST_PYTHON}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid.py"
+    --compiler $<TARGET_FILE:npu-compile> --hybrid $<TARGET_FILE:npu-hybrid>
+    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
+    --graph "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid-graph.mlir"
+    --out "${CMAKE_CURRENT_BINARY_DIR}/hybrid")
+  set_tests_properties(npu-hybrid PROPERTIES TIMEOUT 900 LABELS integration
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Integration")
+  if(NPU_TEST_LP6_ROOT)
+    set_tests_properties(npu-hybrid PROPERTIES ENVIRONMENT "LP6_DRAMSIM3_ROOT=${NPU_TEST_LP6_ROOT}")
+  endif()
 endif()
