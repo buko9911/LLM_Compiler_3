@@ -148,6 +148,18 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 모든 경우 하이브리드 출력은 NPU 단독과 바이트 단위로 같다. PIM 스윕 1회는 묶음과
 무관하게 3.38~3.42 µs(효율 약 0.62, 고정 비용 약 0)였다.
 
+36층 + lm_head (Qwen3-4B 전체, 프롬프트 "The capital of France is", f228302 컴파일러):
+
+| | 한 토큰 |
+|---|---|
+| NPU+PIM (146 NPU 페이즈 + 145 PIM 페이즈) | 77.3 ms (NPU 20.1 + PIM 57.2, lm_head PIM 5.1) |
+| NPU 단독 W8A8 (층마다 한 프로그램, 37 페이즈) | 242.3 ms |
+| 비 | 3.13배 |
+
+logits와 새 K/V 72개, 출력 73개가 전부 바이트 단위로 같고, 다음 토큰은 장치와 PyTorch FP32
+모두 " Paris"(장치 top-5: " Paris", " in", " a", " located", " __")다. logits의 FP32 대비 상대
+오차 13%는 36층에 걸친 W8A8 활성값 양자화 몫이다.
+
 층 0, M=1의 NPU 페이즈 합이 어떻게 줄었는지(모두 NPU 단독에도 똑같이 적용된다):
 
 | 커밋 | 변경 | NPU 페이즈 합 |
@@ -166,4 +178,5 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 - 독립인 헤드별 행렬곱이 코어 0에 몰린다(원소별 연산만 열 방향으로 코어 분할).
 - 결과 gather는 32 B 행 GDMA다. PIM 결과를 DRAM을 거치지 않고 소비 쪽 L2 패널로 바로
   모으면 DRAM 왕복이 없어진다.
-- 비용 모델 상수는 hybrid-compiler에서 가져온 시작값이다. 이 컴파일러의 측정으로 다시 맞춘다.
+- 비용 모델: PIM 효율·경계 비용은 층 0 측정, NPU 대역폭 17.9 GB/s는 36층 NPU 단독 측정으로
+  맞췄다(configs/hybrid.json). NPU GEMV 고정 비용 2 µs는 아직 맞추지 않은 시작값이다.
