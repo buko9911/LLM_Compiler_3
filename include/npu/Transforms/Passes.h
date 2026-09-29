@@ -8,7 +8,10 @@ namespace npu {
 // same code through mlir::PassManager (IR verification after every pass,
 // timing, crash reproducers, textual pipelines).
 //
-//   npu-legalize   Stage 1  normalize the captured graph, reject what cannot lower
+//   npu-legalize   Stage 1  normalize the captured graph, W8A8 when the module asks
+//                           (npu-attach-hardware quantize=w8a8), reject what cannot lower
+//   npu-partition           map each INT8 GEMV group to the NPU or the PIM (npu-hybrid
+//                           then outlines the phases; see Hybrid.h)
 //   npu-tile       Stage 2  tile loops and core split          (needs hardware)
 //   npu-place      Stage 3  bufferize, liveness, address plan  (needs hardware)
 //   npu-lower      Stage 4  npu.core_block / npu.dma target IR

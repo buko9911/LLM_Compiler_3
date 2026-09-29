@@ -6,6 +6,7 @@
 // npu-opt schedule it with mlir::PassManager.
 //===----------------------------------------------------------------------===//
 #include "npu/Transforms/Passes.h"
+#include "npu/Transforms/Hybrid.h"
 #include "npu/Transforms/Pipeline.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/PassManager.h"
@@ -81,6 +82,8 @@ public:
                                   llvm::cl::desc("lower a/b as a * (1/b)"), llvm::cl::init(false)};
   Option<bool> readback{*this, "readback", llvm::cl::desc("copy outputs back into L2 at the end"),
                         llvm::cl::init(false)};
+  Option<std::string> quantize{*this, "quantize",
+                               llvm::cl::desc("w8a8: INT8 weight GEMVs, applied by npu-legalize")};
   void runOnOperation() override {
     auto *hw = resolve();
     if (!hw) return signalPassFailure();
@@ -91,6 +94,36 @@ public:
     if (fp16) module->setAttr("npu.numerical", StringAttr::get(context, "fp16"));
     if (reciprocalDivision) module->setAttr("npu.division", StringAttr::get(context, "reciprocal"));
     if (readback) module->setAttr("npu.readback", UnitAttr::get(context));
+    if (!quantize.empty()) module->setAttr("npu.quantize", StringAttr::get(context, quantize));
+  }
+};
+
+// Maps every INT8 GEMV group to the NPU or the PIM (npu.target, npu.group) and
+// keeps the cost report on the module as npu.partition.
+class PartitionPass : public PassWrapper<PartitionPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PartitionPass)
+  PartitionPass() = default;
+  PartitionPass(const PartitionPass &other) : PassWrapper(other) {}
+  StringRef getArgument() const final { return "npu-partition"; }
+  StringRef getName() const override { return "npu-partition"; }
+  StringRef getDescription() const final {
+    return "Map each W8A8 GEMV group to the NPU or the LPDDR6-PIM with the hybrid cost model";
+  }
+  Option<std::string> config{*this, "config", llvm::cl::desc("cost model JSON (configs/hybrid.json)")};
+  Option<std::string> policy{*this, "policy", llvm::cl::desc("cost | npu | pim, overrides the config")};
+  void getDependentDialects(DialectRegistry &registry) const override { dependOnPipeline(registry); }
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    auto model = HybridCostModel::load(config);
+    if (!model) {
+      module.emitError(model.error);
+      return signalPassFailure();
+    }
+    if (!policy.empty()) model.value.policy = policy;
+    auto report = partitionGraph(module, model.value, {});
+    if (failed(report)) return signalPassFailure();
+    module->setAttr("npu.partition", StringAttr::get(module.getContext(), *report));
   }
 };
 
@@ -160,6 +193,7 @@ struct PipelineOptions : PassPipelineOptions<PipelineOptions> {
                                   llvm::cl::desc("lower a/b as a * (1/b)"), llvm::cl::init(false)};
   Option<bool> readback{*this, "readback", llvm::cl::desc("copy outputs back into L2 at the end"),
                         llvm::cl::init(false)};
+  Option<std::string> quantize{*this, "quantize", llvm::cl::desc("w8a8: INT8 weight GEMVs")};
 };
 
 template <typename P>
@@ -182,6 +216,7 @@ std::unique_ptr<Pass> createLowerPass() { return std::make_unique<LowerPass>(); 
 void registerPasses() {
   PassRegistration<AttachHardwarePass>();
   PassRegistration<LegalizePass>();
+  PassRegistration<PartitionPass>();
   PassRegistration<TilePass>();
   PassRegistration<PlacePass>();
   PassRegistration<LowerPass>();
@@ -194,6 +229,7 @@ void registerPasses() {
         attach->fp16 = options.fp16;
         attach->reciprocalDivision = options.reciprocalDivision;
         attach->readback = options.readback;
+        attach->quantize = options.quantize;
         pm.addPass(std::move(attach));
         pm.addPass(createLegalizePass());
         pm.addPass(withSettings<TilePass>(options.settings));
