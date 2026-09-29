@@ -208,30 +208,60 @@ FailureOr<std::string> partitionGraph(ModuleOp m, const HybridCostModel &model,
   return text;
 }
 
-FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &names) {
+FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &names, int64_t splitEvery) {
   auto f = entryOf(m);
   if (!f || !llvm::hasSingleElement(f.getBody())) return m.emitError("outlining requires one single-block entry function");
   Block &body = f.front();
   auto *context = m.getContext();
   HybridPlan plan;
 
-  // PIM groups, in the order their first GEMV appears.
-  DenseMap<Operation *, int64_t> groupOf;
+  // Phase boundaries, in the order their first GEMV appears: every PIM group,
+  // and with splitEvery every splitEvery-th NPU group (its GEMVs stay on the NPU).
+  DenseMap<Operation *, int64_t> groupOf;               // PIM GEMV -> dense PIM group
+  SmallVector<SmallVector<linalg::MatmulOp>> members;   // per dense PIM group
+  SmallVector<int64_t> boundaryOf;                      // per dense PIM group
+  struct Boundary { Operation *first; int64_t pimGroup; };
+  SmallVector<Boundary> boundaries;
+  DenseSet<int64_t> seen;
   DenseMap<int64_t, int64_t> denseGroup;
-  SmallVector<SmallVector<linalg::MatmulOp>> members;
   bool nested = false;
   f.walk([&](linalg::MatmulOp mm) {
+    auto group = mm->getAttrOfType<IntegerAttr>("npu.group");
+    if (!group) return;
     auto target = mm->getAttrOfType<StringAttr>("npu.target");
-    if (!target || target.getValue() != "pim") return;
-    if (mm->getBlock() != &body) { nested = true; return; }
-    int64_t g = mm->getAttrOfType<IntegerAttr>("npu.group").getInt();
-    auto [it, inserted] = denseGroup.try_emplace(g, int64_t(members.size()));
-    if (inserted) members.emplace_back();
-    members[size_t(it->second)].push_back(mm);
-    groupOf[mm.getOperation()] = it->second;
+    bool pim = target && target.getValue() == "pim";
+    if (pim && mm->getBlock() != &body) { nested = true; return; }
+    int64_t g = group.getInt();
+    if (pim) {
+      auto [it, inserted] = denseGroup.try_emplace(g, int64_t(members.size()));
+      if (inserted) {
+        members.emplace_back();
+        boundaryOf.push_back(int64_t(boundaries.size()));
+        boundaries.push_back({mm.getOperation(), it->second});
+      }
+      members[size_t(it->second)].push_back(mm);
+      groupOf[mm.getOperation()] = it->second;
+      seen.insert(g);
+      return;
+    }
+    if (seen.insert(g).second && splitEvery > 0 && g > 0 && g % splitEvery == 0) {
+      if (mm->getBlock() != &body) { nested = true; return; }
+      boundaries.push_back({mm.getOperation(), -1});
+    }
   });
-  if (nested) return m.emitError("a PIM GEMV inside a loop cannot be outlined");
+  if (nested) return m.emitError("a phase boundary inside a loop cannot be outlined");
   const int64_t groups = int64_t(members.size());
+  // Boundaries passed so far in program order: a statement never runs in an
+  // earlier phase than that, so a split holds even without a data dependence.
+  DenseMap<Operation *, int64_t> ordinal;
+  {
+    int64_t passed = 0;
+    size_t next = 0;
+    for (Operation &op : body) {
+      while (next < boundaries.size() && boundaries[next].first == &op) { ++passed; ++next; }
+      ordinal[&op] = passed;
+    }
+  }
 
   auto operandsOf = [](Operation *op) {
     llvm::SetVector<Value> values(op->operand_begin(), op->operand_end());
@@ -265,7 +295,7 @@ FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &
   std::function<int64_t(Value)> available = [&](Value v) -> int64_t {
     if (isa<BlockArgument>(v)) return 0;
     Operation *producer = v.getDefiningOp();
-    if (auto it = groupOf.find(producer); it != groupOf.end()) return it->second + 1;
+    if (auto it = groupOf.find(producer); it != groupOf.end()) return boundaryOf[size_t(it->second)] + 1;
     if (cloneable(producer)) {
       int64_t phase = 0;
       for (Value operand : operandsOf(producer)) phase = std::max(phase, available(operand));
@@ -275,7 +305,7 @@ FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &
   };
   for (Operation &op : body.without_terminator()) {
     if (groupOf.count(&op) || cloneable(&op)) continue;
-    int64_t phase = 0;
+    int64_t phase = ordinal.lookup(&op);
     for (Value v : operandsOf(&op)) phase = std::max(phase, available(v));
     phaseOf[&op] = phase;
   }
@@ -284,7 +314,8 @@ FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &
     for (auto mm : members[size_t(g)])
       if (mm.getDpsInputOperand(0)->get() != input)
         return mm.emitError("the GEMVs of one PIM group must read one activation");
-    if (available(input) > g) return members[size_t(g)].front().emitError("PIM group reads a value computed after it");
+    if (available(input) > boundaryOf[size_t(g)])
+      return members[size_t(g)].front().emitError("PIM group reads a value computed after it");
   }
 
   // Buffers a value is made of, looking through views: block arguments, PIM
@@ -362,7 +393,8 @@ FailureOr<HybridPlan> outlinePhases(ModuleOp m, const std::vector<std::string> &
     return false;
   };
 
-  const int64_t phases = groups + 1;
+  const int64_t phases = int64_t(boundaries.size()) + 1;
+  for (const auto &boundary : boundaries) plan.pimAfter.push_back(boundary.pimGroup);
   llvm::StringSet<> kept{"npu.cores", "npu.l1_bytes", "npu.l2_bytes", "npu.dram_bytes", "npu.hardware",
                          "npu.schema", "npu.numerical", "npu.division"};
   for (int64_t p = 0; p < phases; ++p) {

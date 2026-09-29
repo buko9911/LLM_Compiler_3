@@ -80,14 +80,21 @@ struct PimGroup {
   std::vector<PimGemv> gemvs;
 };
 struct HybridPlan {
-  // npuPhases[i]: NPU work before PIM group i; the last one has no PIM after it.
-  // Each holds one function whose arguments and results carry npu.global.
+  // npuPhases[i] runs, then pimGroups[pimAfter[i]] when that is not -1 (a
+  // split only), then npuPhases[i + 1]. Each phase module holds one function
+  // whose arguments and results carry npu.global.
   std::vector<mlir::OwningOpRef<mlir::ModuleOp>> npuPhases;
+  std::vector<int64_t> pimAfter;
   std::vector<PimGroup> pimGroups;
   std::vector<HybridGlobal> globals;
   std::vector<int64_t> outputs;   // the global of each entry result
 };
-// Cuts a partitioned, legal module into phases. names as for partitionGraph.
-mlir::FailureOr<HybridPlan> outlinePhases(mlir::ModuleOp module, const std::vector<std::string> &names);
+// Cuts a partitioned, legal module into phases at the PIM groups. names as for
+// partitionGraph. splitEvery > 0 also starts a new NPU phase at every
+// splitEvery-th GEMV group (group g with g % splitEvery == 0, g > 0) that stays
+// on the NPU, e.g. one phase per decoder layer: a simulator program holds at
+// most 65,536 commands.
+mlir::FailureOr<HybridPlan> outlinePhases(mlir::ModuleOp module, const std::vector<std::string> &names,
+                                          int64_t splitEvery = 0);
 } // namespace npu
 #endif

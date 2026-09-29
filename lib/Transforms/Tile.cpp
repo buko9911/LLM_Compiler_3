@@ -202,9 +202,10 @@ LogicalResult promoteElementwise(IRRewriter &r, linalg::GenericOp gen, unsigned 
   gen.getResult(0).replaceAllUsesExcept(copied,copied.getDefiningOp());
   return success();
 }
-FailureOr<linalg::GenericOp> tileElementwise(IRRewriter &r, linalg::GenericOp gen, int64_t rows) {
+FailureOr<linalg::GenericOp> tileElementwise(IRRewriter &r, linalg::GenericOp gen, int64_t rows,
+                                             int64_t columns = 0) {
   scf::SCFTilingOptions options;
-  options.setTileSizes({r.getIndexAttr(rows), r.getIndexAttr(0)});
+  options.setTileSizes({r.getIndexAttr(rows), r.getIndexAttr(columns)});
   auto tiled = scf::tileUsingSCF(r, cast<TilingInterface>(gen.getOperation()), options);
   if (failed(tiled) || tiled->tiledOps.empty()) return failure();
   auto next = dyn_cast<linalg::GenericOp>(tiled->tiledOps.front());
@@ -277,13 +278,32 @@ LogicalResult tileElementwiseGraph(ModuleOp m, const HardwareConfig &hw, IRRewri
     tileRows = std::min(tileRows,panel);
     for (; tileRows > 0 && panel % tileRows; --tileRows) {}
     if (!tileRows) return gen.emitError("no common elementwise row factor for L2 panel and L1 tile");
+    // 행이 적고 열이 길면(decode 의 1xH 활성값) 행만 나눠서는 코어 하나만 일한다.
+    // 그때는 열을 코어 수만큼의 연속 구간으로 나눠 코어마다 하나씩 맡긴다. 구간은
+    // 32 의 배수라 FP16(32개)과 INT32/FP32(16개) 레지스터 어느 쪽 루프에도 꼬리가
+    // 없다. 행마다의 스칼라는 모든 구간이 같은 것을, 채널별 행은 제 구간을 읽는다.
+    int64_t coreCols = cols;
+    if (hw.cores > 1 && panel / tileRows < int64_t(hw.cores)) {
+      int64_t want = cols / int64_t(hw.cores);
+      want -= want % 32;
+      if (want >= 32 && cols % want == 0) coreCols = want;
+    }
     explanations.push_back(r.getStringAttr("Elementwise rows L2=" + std::to_string(panel) +
                                            " L1=" + std::to_string(tileRows) +
-                                           " cols=" + std::to_string(cols)));
+                                           " cols=" + std::to_string(cols) +
+                                           (coreCols != cols ? " core_cols=" + std::to_string(coreCols) : "")));
     gen->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
     auto outer = tileElementwise(r,gen,panel);
     if (failed(outer) || failed(promoteElementwise(r,*outer,1))) return failure();
-    auto inner = tileElementwise(r,*outer,tileRows);
+    linalg::GenericOp local = *outer;
+    if (coreCols != cols) {
+      auto split = tileElementwise(r,*outer,0,coreCols);
+      if (failed(split)) return failure();
+      if (auto loop = (*split)->getParentOfType<scf::ForOp>())
+        loop->setAttr("npu.core_split", r.getUnitAttr());
+      local = *split;
+    }
+    auto inner = tileElementwise(r,local,tileRows);
     if (failed(inner) || failed(promoteElementwise(r,*inner,2))) return failure();
   }
   return success();

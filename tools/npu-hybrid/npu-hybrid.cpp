@@ -65,6 +65,7 @@ struct Options {
   std::string input, output, settings, inputsDir, config, names, policy;
   std::vector<std::pair<std::string, std::string>> overrides;
   uint64_t lp6Bytes = uint64_t(16) << 30;
+  int64_t splitEvery = 0;
   bool saveStages = false, timeStages = false;
 };
 
@@ -241,6 +242,7 @@ int main(int argc, char **argv) {
                    "  --policy cost|npu|pim override the configured policy\n"
                    "  --map name=npu|pim    map every group whose weight name contains name (repeatable)\n"
                    "  --names file          argument names (default: <inputs>/arguments.txt)\n"
+                   "  --split-every N       also start an NPU phase at every N-th GEMV group (4 = per Qwen3 layer)\n"
                    "  --lp6-bytes N         LP6 capacity (default 16 GiB)\n"
                    "  --save-stages | --time-stages\n";
       return 0;
@@ -257,6 +259,7 @@ int main(int argc, char **argv) {
       if (eq == std::string::npos) { std::cerr << "--map takes name=npu|pim\n"; return 2; }
       options.overrides.push_back({map.substr(0, eq), map.substr(eq + 1)});
     } else if (arg == "--lp6-bytes") options.lp6Bytes = std::stoull(value());
+    else if (arg == "--split-every") options.splitEvery = std::stoll(value());
     else if (arg == "--save-stages") options.saveStages = true;
     else if (arg == "--time-stages") options.timeStages = true;
     else if (options.input.empty() && !arg.empty() && arg[0] != '-') options.input = arg;
@@ -344,7 +347,7 @@ int main(int argc, char **argv) {
     std::ofstream file(out / "partition.json");
     file << *report << '\n';
   }
-  auto plan = ::npu::outlinePhases(*module, names);
+  auto plan = ::npu::outlinePhases(*module, names, options.splitEvery);
   if (failed(plan)) return 1;
   auto &globals = plan->globals;
   const int64_t groups = int64_t(plan->pimGroups.size());
@@ -487,21 +490,21 @@ int main(int argc, char **argv) {
     OpBuilder b(&context);
     uint64_t l2End = uint64_t(m->getAttrOfType<IntegerAttr>("npu.l2_bytes").getInt());
     // 앞에: 직전 PIM 묶음의 결과를 DRAM 전역으로.
-    if (p > 0) {
-      const auto &group = plan->pimGroups[size_t(p - 1)];
+    if (int64_t g = p > 0 ? plan->pimAfter[size_t(p - 1)] : -1; g >= 0) {
+      const auto &group = plan->pimGroups[size_t(g)];
       b.setInsertionPointToStart(m.getBody());
       for (auto [j, gemv] : llvm::enumerate(group.gemvs))
-        for (const auto &d : gather(program, program.projections[size_t(projectionsOf[size_t(p - 1)][j])],
+        for (const auto &d : gather(program, program.projections[size_t(projectionsOf[size_t(g)][j])],
                                     globals[size_t(gemv.result)], group.tokens, staging, stagingBytes))
           emitDma(b, m.getLoc(), d);
       l2End = std::max(l2End, staging + stagingBytes);
     }
     b.setInsertionPointToEnd(m.getBody());
     // 뒤에: 다음 PIM 묶음의 활성값을 PIM 행으로.
-    if (p < groups) {
-      const auto &group = plan->pimGroups[size_t(p)];
+    if (int64_t g = p + 1 < phases ? plan->pimAfter[size_t(p)] : -1; g >= 0) {
+      const auto &group = plan->pimGroups[size_t(g)];
       std::string error;
-      auto dmas = scatter(program, group, activationsOf[size_t(p)], globals[size_t(group.input)], staging,
+      auto dmas = scatter(program, group, activationsOf[size_t(g)], globals[size_t(group.input)], staging,
                           stagingBytes, error);
       if (!error.empty()) { std::cerr << "phase " << p << ": " << error << '\n'; return 1; }
       for (const auto &d : dmas) emitDma(b, m.getLoc(), d);
@@ -553,10 +556,10 @@ int main(int argc, char **argv) {
   for (int64_t p = 0; p < phases; ++p) {
     schedulePhases.push_back(llvm::json::Object{{"npu", llvm::json::Object{
         {"name", "npu" + std::to_string(p)}, {"program", "phase" + std::to_string(p) + "/system.json"}}}});
-    if (p < groups)
+    if (int64_t g = p + 1 < phases ? plan->pimAfter[size_t(p)] : -1; g >= 0)
       schedulePhases.push_back(llvm::json::Object{{"pim", llvm::json::Object{
-          {"name", "pim" + std::to_string(p)}, {"first", pimPhases[size_t(p)].first},
-          {"count", pimPhases[size_t(p)].second}}}});
+          {"name", "pim" + std::to_string(g)}, {"first", pimPhases[size_t(g)].first},
+          {"count", pimPhases[size_t(g)].second}}}});
   }
   llvm::json::Object schedule{{"schema", "plena.v2.host_schedule.v1"}, {"phases", std::move(schedulePhases)}};
   if (groups) {

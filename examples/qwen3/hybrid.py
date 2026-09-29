@@ -33,15 +33,25 @@ ap.add_argument("--config", type=Path, default=ROOT / "configs/hybrid.json", hel
 ap.add_argument("--policy", choices=["cost", "npu", "pim"], help="override the configured mapping policy")
 ap.add_argument("--map", action="append", default=[], help="name=npu|pim, as npu-hybrid --map")
 ap.add_argument("--skip-npu", action="store_true", help="run only the hybrid package")
+ap.add_argument("--split-every", type=int, default=0,
+                help="build the NPU-only baseline with npu-hybrid --policy npu --split-every N "
+                     "(one program per N GEMV groups; 4 = per layer) instead of one npu-compile program")
+ap.add_argument("--reference", choices=["w8a8", "fp32"], default="w8a8",
+                help="reference model: W8A8 linears (exact GEMVs) or plain FP32 (lighter for many layers)")
 a = ap.parse_args()
 a.out = a.out.resolve()
 a.out.mkdir(parents=True, exist_ok=True)
 
-step = prepare(a.capture, a.out, a.prompt, quantize=True)
+step = prepare(a.capture, a.out, a.prompt, quantize=a.reference == "w8a8")
 settings = simulator_settings(a.hardware, a.out)
 graph = a.capture / "00-imported.mlir"
 npu_package, hybrid_package = a.out / "npu", a.out / "hybrid"
-if not a.skip_npu:
+if not a.skip_npu and a.split_every:
+    subprocess.run([str(ROOT / "build/bin/npu-hybrid"), str(graph), "--settings", str(a.hardware), "-o",
+                    str(npu_package), "--config", str(a.config), "--inputs", str(step.inputs), "--names",
+                    str(step.inputs / "arguments.txt"), "--policy", "npu", "--split-every", str(a.split_every)],
+                   check=True)
+elif not a.skip_npu:
     subprocess.run([str(ROOT / "build/bin/npu-compile"), "--from=graph", str(graph), "--settings", str(a.hardware),
                     "-o", str(npu_package), "--fp16", "--reciprocal-division", "--readback", "--quantize=w8a8",
                     "--inputs", str(step.inputs)], check=True)
@@ -55,14 +65,24 @@ subprocess.run(command, check=True)
 
 with ThreadPoolExecutor(2) as pool:
     hybrid_job = pool.submit(run_hybrid, hybrid_package, settings)
-    npu_job = None if a.skip_npu else pool.submit(run_npu, npu_package, settings)
+    npu_job = None if a.skip_npu else pool.submit(run_hybrid if a.split_every else run_npu, npu_package, settings)
     hybrid_outputs, report = hybrid_job.result()
     npu_outputs, npu_cycles = npu_job.result() if npu_job else (None, None)
+    if a.split_every and npu_job:
+        npu_cycles = phase_summary(npu_cycles)["all"]
 
 summary = {"prompt": a.prompt, "layers": step.manifest["layers"], "outputs": {}}
-print("NPU + PIM against the W8A8 reference (FP32 outside the GEMVs):")
+print(f"NPU + PIM against the {'W8A8' if a.reference == 'w8a8' else 'FP32'} reference:")
 for name, got, want in zip(step.names, hybrid_outputs, step.expected):
     summary["outputs"][name] = {"relative_to_reference": compare(name, got, want)}
+if step.names[0] == "logits":
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(step.manifest["model"])
+    device, reference = int(np.argmax(hybrid_outputs[0])), int(np.argmax(step.expected[0]))
+    top5 = np.argsort(-hybrid_outputs[0].astype(np.float32).reshape(-1))[:5]
+    print(f"  next token: device {device} {tokenizer.decode([device])!r}, reference {reference} "
+          f"{tokenizer.decode([reference])!r}; device top-5 {[tokenizer.decode([int(t)]) for t in top5]}")
+    summary["next_token"] = {"device": tokenizer.decode([device]), "reference": tokenizer.decode([reference])}
 if npu_outputs is not None:
     identical = True
     print("NPU + PIM against NPU only:")
@@ -84,7 +104,7 @@ if npu_cycles:
     summary["npu_only_cycles"] = npu_cycles
     print(f"  NPU only    {npu_cycles:>12,}  = {npu_cycles / NPU_HZ * 1e3:8.3f} ms"
           f"   speedup {npu_cycles / phases['all']:.2f}x")
-for phase in report["phases"]:
+for phase in report["phases"] if len(report["phases"]) <= 12 else []:
     cycles = phase["end_npu_cycle"] - phase["start_npu_cycle"]
     print(f"    {phase['kind']:3s} {phase['name']:8s} {cycles:>10,} cycles  {cycles / NPU_HZ * 1e6:9.1f} us")
 (a.out / "summary.json").write_text(json.dumps(summary, indent=1))
