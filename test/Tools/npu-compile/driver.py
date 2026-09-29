@@ -140,7 +140,10 @@ func.func @main() {
               "--save-stages", "-o", root / "hazards"])
         target = (root / "hazards/03-target.mlir").read_text()
         assert target.count("C_WAIT_LDMA") == 2
-        assert "L2_LOAD_STRIDED_ASYNC" in target and "L2_STORE_STRIDED_ASYNC" in target
+        # One-row copies are RAW transfers (LDMA.I in ISA ver 2.0); the tile
+        # written into two column halves of %out stays strided.
+        assert "L2_LOAD_RAW_ASYNC" in target and "L2_STORE_RAW_ASYNC" in target
+        assert "L2_STORE_STRIDED_ASYNC" in target and "L2_LOAD_STRIDED_ASYNC" not in target
         # Residency follows contents, not reused L2 addresses. A DRAM write
         # invalidates the old key; a small L1 must retain the uncached path.
         fingerprint = re.search(r'npu.hardware = "([^"]+)"', header).group(1)

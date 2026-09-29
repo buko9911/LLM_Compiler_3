@@ -294,18 +294,26 @@ class Lowering {
     }
     if (!((src.space==1 && dst.space==2) || (src.space==2 && dst.space==1) || (src.space==2 && dst.space==2)))
       return fail("unsupported memory copy path: "+std::to_string(src.space)+" -> "+std::to_string(dst.space));
-    if (!control("C_SET_DMA_BYTES",src.cols*src.bytes) || !control("C_SET_DMA_ROWS",src.rows) ||
-        !control("C_SET_DMA_SOURCE_STRIDE",src.rowStride) || !control("C_SET_DMA_DESTINATION_STRIDE",dst.rowStride)) return false;
+    // One row (a contiguous transfer, merged above) is a RAW transfer: it needs
+    // no row or stride setting, and ISA ver 2.0 carries it as one LDMA.I with
+    // the addresses and size inline when they are 32-byte aligned.
+    const bool raw = src.rows==1;
+    if (!control("C_SET_DMA_BYTES",src.cols*src.bytes)) return false;
+    if (!raw && (!control("C_SET_DMA_ROWS",src.rows) || !control("C_SET_DMA_SOURCE_STRIDE",src.rowStride) ||
+                 !control("C_SET_DMA_DESTINATION_STRIDE",dst.rowStride))) return false;
     // The ISA tracks pending L1 ranges: consumers wait for loads, and writes
     // wait for store capture. flush() fences completion before exposing L2
     // accesses to the global scheduler. Independent instructions can proceed.
     if (src.space==1) {
-      if (!imm(12,dst.address) || !imm(13,src.address) || !inst("L2_LOAD_STRIDED_ASYNC 12, 13")) return false;
+      if (!imm(12,dst.address) || !imm(13,src.address) ||
+          !inst(raw ? "L2_LOAD_RAW_ASYNC 12, 13" : "L2_LOAD_STRIDED_ASYNC 12, 13")) return false;
       pendingL2Accesses.push_back({src, false});
     } else if (dst.space==1) {
-      if (!imm(12,src.address) || !imm(13,dst.address) || !inst("L2_STORE_STRIDED_ASYNC 12, 13")) return false;
+      if (!imm(12,src.address) || !imm(13,dst.address) ||
+          !inst(raw ? "L2_STORE_RAW_ASYNC 12, 13" : "L2_STORE_STRIDED_ASYNC 12, 13")) return false;
       pendingL2Accesses.push_back({dst, true});
-    } else if (!imm(12,dst.address) || !imm(13,src.address) || !inst("L1_COPY_STRIDED 12, 13")) return false;
+    } else if (!imm(12,dst.address) || !imm(13,src.address) ||
+               !inst(raw ? "L1_COPY_RAW 12, 13" : "L1_COPY_STRIDED 12, 13")) return false;
     access(src,false); access(dst,true); return true;
   }
   bool matrix(linalg::MatmulOp mm) {

@@ -187,7 +187,7 @@ placed IR을 위에서부터 읽으며 명령을 만든다. 이 단계는 전부
 | `memref.subview` / reshape | 주소·행 간격 계산(명령 없음) |
 | `scf.for` + `npu.core_split` | 반복마다 코어를 turn % cores로 돌려가며 배정 |
 | DRAM↔L2 복사 | `npu.dma` (중앙 GDMA 레코드) |
-| L2↔L1 복사 | `L2_LOAD/STORE_STRIDED_ASYNC`, `L1_COPY_STRIDED` |
+| L2↔L1 복사 | 한 행(연속)이면 `L2_LOAD/STORE_RAW_ASYNC`, `L1_COPY_RAW`(ver 2.0에서 32 B 정렬이면 `LDMA.I`), 아니면 `L2_LOAD/STORE_STRIDED_ASYNC`, `L1_COPY_STRIDED` |
 | `linalg.matmul` (32×32 타일) | `npu.matrix_load` ×2 → `npu.matrix_mma` (INIT/ACC, K를 32씩) → `npu.matrix_writeout` |
 | 원소별 `linalg.generic` | `V_LOAD` → `V_ADD/MUL/MAX…_F16` → `V_STORE`, 32개씩 하드웨어 루프 |
 | 리덕션 generic | `V_REDUCE_SUM/MAX_F16_F32` + `S_ADD/MAX_F32` |
