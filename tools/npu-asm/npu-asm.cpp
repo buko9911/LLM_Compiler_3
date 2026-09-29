@@ -11,7 +11,8 @@ int main(int argc, char **argv) {
     std::string arg = argv[i];
     if (arg == "--help") {
       std::cout << "usage: npu-asm [--disassemble] [input|-] [-o output|-]\n"
-                   "Core ISA ver 1.0 only: numeric register indices; .mem contains one 32-bit word per line.\n"
+                   "Builder stream only (the ISA ver 1.0 encodings the compiler writes; encode lowers them\n"
+                   "to ISA ver 2.0): numeric register indices; .mem contains one 32-bit word per line.\n"
                    "Matrix loads/writeouts are four-word records (register, rows, columns, stride_bytes);\n"
                    "M_MMA_* takes INIT or ACC.\n";
       return 0;
