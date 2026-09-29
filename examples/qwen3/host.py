@@ -1,0 +1,162 @@
+"""Host side of a Qwen3 decode step: inputs, simulator runs, outputs.
+
+prepare() decodes the last token of a prompt: it builds the KV windows by
+running the PyTorch module over the earlier prompt tokens one step at a time
+(FP32), writes the checked step's inputs as arg<N>.bin beside the captured
+weights, and returns the FP32 reference outputs of that step.
+
+run_npu() runs an npu-compile package (one program), run_hybrid() an npu-hybrid
+package (a host schedule of NPU and PIM phases). Both return the outputs read
+back from the simulator's L2 dump and the cycle counts.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+import torch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from qwen3 import Checkpoint, Config, DecodeStep, load, rope_tables, step_mask, w8a8
+
+LP6 = Path("/home/jongjip/LP6")
+EMULATOR = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
+SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
+BACKEND = LP6 / "lp6-pim-main"
+NPU_HZ = 800e6
+DTYPES = {"float16": "<f2", "float32": "<f4", "int8": "i1", "int32": "<i4"}
+
+
+@dataclass
+class Step:
+    manifest: dict
+    inputs: Path                      # arg<N>.bin of the step (weights linked from the capture)
+    expected: list[np.ndarray]        # FP32 reference, one per result
+    names: list[str] = field(default_factory=list)
+
+
+def prepare(capture: Path, out: Path, prompt: str, quantize: bool) -> Step:
+    manifest = json.loads((capture / "manifest.json").read_text())
+    c = Config(**manifest["config"])
+    L, M, P = manifest["layers"], manifest["tokens"], manifest["capacity"]
+    assert M == 1, "the host loop decodes one token per step"
+    model = Path(manifest["model"])
+    from transformers import AutoTokenizer
+    tokens = AutoTokenizer.from_pretrained(model)(prompt)["input_ids"]
+    assert 1 <= len(tokens) <= P + 1, "prompt longer than the cache"
+    checkpoint = Checkpoint(model)
+    embed = checkpoint.get("model.embed_tokens.weight")
+    reference = DecodeStep(c, L, manifest["head"]).float()
+    load(reference, checkpoint, manifest["first_layer"])
+    if quantize:
+        w8a8(reference)
+
+    def run(x, position, past, windows):
+        cos, sin = rope_tables(c, [position])
+        mask = step_mask(M, P, past)
+        with torch.no_grad():
+            return reference(x, cos, sin, mask, *windows), cos, sin, mask
+
+    windows = [torch.zeros(c.kv_heads, P + M, c.head_dim) for _ in range(2 * L)]
+    for t, token in enumerate(tokens[:-1]):
+        outputs, *_ = run(embed[token][None].float(), t, t, windows)
+        for i in range(2 * L):                  # the host moves the new rows into slot t
+            windows[i][:, t] = outputs[1 + i][:, 0]
+    last = len(tokens) - 1
+    x = embed[tokens[-1]][None].to(torch.float16)
+    outputs, cos, sin, mask = run(x.float(), last, last, [w.clone() for w in windows])
+    step_inputs = [x, cos.half(), sin.half(), mask.half()] + [w.half() for w in windows]
+
+    source = out / "inputs"
+    source.mkdir(parents=True, exist_ok=True)
+    for path in list(capture.glob("arg*.bin")) + [capture / "arguments.txt"]:
+        target = source / path.name
+        if not target.exists():
+            target.symlink_to(path.resolve())
+    for index, tensor in enumerate(step_inputs):
+        target = source / f"arg{index}.bin"
+        target.unlink(missing_ok=True)
+        target.write_bytes(tensor.contiguous().numpy().tobytes())
+    return Step(manifest, source, [o.float().numpy() for o in outputs],
+                [r["name"] for r in manifest["results"]])
+
+
+def simulator_settings(hardware: Path, out: Path, settings: Path = SETTINGS) -> Path:
+    """The simulator settings with the core count the compile used."""
+    cores = re.search(r"(?m)^num_cores\s*=\s*(\d+)", hardware.read_text())
+    path = out / "settings.toml"
+    path.write_text(re.sub(r"(?m)^num_cores\s*=\s*\d+", f"num_cores = {cores.group(1) if cores else 1}",
+                           settings.read_text()))
+    return path
+
+
+def _simulate(package: Path, args: list[str], timeout: int) -> str:
+    env = dict(os.environ, LP6_DRAMSIM3_ROOT=str(BACKEND))
+    done = subprocess.run([str(EMULATOR)] + args, cwd=package, capture_output=True, text=True,
+                          timeout=timeout, env=env)
+    log = re.sub(r"\x1b\[[0-9;]*m", "", done.stdout + done.stderr)
+    (package / "simulator.log").write_text(log)
+    if done.returncode:
+        raise RuntimeError(log[-6000:])
+    return log
+
+
+def _read_l2(package: Path, outputs: list[dict]) -> list[np.ndarray]:
+    raw = (package / "l2_sram_dump.bin").read_bytes()
+    result = []
+    for o in outputs:
+        dtype = np.dtype(DTYPES[o["dtype"]])
+        at = o["readback_l2_address"]
+        count = o["bytes"] // dtype.itemsize
+        assert len(raw) >= at + o["bytes"], f"L2 dump ends at {len(raw)}, output needs {at + o['bytes']}"
+        result.append(np.frombuffer(raw[at:at + o["bytes"]], dtype=dtype, count=count).copy())
+    return result
+
+
+def run_npu(package: Path, settings: Path, timeout: int = 14400):
+    """One npu-compile package (compiled with --readback): outputs and total cycles."""
+    log = _simulate(package, ["--system-program", "system.json", "--lp6-image", "hbm.bin",
+                              "--settings", str(settings), "--log-level", "info"], timeout)
+    meta = json.loads((package / "metadata.json").read_text())
+    outputs = [dict(o, bytes=o["rows"] * o["cols"] * (4 if o["dtype"] in ("float32", "int32") else
+                                                      1 if o["dtype"] == "int8" else 2),
+                    readback_l2_address=o["readback_l2_address"]) for o in meta["outputs"]]
+    cycles = re.search(r"total_cycles=(\d+)", log)
+    return _read_l2(package, outputs), int(cycles.group(1)) if cycles else None
+
+
+def run_hybrid(package: Path, settings: Path, timeout: int = 14400):
+    """One npu-hybrid package: outputs and the per-phase report of the host schedule."""
+    _simulate(package, ["--settings", str(settings), "--schedule", "schedule.json",
+                        "--schedule-report", "phases.json", "--lp6-image", "lp6.bin",
+                        "--lp6-size", "16GiB", "--log-level", "info"], timeout)
+    meta = json.loads((package / "metadata.json").read_text())
+    report = json.loads((package / "phases.json").read_text())
+    return _read_l2(package, meta["outputs"]), report
+
+
+def phase_summary(report: dict) -> dict:
+    """NPU cycles per kind of phase, and the total, from a schedule report."""
+    total = {"npu": 0, "pim": 0}
+    for phase in report["phases"]:
+        total[phase["kind"]] += phase["end_npu_cycle"] - phase["start_npu_cycle"]
+    total["all"] = total["npu"] + total["pim"]
+    return total
+
+
+def compare(name: str, got: np.ndarray, want: np.ndarray) -> float:
+    got = got.astype(np.float32).reshape(-1)
+    want = np.asarray(want, dtype=np.float32).reshape(-1)
+    error = float(np.abs(got - want).max())
+    peak = float(np.abs(want).max())
+    relative = error / peak if peak else error
+    print(f"  {name:10s} max|err| {error:.3e}  max|ref| {peak:.3e}  rel {relative:.3e}"
+          f"{'' if np.isfinite(got).all() else '  NON-FINITE'}")
+    return relative

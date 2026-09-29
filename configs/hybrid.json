@@ -1,0 +1,29 @@
+{
+  "_comment": "Cost model and mapping policy of npu-hybrid (include/npu/Transforms/Hybrid.h). NPU values follow the simulator settings (800 MHz, 4 cores, 32x32 array); PIM values follow lp6-pim-main configs/LPDDR6_PIM_Mobile_2CH.ini (2400 MHz, 8 PUs x 4 lanes, 2 subchannels x 2 ranks, nLLD 10 CK). npu.lp6_read_gbps, pim.efficiency and the boundary costs (act_write_*, readback_*, gemv_fixed_us) are starting values carried over from hybrid-compiler/configs/target.json (fitted there to that compiler's code on 2026-09-26/29); they are not from the LPDDR6-PIM PDF and are to be refitted to this compiler's runs. pim.concurrent_ranks is false because the draft defines no rank-to-rank rule for PIM compute: a PIM phase runs on the two subchannels of one rank. mapping.policy: cost (compare estimates), npu or pim (every group); mapping.overrides: weight-name substring -> npu | pim, longest match first.",
+  "npu": {
+    "clock_mhz": 800,
+    "cores": 4,
+    "lp6_read_gbps": 22.51,
+    "gemv_fixed_us": 2.0
+  },
+  "pim": {
+    "clock_mhz": 2400,
+    "pus": 8,
+    "lanes": 4,
+    "channels": 2,
+    "ranks": 2,
+    "partitions": 4,
+    "concurrent_ranks": false,
+    "ldmac_ck": 10,
+    "efficiency": 0.5725,
+    "phase_fixed_us": 1.0,
+    "act_write_fixed_us": 1.5,
+    "act_write_us_per_kib": 0.9,
+    "readback_fixed_us": 1.5,
+    "readback_us_per_kib": 0.35
+  },
+  "mapping": {
+    "policy": "cost",
+    "overrides": {}
+  }
+}

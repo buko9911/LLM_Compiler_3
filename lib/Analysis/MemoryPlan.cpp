@@ -13,7 +13,7 @@ bool sameStorage(const BufferPlacement &a, const BufferPlacement &b) {
   return a.space == b.space && (a.space != MemorySpace::L1 || a.requirement.core == b.requirement.core);
 }
 std::optional<uint64_t> findAddress(const BufferPlacement &candidate,
-                                   const MemoryPlan &plan, uint64_t cap) {
+                                   const MemoryPlan &plan, uint64_t cap, uint64_t base = 0) {
   const auto &r = candidate.requirement;
   std::vector<std::pair<uint64_t,uint64_t>> occupied;
   for (const auto &p : plan.buffers) {
@@ -22,7 +22,7 @@ std::optional<uint64_t> findAddress(const BufferPlacement &candidate,
       occupied.push_back({p.address, p.address + p.requirement.bytes});
   }
   std::sort(occupied.begin(), occupied.end());
-  uint64_t address = 0;
+  uint64_t address = base;
   auto aligned = [&](uint64_t n) -> std::optional<uint64_t> {
     if (n > UINT64_MAX - (r.alignment - 1)) return {};
     return (n + r.alignment - 1) & ~(r.alignment - 1);
@@ -56,12 +56,31 @@ Result<MemoryPlan> planMemory(std::vector<BufferRequirement> requirements, const
     if (r.space == MemorySpace::Accumulator || unsigned(r.space) > 3)
       return R::failure("accumulator is dedicated state, not an allocatable buffer");
   }
+  // Fixed buffers first: every other buffer has to fit around them.
   std::stable_sort(requirements.begin(), requirements.end(), [](const auto &a, const auto &b) {
+    if (a.fixed != b.fixed) return a.fixed;
     return a.begin < b.begin;
   });
   for (const auto &r : requirements) {
     BufferPlacement p{r, r.space, 0, BufferPlacement::Action::Resident};
-    auto address = findAddress(p, plan, capacity(p.space, limits));
+    if (r.fixed) {
+      auto cap = capacity(r.space, limits);
+      if (r.fixedAddress % r.alignment || r.fixedAddress > cap || r.bytes > cap - r.fixedAddress)
+        return R::failure("fixed buffer outside capacity: " + r.name);
+      for (const auto &q : plan.buffers)
+        if (sameStorage(q, p) && overlap(r.begin, r.end, q.requirement.begin, q.requirement.end) &&
+            overlap(r.fixedAddress, r.fixedAddress + r.bytes, q.address, q.address + q.requirement.bytes))
+          return R::failure("fixed buffers overlap: " + r.name + ", " + q.requirement.name);
+      p.address = r.fixedAddress;
+      auto end = p.address + r.bytes;
+      if (p.space == MemorySpace::L1) plan.l1HighWater[r.core] = std::max(plan.l1HighWater[r.core], end);
+      else if (p.space == MemorySpace::L2) plan.l2HighWater = std::max(plan.l2HighWater, end);
+      else plan.dramHighWater = std::max(plan.dramHighWater, end);
+      plan.buffers.push_back(std::move(p));
+      continue;
+    }
+    auto address = findAddress(p, plan, capacity(p.space, limits),
+                               p.space == MemorySpace::DRAM ? limits.dramBase : 0);
     if (!address) {
       bool remat = r.pure && r.inputsAvailable && r.preservesNumerics;
       bool spill = r.spillable && r.space != MemorySpace::DRAM;
@@ -69,7 +88,7 @@ Result<MemoryPlan> planMemory(std::vector<BufferRequirement> requirements, const
         p.action = BufferPlacement::Action::Rematerialize;
       } else if (spill) {
         p.space = MemorySpace::DRAM;
-        address = findAddress(p, plan, limits.dram);
+        address = findAddress(p, plan, limits.dram, limits.dramBase);
         if (address) p.action = BufferPlacement::Action::Spill;
         else if (remat) p.action = BufferPlacement::Action::Rematerialize;
         else return R::failure("DRAM spill capacity exhausted: " + r.name);

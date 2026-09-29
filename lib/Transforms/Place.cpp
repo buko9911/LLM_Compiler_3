@@ -61,6 +61,23 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
     }
     return {begin, std::max(end, begin + 1)};
   };
+  // A hybrid phase (npu-hybrid) shares DRAM with the other phases: its
+  // arguments and results already have the addresses the whole schedule uses,
+  // and everything else of the phase goes above npu.dram_base.
+  DenseMap<Value, uint64_t> fixedAddress;
+  for (auto arg : entry.getArguments())
+    if (auto at = entry.getArgAttrOfType<IntegerAttr>(arg.getArgNumber(), "npu.address"))
+      fixedAddress[arg] = uint64_t(at.getInt());
+  if (entry.getNumResults()) {
+    auto ret = cast<func::ReturnOp>(entry.front().getTerminator());
+    for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
+      auto at = entry.getResultAttrOfType<IntegerAttr>(i, "npu.address");
+      if (!at) continue;
+      if (!v.getDefiningOp<memref::AllocOp>())
+        return m.emitError("a result with a fixed address must be its own allocation");
+      fixedAddress[v] = uint64_t(at.getInt());
+    }
+  }
   for (auto value : allocations) {
     auto t = dyn_cast<MemRefType>(value.getType());
     unsigned width = t ? elementBytes(t.getElementType()) : 0;
@@ -70,6 +87,10 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
     BufferRequirement r; r.name = "buffer" + std::to_string(requirements.size());
     r.bytes = bytes; r.space = MemorySpace(t.getMemorySpaceAsInt());
     std::tie(r.begin,r.end) = lifetime(value);
+    if (auto found = fixedAddress.find(value); found != fixedAddress.end()) {
+      if (r.space != MemorySpace::DRAM) return m.emitError("only DRAM buffers take fixed addresses");
+      r.fixed = true; r.fixedAddress = found->second;
+    }
     requirements.push_back(r);
   }
   // A GDMA command reaches between DRAM and L2 only, so a transfer that starts
@@ -95,7 +116,9 @@ LogicalResult placeGraph(ModuleOp m, const HardwareConfig &hw) {
       requirements.push_back(readback);
     }
   }
-  auto placed = planMemory(requirements,{hw.l1Bytes,hw.l2Bytes,hw.dramBytes,1,hw.dramBytesPerCycle,0});
+  MemoryLimits limits{hw.l1Bytes,hw.l2Bytes,hw.dramBytes,1,hw.dramBytesPerCycle,0};
+  if (auto base = m->getAttrOfType<IntegerAttr>("npu.dram_base")) limits.dramBase = uint64_t(base.getInt());
+  auto placed = planMemory(requirements,limits);
   if (!placed) return m.emitError(placed.error);
   // planMemory sorts its input by lifetime start, so results are not in call
   // order. Match on the unique name the analysis already validates.

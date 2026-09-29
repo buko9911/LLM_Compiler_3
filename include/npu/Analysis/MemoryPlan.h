@@ -18,11 +18,18 @@ struct BufferRequirement {
   bool pure = false, inputsAvailable = false, preservesNumerics = false;
   uint64_t reloads = 1, stores = 1;
   uint64_t rematerializeCycles = 0;
+  // A buffer another program also names (a hybrid phase boundary) keeps the
+  // address that program uses. Fixed buffers are placed first, as given.
+  bool fixed = false;
+  uint64_t fixedAddress = 0;
 };
 struct MemoryLimits {
   uint64_t l1 = 0, l2 = 0, dram = 0;
   unsigned cores = 1;
   uint64_t dramBytesPerCycle = 1, dmaSetupCycles = 0;
+  // DRAM below this belongs to buffers other programs own; a buffer that is
+  // not fixed is placed at or above it.
+  uint64_t dramBase = 0;
 };
 struct BufferPlacement {
   enum class Action { Resident, Spill, Rematerialize };
