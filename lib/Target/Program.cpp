@@ -1,5 +1,6 @@
 #include "npu/Target/Program.h"
 #include "npu/Target/ISA.h"
+#include "npu/Target/IsaV2.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -230,58 +231,136 @@ Result<Program> schedule(Program program) {
   return R::success(std::move(program));
 }
 
+namespace {
+namespace isa2 = ::npu::isa2;
+// Dependency list of the record `ordinal` at words[at]: two 16-bit backward
+// distances per word, low half first; the unused half of the last word is 0.
+Result<bool> readDependencies(const std::vector<uint32_t> &words, size_t &at, uint32_t ordinal, uint32_t count) {
+  using R = Result<bool>;
+  if ((uint64_t(count) + 1) / 2 > words.size() - at) return R::failure("truncated dependencies");
+  std::set<uint32_t> unique;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint32_t distance = words[at + i / 2] >> (16 * (i % 2)) & 0xffff;
+    if (!distance || distance > ordinal || !unique.insert(ordinal - distance).second)
+      return R::failure("invalid dependency graph");
+  }
+  if (count % 2 && words[at + count / 2] >> 16) return R::failure("unused dependency half must be 0");
+  at += (size_t(count) + 1) / 2;
+  return R::success(true);
+}
+
+// One ver 2.0 GDMA record: `rows` rows of `rowBytes`, each side at its stride.
+struct Transfer { uint64_t lp6, l2, rowBytes, rows, lp6Stride, l2Stride; };
+
+// The smallest divisor of n in [from, 2^16], or 0.
+uint64_t divisorFrom(uint64_t n, uint64_t from) {
+  for (uint64_t d = std::max<uint64_t>(from, 1); d <= isa2::kGdmaRows && d <= n; ++d)
+    if (n % d == 0) return d;
+  return 0;
+}
+
+// A DMA command as GDMA records. The command's own shape is kept whenever the
+// fields hold it. A row of 1 MiB or more does not fit the 20-bit row size: a
+// contiguous transfer is cut into the fewest equal rows, 64-byte multiples when
+// possible (the simulator then issues the same LP6 blocks in the same order),
+// and a strided one is split into column pieces.
+Result<std::vector<Transfer>> gdmaTransfers(const Command &c) {
+  using R = Result<std::vector<Transfer>>;
+  const Transfer t{c.dramOffset, c.l2Offset, c.bytes, c.rows, c.rows > 1 ? c.dramStride : c.bytes,
+                   c.rows > 1 ? c.l2Stride : c.bytes};
+  std::vector<Transfer> pieces;
+  if (t.rowBytes < isa2::kGdmaRowBytes) {
+    pieces.push_back(t);
+  } else {
+    const bool contiguous = t.rows == 1 || (t.lp6Stride == t.rowBytes && t.l2Stride == t.rowBytes);
+    const uint64_t total = t.rowBytes * t.rows;
+    const uint64_t fewest = (total + isa2::kGdmaRowBytes - 2) / (isa2::kGdmaRowBytes - 1);
+    uint64_t rows = 0;
+    if (contiguous && total % 64 == 0) rows = divisorFrom(total / 64, fewest);
+    if (contiguous && !rows) rows = divisorFrom(total, fewest);
+    if (rows) {
+      pieces.push_back({t.lp6, t.l2, total / rows, rows, total / rows, total / rows});
+    } else {
+      constexpr uint64_t kPiece = isa2::kGdmaRowBytes / 2;
+      for (uint64_t at = 0; at < t.rowBytes; at += kPiece)
+        pieces.push_back({t.lp6 + at, t.l2 + at, std::min(kPiece, t.rowBytes - at), t.rows, t.lp6Stride,
+                          t.l2Stride});
+    }
+  }
+  std::vector<Transfer> out;
+  for (const auto &piece : pieces)
+    for (uint64_t first = 0; first < piece.rows; first += isa2::kGdmaRows) {   // rows - 1 < 2^16
+      Transfer q = piece;
+      q.rows = std::min(isa2::kGdmaRows, piece.rows - first);
+      q.lp6 += first * piece.lp6Stride;
+      q.l2 += first * piece.l2Stride;
+      if (q.rows == 1) q.lp6Stride = q.l2Stride = q.rowBytes;
+      if (q.lp6 >= isa2::kGdmaLp6 || q.l2 >= isa2::kGdmaL2 || q.lp6Stride >= isa2::kGdmaStride ||
+          q.l2Stride >= isa2::kGdmaStride)
+        return R::failure("DMA does not fit a GDMA record (LP6 address < 2^36, L2 address and strides < 2^24)");
+      out.push_back(q);
+    }
+  return R::success(std::move(out));
+}
+} // namespace
+
 Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
   using R = Result<bool>;
   if (words.size() < 6 || words[0] != kProgramMagic || words[1] != kProgramVersion || words[2] != words.size())
-    return R::failure("invalid Unified Program (ISA ver 1.0) header");
+    return R::failure("invalid Unified Program (ISA ver 2.0) header");
   size_t at = 5;
-  uint64_t instructions = 0;
+  uint64_t coreWords = 0;
   for (uint32_t id = 0; id < words[3]; ++id) {
-    if (words.size() - at < 11) return R::failure("truncated command header");
-    auto header = at;
-    uint32_t op = words[at], encodedId = words[at+1];
-    if (encodedId != id) return R::failure("non-canonical or duplicate command ID");
-    uint32_t deps = 0;
-    if (op == 0x26) deps = words[at+8];
-    else if (op == 0x2b || op == 0x2c) {
-      deps = words[at+2];
-      // row_bytes, rows, and a stride per side. Rows that step by less than one
-      // row would overlap, so the record would not describe a rectangle.
-      uint32_t rowBytes = words[at+7], rows = words[at+8];
-      uint32_t dramStride = words[at+9], l2Stride = words[at+10];
-      if (!rowBytes || !rows) return R::failure("empty DMA extent in encoded program");
-      if (rows == 1 ? (dramStride != rowBytes || l2Stride != rowBytes)
-                    : (dramStride < rowBytes || l2Stride < rowBytes))
-        return R::failure("unsupported DMA layout in encoded program");
-    } else return R::failure("unknown program command");
-    at += 11;
-    if (deps > words.size() - at) return R::failure("truncated dependencies");
-    std::set<uint32_t> unique;
-    for (uint32_t i = 0; i < deps; ++i) {
-      uint32_t d = words[at++];
-      if (d >= id || !unique.insert(d).second) return R::failure("invalid dependency graph");
+    if (at >= words.size()) return R::failure("truncated command record");
+    const uint32_t head = words[at];
+    Result<bool> deps = R::success(true);
+    switch (head & 63) {
+    case 0x2d:   // BARRIER
+      if (head >> 14) return R::failure("reserved BARRIER bits set");
+      ++at;
+      deps = readDependencies(words, at, id, head >> 6 & 0xff);
+      break;
+    case 0x2b:   // GDMA_LOAD
+    case 0x2c: { // GDMA_STORE
+      if (words.size() - at < 3) return R::failure("truncated GDMA record");
+      if (words[at + 2] >> 31) return R::failure("reserved GDMA bit set");
+      // Row bytes are record bits [34:15]; bits [31:15] of word 0, [2:0] of word 1.
+      const uint32_t rowBytes = (head >> 15 | words[at + 1] << 17) & 0xfffff;
+      if (!rowBytes) return R::failure("empty DMA extent in encoded program");
+      at += 3;
+      if (head >> 6 & 1) {
+        if (words.size() - at < 2) return R::failure("truncated GDMA 2-D extension");
+        const uint64_t e = words[at] | uint64_t(words[at + 1]) << 32;
+        const uint64_t rows = (e & 0xffff) + 1, lp6Stride = e >> 16 & 0xffffff, l2Stride = e >> 40;
+        // A 2-D record describes a rectangle of several rows.
+        if (rows == 1 || lp6Stride < rowBytes || l2Stride < rowBytes)
+          return R::failure("unsupported DMA layout in encoded program");
+        at += 2;
+      }
+      deps = readDependencies(words, at, id, head >> 7 & 0xff);
+      break;
     }
-    if (op != 0x26) continue;
-    if (words[header+2] > 65535 || words[header+6] != 0 || words[header+9] != 0 || words[header+10] > 1)
-      return R::failure("unsupported CORE layout");
-    if (words[header+10]) {
-      if (words.size() - at < 7) return R::failure("truncated L1 span");
-      if (words[at] != 0 || words[at+1] != 0 || words[at+2] != words[header+5] ||
-          words[at+3] != 0 || words[at+4] != 64 || words[at+5] != 0 || words[at+6] != UINT32_MAX)
-        return R::failure("invalid L1 span");
-      at += 7;
-    } else if (words[header+5]) return R::failure("missing L1 span");
-    uint32_t count = words[header+7];
-    if (count > words.size() - at) return R::failure("truncated core instructions");
-    auto valid = verifyCore(std::vector<uint32_t>(words.begin()+at,words.begin()+at+count));
-    if (!valid) return valid;
-    at += count; instructions += count;
-    if (words.size() - at < 2 || words[at] != 0x27 || words[at+1] != id)
-      return R::failure("invalid CORE_END");
-    at += 2;
+    case 0x26: { // CORE_BEGIN
+      if (words.size() - at < 2) return R::failure("truncated CORE_BEGIN");
+      if (head >> 6 & 1) return R::failure("unsupported CORE_BEGIN extension");
+      const uint32_t count = words[at + 1] & 0xffffff;
+      at += 2;
+      deps = readDependencies(words, at, id, words[at - 1] >> 24);
+      if (!deps) return deps;
+      if (count > words.size() - at) return R::failure("truncated core instructions");
+      if (auto body = isa2::verifyCoreBlock(words.data() + at, count); !body)
+        return R::failure("command " + std::to_string(id) + ": " + body.error);
+      at += count;
+      coreWords += count;
+      break;
+    }
+    default:
+      return R::failure("unknown program command");
+    }
+    if (!deps) return deps;
   }
-  if (words.size() - at != 1 || words[at] != 0x2f || instructions != words[4])
-    return R::failure("invalid program footer or instruction count");
+  if (words.size() - at != 1 || words[at] != 0x2f || coreWords != words[4])
+    return R::failure("invalid program footer or core instruction count");
   return R::success(true);
 }
 
@@ -290,34 +369,61 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
   auto checked = schedule(program);
   if (!checked) return R::failure(checked.error);
   const auto &p = checked.value;
+  if (p.cores > isa2::kCoreAny) return R::failure("CORE_BEGIN addresses at most 31 logical cores");
+  if ((uint64_t(p.l1Bytes) + 7) / 8 >= isa2::kL1Units) return R::failure("L1 size does not fit CORE_BEGIN");
   std::vector<uint32_t> out(5);
+  uint32_t next = 0;   // ordinal of the next record, its completion event
   uint64_t coreWords = 0;
+  std::vector<std::vector<uint32_t>> records(p.commands.size());   // records that complete each command
+  auto fail = [](uint32_t id, const std::string &what) {
+    return R::failure("command " + std::to_string(id) + ": " + what);
+  };
+  auto near = [&](const std::vector<uint32_t> &deps) {
+    return deps.empty() || next - deps.front() <= isa2::kMaxDistance;
+  };
   for (uint32_t id = 0; id < p.commands.size(); ++id) {
     const auto &c = p.commands[id];
-    if (c.words.size() > UINT32_MAX || c.dependencies.size() > UINT32_MAX)
-      return R::failure("command exceeds binary field size");
-    auto count = uint32_t(c.dependencies.size());
+    std::vector<uint32_t> deps;
+    for (auto d : c.dependencies) deps.insert(deps.end(), records[d].begin(), records[d].end());
+    std::sort(deps.begin(), deps.end());
+    while (deps.size() > isa2::kMaxDependencies) {
+      std::vector<uint32_t> joined;
+      for (size_t i = 0; i < deps.size(); i += isa2::kMaxDependencies) {
+        std::vector<uint32_t> group(deps.begin() + i,
+                                    deps.begin() + std::min(deps.size(), i + isa2::kMaxDependencies));
+        if (!near(group)) return fail(id, "dependency more than 65535 records back");
+        auto barrier = isa2::barrierRecord(next, group);
+        out.insert(out.end(), barrier.begin(), barrier.end());
+        joined.push_back(next++);
+      }
+      deps = std::move(joined);
+    }
     if (c.kind == Command::Kind::Core) {
-      out.insert(out.end(), {0x26, id, c.core, UINT32_MAX, UINT32_MAX, p.l1Bytes, 0,
-                             uint32_t(c.words.size()), count, 0, p.l1Bytes ? 1u : 0u});
-      out.insert(out.end(), c.dependencies.begin(), c.dependencies.end());
-      if (p.l1Bytes) out.insert(out.end(), {0, 0, p.l1Bytes, 0, 64, 0, UINT32_MAX});
-      out.insert(out.end(), c.words.begin(), c.words.end());
-      out.insert(out.end(), {0x27, id});
-      coreWords += c.words.size();
-    } else {
-      out.insert(out.end(), {c.kind == Command::Kind::Load ? 0x2bu : 0x2cu, id, count,
-                             uint32_t(c.dramOffset), uint32_t(c.dramOffset >> 32),
-                             c.l2Offset, 0, c.bytes, c.rows,
-                             c.rows > 1 ? c.dramStride : c.bytes,
-                             c.rows > 1 ? c.l2Stride : c.bytes});
-      out.insert(out.end(), c.dependencies.begin(), c.dependencies.end());
+      auto body = isa2::lowerCoreBlock(c.words);
+      if (!body) return fail(id, body.error);
+      if (body.value.size() >= isa2::kCoreWords) return fail(id, "core block exceeds 2^24 words");
+      if (!near(deps)) return fail(id, "dependency more than 65535 records back");
+      auto begin = isa2::coreBeginRecord(next, deps, uint32_t(body.value.size()), c.core, p.l1Bytes);
+      out.insert(out.end(), begin.begin(), begin.end());
+      out.insert(out.end(), body.value.begin(), body.value.end());
+      coreWords += body.value.size();
+      records[id].push_back(next++);
+      continue;
+    }
+    auto transfers = gdmaTransfers(c);
+    if (!transfers) return fail(id, transfers.error);
+    for (const auto &t : transfers.value) {
+      if (!near(deps)) return fail(id, "dependency more than 65535 records back");
+      auto record = isa2::gdmaRecord(c.kind == Command::Kind::Load, next, deps, t.lp6, t.l2, uint32_t(t.rowBytes),
+                                     uint32_t(t.rows), uint32_t(t.lp6Stride), uint32_t(t.l2Stride));
+      out.insert(out.end(), record.begin(), record.end());
+      records[id].push_back(next++);
     }
   }
   out.push_back(0x2f);
   if (out.size() > UINT32_MAX || coreWords > UINT32_MAX) return R::failure("program exceeds binary field size");
   out[0] = kProgramMagic; out[1] = kProgramVersion; out[2] = uint32_t(out.size());
-  out[3] = uint32_t(p.commands.size()); out[4] = uint32_t(coreWords);
+  out[3] = next; out[4] = uint32_t(coreWords);
   auto verified = verifyProgramWords(out);
   if (!verified) return R::failure(verified.error);
   std::vector<uint8_t> bytes;
@@ -328,16 +434,20 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
 Result<std::string> systemManifest(const Program &p) {
   auto bytes = encodeProgram(p);
   if (!bytes) return Result<std::string>::failure(bytes.error);
-  return Result<std::string>::success(systemManifestForEncoded(p, bytes.value.size() / 4));
+  return Result<std::string>::success(systemManifestForEncoded(p, bytes.value));
 }
-std::string systemManifestForEncoded(const Program &p, uint64_t wordCount) {
-  uint64_t instructions = 0;
-  for (const auto &c : p.commands) instructions += c.words.size();
+std::string systemManifestForEncoded(const Program &p, const std::vector<uint8_t> &encoded) {
+  // Header words 2..4: program words, records, core words.
+  auto header = [&](size_t i) {
+    uint32_t w = 0;
+    for (unsigned b = 0; b < 4; ++b) w |= uint32_t(encoded[4 * i + b]) << (8 * b);
+    return std::to_string(w);
+  };
   std::string s = std::string("{\n  \"schema\": \"") + kProgramSchema + "\",\n  \"program\": \"program.bin\",\n  \"scheduling_policy\": \"compiler_static\",\n  \"logical_to_physical\": [";
   for (unsigned i = 0; i < p.cores; ++i) s += (i ? ", " : "") + std::to_string(i);
-  return s + "],\n  \"program_word_count\": " + std::to_string(wordCount) +
-    ",\n  \"command_count\": " + std::to_string(p.commands.size()) +
-    ",\n  \"core_instruction_count\": " + std::to_string(instructions) +
+  return s + "],\n  \"program_word_count\": " + header(2) +
+    ",\n  \"command_count\": " + header(3) +
+    ",\n  \"core_instruction_count\": " + header(4) +
     ",\n  \"l2_bytes_required\": " + std::to_string(p.l2Bytes) +
     ",\n  \"l2_regions\": [{\"name\": \"l2\", \"offset\": 0, \"size\": " +
     std::to_string(p.l2Bytes) + ", \"alignment\": 64}]\n}\n";

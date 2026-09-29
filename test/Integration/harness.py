@@ -1,6 +1,6 @@
 """Run a package on NPU_Simulator main and read one output tensor back.
 
-NPU_Simulator main (ISA ver 1.0) dumps each core's L1 and the shared L2 but not
+NPU_Simulator main (ISA ver 2.0) dumps each core's L1 and the shared L2 but not
 DRAM, so an output is read from ``l2_sram_dump.bin``:
 
 * a compiled graph asks for this with ``npu-compile --readback``; the

@@ -1,19 +1,9 @@
 #include "npu/Target/PimLayout.h"
+#include "npu/Target/IsaV2.h"
 #include <algorithm>
 
 namespace npu::pim {
 namespace {
-Record blankRecord() {
-  Record r{};
-  r.f.fill(0);
-  r.payload.fill(0);
-  for (Field f : {F_WEIGHT_TILE, F_ACT_TILE, F_SCALE_TILE, F_ACC, F_OUT_TILE, F_VBANK}) r.f[f] = -1;
-  r.f[F_WBITS] = 8;
-  r.f[F_ABITS] = 8;
-  r.f[F_SBITS] = 0;
-  r.f[F_LOGICAL] = 1;
-  return r;
-}
 int64_t rowsFor(int64_t tiles) { return tiles == 0 ? 0 : (tiles + kPacketsPerRow - 1) / kPacketsPerRow; }
 } // namespace
 
@@ -72,53 +62,25 @@ int64_t Program::storedTiles(int rank) const {
   return tiles;
 }
 
-void Program::emitCompute(int64_t index, std::vector<Record> &out) {
+Result<bool> Program::emitCompute(int64_t index, std::vector<uint32_t> &commands) {
+  // The PIM controller expands one PIM_GEMV to CLEAR x16, per sweep LOAD_ACT x32
+  // + GEMV_STREAM, then STORE x8 of the 8 output registers.
   Projection &p = projections[size_t(index)];
-  p.computeFirst = int64_t(out.size());
-  const int64_t streams = p.streams(), sweeps = p.sweeps();
+  p.computeFirst = int64_t(commands.size()) / 2;
+  const int64_t streams = p.streams();
   for (int m = 0; m < p.tokens(); ++m) {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
     for (int64_t g = 0; g < streams; ++g) {
-      int part = p.streamPart[size_t(g)];
-      auto record = [&](Primitive type) {
-        Record r = blankRecord();
-        r.f[F_TYPE] = type;
-        r.f[F_VCHANNEL] = part;
-        return r;
-      };
-      for (int acc = 0; acc < kAccs; ++acc) {
-        Record r = record(CLEAR);
-        r.f[F_ACC] = acc;
-        out.push_back(r);
-      }
-      for (int64_t s = 0; s < sweeps; ++s) {
-        for (int i = 0; i < kInTiles; ++i) {
-          Record r = record(LOAD_ACT);
-          r.f[F_ACT_TILE] = int32_t(a.base + s * kInTiles + i);
-          out.push_back(r);
-        }
-        Record r = record(GEMV_STREAM);
-        r.f[F_WEIGHT_TILE] = int32_t(p.streamWeightBase[size_t(g)] + s * kAccs * kInTiles);
-        r.f[F_ACT_TILE] = int32_t(a.base + s * kInTiles);
-        r.f[F_ACC] = 0;
-        r.f[F_INPUT_COUNT] = kInTiles;
-        r.f[F_OUTPUT_COUNT] = kAccs;
-        r.f[F_W_IN_STRIDE] = 1;
-        r.f[F_W_OUT_STRIDE] = kInTiles;
-        r.f[F_A_IN_STRIDE] = 1;
-        r.f[F_S_IN_PERIOD] = 1;
-        r.f[F_ACC_OUT_STRIDE] = 1;
-        out.push_back(r);
-      }
-      for (int reg = 0; reg < 8; ++reg) {
-        Record r = record(STORE);
-        r.f[F_ACC] = 2 * reg;
-        r.f[F_OUT_TILE] = int32_t(p.outputBase + (int64_t(m) * streams + g) * 8 + reg);
-        out.push_back(r);
-      }
+      auto command = isa2::pimGemv(unsigned(p.streamPart[size_t(g)]), uint32_t(p.sweeps()),
+                                   uint32_t(p.streamWeightBase[size_t(g)]), uint32_t(a.base),
+                                   uint32_t(p.outputBase + (int64_t(m) * streams + g) * 8));
+      if (!command) return Result<bool>::failure(p.name + ": " + command.error);
+      commands.push_back(command.value.first);
+      commands.push_back(command.value.second);
     }
   }
-  p.computeCount = int64_t(out.size()) - p.computeFirst;
+  p.computeCount = int64_t(commands.size()) / 2 - p.computeFirst;
+  return Result<bool>::success(true);
 }
 
 Program::BaseRows Program::baseRows() const {

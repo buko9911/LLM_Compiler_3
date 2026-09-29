@@ -1,4 +1,5 @@
 #include "npu/Target/ISA.h"
+#include "npu/Target/IsaV2.h"
 #include "npu/Target/Program.h"
 #include <gtest/gtest.h>
 #include <random>
@@ -138,13 +139,57 @@ TEST(Program, RejectsCorruptedProgramAndTruncation) {
     words.push_back(w);
   }
   ASSERT_TRUE(bool(npu::verifyProgramWords(words)));
-  auto corrupt = words; corrupt[23] = 0x1; // core instruction after the L1 span
+  // Header, CORE_BEGIN (2 words), the lowered C_FENCE_ALL, PROGRAM_END.
+  ASSERT_EQ(words, (std::vector<uint32_t>{0x414e4c50, 0x00020000, 9, 1, 1, 0x26 | 8u << 12, 1, 0xff, 0x2f}));
+  auto corrupt = words; corrupt[7] = 0x1; // invalid ver 2.0 opcode in the core block
   EXPECT_FALSE(bool(npu::verifyProgramWords(corrupt)));
   for (size_t size = 0; size < words.size(); ++size) {
     auto shortWords = std::vector<uint32_t>(words.begin(),words.begin()+size);
     if (size > 2) shortWords[2] = uint32_t(size);
     EXPECT_FALSE(bool(npu::verifyProgramWords(shortWords))) << size;
   }
+}
+std::vector<uint32_t> wordsOf(const std::vector<uint8_t> &bytes) {
+  std::vector<uint32_t> words;
+  for (size_t i = 0; i < bytes.size(); i += 4) {
+    uint32_t w = 0;
+    for (unsigned b = 0; b < 4; ++b) w |= uint32_t(bytes[i+b]) << (8*b);
+    words.push_back(w);
+  }
+  return words;
+}
+TEST(Program, ContiguousRowOverOneMebibyteBecomesEqualRows) {
+  // 128 x 9728 bytes, a down-projection panel: the 20-bit row size holds less
+  // than 1 MiB, so the load becomes two contiguous 622,592-byte rows.
+  auto dma = load(0); dma.bytes = 128 * 9728;
+  npu::Program p{1, 64, 2 << 20, 4 << 20, {dma}};
+  auto encoded = npu::encodeProgram(p); ASSERT_TRUE(bool(encoded)) << encoded.error;
+  auto words = wordsOf(encoded.value);
+  ASSERT_EQ(words[3], 1u);
+  EXPECT_EQ(std::vector<uint32_t>(words.begin() + 5, words.begin() + 10),
+            npu::isa2::gdmaRecord(true, 0, {}, 0, 0, 622592, 2, 622592, 622592));
+  // A strided transfer with such rows is split into column pieces.
+  dma.bytes = 3 << 19; dma.rows = 2; dma.dramStride = 2 << 20; dma.l2Stride = 3 << 19;
+  p.l2Bytes = 4 << 20; p.commands = {dma};
+  encoded = npu::encodeProgram(p); ASSERT_TRUE(bool(encoded)) << encoded.error;
+  EXPECT_EQ(wordsOf(encoded.value)[3], 3u);
+}
+TEST(Program, BarriersJoinMoreThan255Dependencies) {
+  using M = npu::MemorySpace;
+  npu::Program p{1, 64, 300 * 64, 300 * 64, {}};
+  for (unsigned i = 0; i < 300; ++i) p.commands.push_back(load(64 * i));
+  p.commands.push_back(core({{M::L2, 0, 300 * 64, false}}));
+  auto encoded = npu::encodeProgram(p); ASSERT_TRUE(bool(encoded)) << encoded.error;
+  auto words = wordsOf(encoded.value);
+  // 300 loads, BARRIER over loads 0..254, BARRIER over 255..299, the core block.
+  EXPECT_EQ(words[3], 303u);
+  size_t at = 5 + 300 * 3;
+  EXPECT_EQ(words[at], 0x2du | 255u << 6);
+  at += 1 + 128;
+  EXPECT_EQ(words[at], 0x2du | 45u << 6);
+  at += 1 + 23;
+  EXPECT_EQ(words[at + 1] >> 24, 2u);                      // the block waits for the two barriers
+  EXPECT_EQ(words[at + 2], 2u | 1u << 16);
 }
 TEST(Program, RectangularHazardsMatchBytewiseOracle) {
   using M = npu::MemorySpace;

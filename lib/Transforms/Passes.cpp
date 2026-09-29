@@ -223,7 +223,7 @@ void registerPasses() {
   registerPass([] { return createEncodePass(); });
   // The whole of npu-compile --from=graph, minus writing the package files.
   PassPipelineRegistration<PipelineOptions>(
-      "npu-pipeline", "Captured linalg graph to an encoded Unified Program (ISA ver 1.0)",
+      "npu-pipeline", "Captured linalg graph to an encoded Unified Program (ISA ver 2.0)",
       [](OpPassManager &pm, const PipelineOptions &options) {
         auto attach = withSettings<AttachHardwarePass>(options.settings);
         attach->fp16 = options.fp16;

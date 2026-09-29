@@ -3,7 +3,7 @@
 2026-09-29. Qwen3 디코드 스텝을 W8A8로 양자화하고, 가중치 GEMV 묶음마다 NPU와
 LPDDR6-PIM 중 어디서 돌릴지 비용 모델로 정해, 두 장치가 한 LP6 메모리를 나눠 쓰는
 호스트 스케줄로 컴파일한다. NPU 쪽은 `npu-compile`과 같은 tile / place / lower / encode를
-그대로 쓰고, PIM 쪽은 LPDDR6-PIM 프리미티브 레코드를 낸다.
+그대로 쓰고, PIM 쪽은 PIM_GEMV 명령을 낸다. NPU 프로그램은 PLENA ISA ver 2.0이다(7절).
 
 ## 1. 전체 흐름
 
@@ -18,8 +18,8 @@ PyTorch decode step (examples/qwen3: KV 창을 제자리에 쓰는 decode, FP16)
   │ ④ 전역 DRAM 배치        전역마다 고정 주소, 페이즈 지역 버퍼는 그 위(npu.dram_base)
   │ ⑤ NPU 페이즈마다        tile → place (고정 주소 존중)
   │ ⑥ PIM 배치              PimLayout: 타일 id, 패킷 주소, 한 페이즈 = 한 rank
-  │ ⑦ NPU 페이즈마다        lower → 경계 전송(GDMA) 붙이기 → encode
-  │ ⑧ pim.bin, schedule.json, lp6.bin(sparse, PIM 가중치 패킷 포함), metadata.json
+  │ ⑦ NPU 페이즈마다        lower → 경계 전송(GDMA) 붙이기 → encode (ISA ver 2.0)
+  │ ⑧ pim.bin(PIM_GEMV), schedule.json, lp6.bin(sparse, PIM 가중치 패킷 포함), metadata.json
   ▼
 IESLAB_NPU_Simulator --schedule  (NPU 페이즈와 PIM 페이즈를 차례로, LP6 하나를 공유)
 ```
@@ -101,9 +101,36 @@ hybrid-compiler의 PimLayout을 옮겼다. lp6-pim-main 런타임 lowering과 �
   가중치를 덜 가진 rank 하나에서.
 - 타일 id는 종류별로 조밀하고, 런타임이 커널 행부터 가중치 행 → 활성값 행 → 출력 행 순으로 놓는다.
 - 주소: rarobacobgch (rank, row, bank, column, bank group, subchannel; 32 B 위).
-- 레코드: 스트림마다 CLEAR×16, 스윕마다 LOAD_ACT×32 + GEMV_STREAM, STORE×8.
+- 명령: (토큰, 스트림)마다 PIM_GEMV 1개(2 워드; `pim.bin` = "PIMC", 명령 수, 명령들). lp6-pim-main이
+  CLEAR×16, 스윕마다 LOAD_ACT×32 + GEMV_STREAM, STORE×8로 펼친다(예전 레코드 열과 같다).
+  `schedule.json`의 PIM 페이즈 범위(first, count)는 명령 단위다.
 
-## 7. 사용법
+## 7. ISA ver 2.0 (lib/Target/IsaV2.cpp, lib/Target/Program.cpp)
+
+시뮬레이터(IESLAB_NPU_Simulator 75725ad)는 ver 1.0 program을 거부한다. 코드 생성(Lower)은 지금처럼
+ver 1.0 인코딩의 builder stream을 만들고, encode가 ver 2.0으로 바꾼다.
+
+| 부분 | ver 2.0 |
+|---|---|
+| core block | builder stream 검사(`verifyCore`) 뒤 block마다 lowering. 시뮬레이터 `tools/isa_v2.py`의 C++ 이식(hybrid-compiler와 같은 규칙) |
+| GDMA | 96비트 레코드(+2-D 확장 2워드). 행이 1 MiB 이상인 연속 전송(NPU 단독 down 패널 1,245,184 B)은 64 B 배수의 같은 행 여러 개로 — 시뮬레이터가 같은 LP6 블록을 같은 순서로 요청한다. strided면 열 조각 레코드 여러 개 |
+| 의존성 | 16비트 backward 거리, 레코드당 255개까지. 넘으면 `BARRIER`가 묶는다 |
+| `CORE_BEGIN` | 2워드(논리 코어, L1/8, 코어 워드 수, 의존성 수). `CORE_END`와 L1 span은 없다 |
+| PIM | `pim.bin` = PIM_GEMV 명령(6절) |
+
+층 0 검사: ver 1.0 program과 레코드 단위로 비교해 core body가 `isa_v2.py` lowering과 같고, GDMA가
+같은 바이트를 옮기고, 의존성 집합이 같다. 시뮬레이터의 L2 dump와 코어 4개 L1 dump 전체가 ver 1.0
+실행과 바이트 단위로 같다(NPU 단독, 하이브리드 둘 다).
+
+| Qwen3-4B 층 0, M=1 | ver 1.0 | ver 2.0 |
+|---|---:|---:|
+| NPU 단독 core 명령 워드 | 196,800 | 36,051 |
+| 하이브리드 core 명령 워드 (NPU 페이즈 5개) | 36,601 | 15,539 |
+| PIM | 레코드 26,850개 | PIM_GEMV 60개 |
+| NPU 단독 | 5.995 ms | 5.963 ms |
+| NPU+PIM | 1.759 ms (NPU 0.355 + PIM 1.404) | 1.746 ms (NPU 0.344 + PIM 1.402) |
+
+## 8. 사용법
 
 ```bash
 export PATH=/home/jongjip/LP6/toolchain/lp6-build/bin:$PATH
@@ -130,7 +157,7 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 `LP6_DRAMSIM3_ROOT=lp6-pim-main transactional_emulator --settings <num_cores=4> --schedule schedule.json
 --schedule-report phases.json --lp6-image lp6.bin --lp6-size 16GiB`
 
-## 8. 검증
+## 9. 검증
 
 | 검사 | 내용 |
 |---|---|
@@ -138,7 +165,7 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 | `examples/qwen3/hybrid.py` | 실제 Qwen3-4B 층: 하이브리드 = NPU 단독 (바이트), PyTorch 기준 대비 오차 |
 | `examples/qwen3/verify.py` | NPU 단독 FP16 / W8A8 vs PyTorch |
 
-## 9. 결과 (Qwen3-4B, M=1, P=255, 4 코어, 한 페이즈 = 한 rank)
+## 10. 결과 (Qwen3-4B, M=1, P=255, 4 코어, 한 페이즈 = 한 rank; ISA ver 1.0에서 측정)
 
 | 구성 | NPU+PIM | NPU 단독 W8A8 | 비 |
 |---|---|---|---|
@@ -173,7 +200,7 @@ logits와 새 K/V 72개, 출력 73개가 전부 바이트 단위로 같고, 다�
 | b974936 | 텐서 전체인 L2 패널을 DRAM 대신 바로 읽음 | 0.383 ms |
 | 79b3704 | 열이 안 나뉘면 행 타일을 코어에 나눔, 패널당 고정 비용을 타일 비용 모델에 | 0.355 ms |
 
-## 10. 한계와 다음 일
+## 11. 한계와 다음 일
 
 - 어텐션 페이즈(층당 약 0.25 ms)가 NPU 페이즈의 대부분이다. 텐서 전체인 중간값은 L2에서
   바로 읽지만(b974936), 헤드별 조각으로 조립되는 텐서는 여전히 DRAM을 거치고 1 KiB 미만의
@@ -185,6 +212,6 @@ logits와 새 K/V 72개, 출력 73개가 전부 바이트 단위로 같고, 다�
   모으면 DRAM 왕복이 없어진다.
 - 비용 모델: PIM 효율·경계 비용은 층 0 측정, NPU 대역폭 17.9 GB/s는 36층 NPU 단독 측정으로
   맞췄다(configs/hybrid.json). NPU GEMV 고정 비용 2 µs는 아직 맞추지 않은 시작값이다.
-  M=4에서 비용 모델의 혼합 선택이 전부 PIM, NPU 단독보다 빨랐다(9절).
+  M=4에서 비용 모델의 혼합 선택이 전부 PIM, NPU 단독보다 빨랐다(10절).
 - 호스트 스케줄은 순차다(NPU 페이즈와 PIM 페이즈가 겹치지 않는다). 시뮬레이터 런타임의
   phase policy가 동시 실행을 지원하면 페이즈 사이 독립 작업을 겹칠 수 있다.

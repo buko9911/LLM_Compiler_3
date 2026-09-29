@@ -15,7 +15,7 @@ namespace npu {
 //   npu-tile       Stage 2  tile loops and core split          (needs hardware)
 //   npu-place      Stage 3  bufferize, liveness, address plan  (needs hardware)
 //   npu-lower      Stage 4  npu.core_block / npu.dma target IR
-//   encode-npu     Stage 5  Unified Program (ISA ver 1.0) words
+//   encode-npu     Stage 5  Unified Program (ISA ver 2.0) words
 //
 // The hardware stages take the parsed configuration from the driver, or read
 // the TOML named by their `settings` option when built from a pipeline string.

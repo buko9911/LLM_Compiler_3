@@ -1,4 +1,4 @@
-"""PyTorch model -> ISA ver 1.0 program -> NPU_Simulator, checked against PyTorch.
+"""PyTorch model -> ISA ver 2.0 program -> NPU_Simulator, checked against PyTorch.
 
 The whole flow on one small model:
 

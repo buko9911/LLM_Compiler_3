@@ -10,7 +10,7 @@
 // PLACED: npu.live = array<i64:
 // PLACED: arith.maximumf
 
-// ENCODED: words = array<i32: 1095650384, 65536,
+// ENCODED: words = array<i32: 1095650384, 131072,
 
 // NOSETTINGS: requires the hardware configuration: settings=<hardware.toml>
 

@@ -1,6 +1,7 @@
 # LLM_Compiler_3
 
-NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main(ISA ver 1.0)에 맞춘 판이다.
+NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main에 맞춘 판이다. 타깃은 PLENA ISA ver 2.0이다
+(2026-09-29부터, 그 전은 ver 1.0).
 
 > 원본: [Jh-Jang98/LLM_Compiler](https://github.com/Jh-Jang98/LLM_Compiler) (LLM_Compiler_2, Jh-Jang98 작성).
 > 이 저장소는 원작자의 허락을 받아 그 코드를 바탕으로 수정한 것이다.
@@ -8,7 +9,7 @@ NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main(ISA ver 1.0)에 �
 전체 설계는 [docs/DESIGN.md](docs/DESIGN.md)에 있다(LLM_Compiler_2 기준 문서이며, LLM_Compiler_3에서 달라진 점은 아래 절에 적는다).
 
 PyTorch 모델을 캡처한 정적 tensor/linalg 그래프, 또는 손으로 쓴 타깃 IR에서
-Unified Program (ISA ver 1.0) 패키지(`program.bin`, `system.json`, `hbm.bin`)를 만들고,
+Unified Program (ISA ver 2.0) 패키지(`program.bin`, `system.json`, `hbm.bin`)를 만들고,
 NPU_Simulator main이 그대로 실행한다.
 matmul·elementwise·리덕션·전치·ReLU와 캡처한 Llama 디코더 층을 지원하며,
 멀티코어 타일 분배·L2 더블버퍼·가중치 패널 패킹이 구현되어 있다.
@@ -16,14 +17,14 @@ matmul·elementwise·리덕션·전치·ReLU와 캡처한 Llama 디코더 층을
 
 **브랜치 `jongjip/PIM-hybrid`**: Qwen3 디코드 스텝(`examples/qwen3`), W8A8 양자화(`--quantize=w8a8`,
 INT8 MMA·양자화·역양자화 lowering), 그리고 가중치 GEMV 묶음을 비용 모델로 NPU와 LPDDR6-PIM에
-나눠 싣는 하이브리드 컴파일러 `npu-hybrid`(NPU 페이즈 + PIM 레코드 + 호스트 스케줄)를 더했다.
+나눠 싣는 하이브리드 컴파일러 `npu-hybrid`(NPU 페이즈 + PIM_GEMV 명령 + 호스트 스케줄)를 더했다.
 설계·사용법·결과는 [docs/HYBRID.md](docs/HYBRID.md)에 있다.
 
 ## LLM_Compiler_2 에서 달라진 점
 
 | 영역 | LLM_Compiler_2 | LLM_Compiler_3 |
 |---|---|---|
-| 타깃 ISA | Program v5 (`PLN5`), `C_SET_TILE_*`/`C_SET_MATRIX_*` + 한 워드 `M_LOAD`/`M_MMA`/`M_WRITEOUT` | ISA ver 1.0 (`PLNA`, version 0x00010000). `M_LOAD`/`M_WRITEOUT`은 4워드 레코드(헤더, rows, cols, stride), `M_MMA`는 고정 32×32×32 한 워드(INIT/ACC) |
+| 타깃 ISA | Program v5 (`PLN5`), `C_SET_TILE_*`/`C_SET_MATRIX_*` + 한 워드 `M_LOAD`/`M_MMA`/`M_WRITEOUT` | ISA ver 2.0 (`PLNA`, version 0x00020000). 코드 생성은 ver 1.0 인코딩의 builder stream(`M_LOAD`/`M_WRITEOUT`은 4워드 레코드, `M_MMA`는 고정 32×32×32 한 워드 INIT/ACC)으로 하고, encode에서 core block마다 ver 2.0으로 낮춘다(`lib/Target/IsaV2.cpp`, 시뮬레이터 `tools/isa_v2.py` 이식) |
 | 행렬 명령 표현 | `npu.instruction` 문자열 | 타입 있는 op `npu.matrix_load` / `npu.matrix_mma` / `npu.matrix_writeout` (속성으로 모양·stride 검증) |
 | 벡터 명령 | 행 길이 전체를 한 번에 | 레지스터 용량(FP16 32개)씩 나눠 하드웨어 루프로 반복 |
 | 결과 확인 | 시뮬레이터 `--lp6-dump`(DRAM) | `--readback`: 출력을 L2로 되읽는 GDMA를 붙이고 `l2_sram_dump.bin`에서 읽음 |
@@ -201,11 +202,12 @@ placed IR을 위에서부터 읽으며 명령을 만든다. 이 단계는 전부
 
 | 순서 | 하는 일 |
 |---|---|
-| 1 | 각 `core_block`의 op들을 32비트 워드로 인코딩(행렬 load/writeout은 4워드) |
+| 1 | 각 `core_block`의 op들을 builder stream 워드로 인코딩(ver 1.0 인코딩, 행렬 load/writeout은 4워드) |
 | 2 | 코어 블록마다 검사: 누산기·피연산자가 블록 밖으로 남지 않는지, 끝이 `C_FENCE_ALL`인지 |
 | 3 | L2/DRAM 읽기·쓰기 범위로 명령 간 의존성 계산 |
-| 4 | 헤더(`PLNA`, version 0x00010000) + 명령 + footer로 조립하고 다시 검증 |
-| 5 | `npu.program` op 하나(워드 배열 + system.json 내용)로 교체 |
+| 4 | 코어 블록마다 ver 2.0으로 lowering(GP 상수는 읽는 곳에서만, base+offset 주소, `M_MMA` count, 정렬된 RAW 전송은 `LDMA.I`) |
+| 5 | ver 2.0 레코드로 조립: 헤더(`PLNA`, version 0x00020000), GDMA 96비트, `CORE_BEGIN` 2워드, 의존성은 16비트 backward 거리. 한 레코드의 의존성이 255개를 넘으면 `BARRIER`로 묶고, 행이 1 MiB 이상인 GDMA는 여러 행이나 여러 레코드로 나눈다. 다시 검증 |
+| 6 | `npu.program` op 하나(워드 배열 + system.json 내용)로 교체 |
 
 전부 ⬜이고, pass의 틀만 MLIR Pass를 쓴다.
 
@@ -214,7 +216,7 @@ placed IR을 위에서부터 읽으며 명령을 만든다. 이 단계는 전부
 | 파일 | 내용 | 읽는 쪽 |
 |---|---|---|
 | `program.bin` | 워드들을 리틀엔디안으로 저장 | 시뮬레이터 |
-| `system.json` | 프로그램 매니페스트(스키마 `plena.v2.unified_program.isa_v1.0`) | 시뮬레이터 |
+| `system.json` | 프로그램 매니페스트(스키마 `plena.v2.unified_program.isa_v2.0`) | 시뮬레이터 |
 | `metadata.json` | 입력·출력 주소, readback 위치 | 검증 스크립트 |
 | `hbm.bin` | 입력·가중치·상수를 정해진 주소에 배치한 DRAM 이미지 | 시뮬레이터 |
 
@@ -256,12 +258,13 @@ ctest --test-dir build --output-on-failure
 
 | 테스트 | 내용 |
 |---|---|
-| `npu-unit` | ISA ver 1.0 인코딩(시뮬레이터 어셈블러와 비트 단위 일치), 프로그램 검증 |
+| `npu-unit` | builder stream 인코딩, ver 2.0 lowering과 레코드(시뮬레이터 `tools/isa_v2.py`·디코더와 워드 단위 일치), 프로그램 검증 |
 | `npu-lit` | IR 왕복, 인코딩, 오류 진단, 패스/파이프라인(`test/Tools/npu-opt/passes.mlir`) |
 | `npu-driver` | 재시작, 하드웨어 지문, 어셈블러, 패킹, 비동기 DMA 위험 |
 | `npu-matmul32`, `npu-vpu32` | NPU_Simulator main에서 실행해 PyTorch와 비교(행렬곱, softmax, flash attention, 디코더 층 …) |
+| `npu-hybrid` | GEMV 두 개 그래프를 NPU 단독과 NPU+PIM으로 실행, numpy W8A8 오라클·서로와 바이트 비교 |
 
-`NPU_TEST_EMULATOR`와 `NPU_TEST_SETTINGS`를 주지 않으면 마지막 둘은 등록되지 않는다.
+`NPU_TEST_EMULATOR`와 `NPU_TEST_SETTINGS`를 주지 않으면 마지막 셋은 등록되지 않는다.
 
 ## PyTorch 모델 → ISA → 시뮬레이터
 
@@ -296,6 +299,7 @@ S=$HOME/NPU_Simulator/plena_settings.toml
 
 ## 어셈블러
 
+`npu-asm`은 builder stream(ver 1.0 인코딩)을 다룬다. 시뮬레이터가 실행하는 ver 2.0 워드는 encode에서 만든다.
 레지스터 번호는 숫자로 받는다. 행렬 load/writeout은 `레지스터, rows, cols, stride_bytes`를 받는 4워드 레코드다.
 
 ```sh

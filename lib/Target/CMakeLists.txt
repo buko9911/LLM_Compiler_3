@@ -1,4 +1,4 @@
-add_library(NPUTarget ISA.cpp Program.cpp HardwareConfig.cpp Quantize.cpp PimLayout.cpp)
+add_library(NPUTarget ISA.cpp IsaV2.cpp Program.cpp HardwareConfig.cpp Quantize.cpp PimLayout.cpp)
 target_include_directories(NPUTarget PUBLIC "${PROJECT_SOURCE_DIR}/include")
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(NPUTarget PRIVATE -fno-exceptions -fno-rtti)

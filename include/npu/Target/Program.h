@@ -6,10 +6,12 @@
 #include <vector>
 
 namespace npu {
-// Unified program container of NPU_Simulator main, "ISA ver 1.0".
+// Unified program container of the PLENA simulator, "ISA ver 2.0". Core
+// blocks are built and checked as builder-stream words (ISA.h) and lowered to
+// ver 2.0 one block at a time when the program is encoded (IsaV2.h).
 inline constexpr uint32_t kProgramMagic = 0x414e4c50;   // little-endian "PLNA"
-inline constexpr uint32_t kProgramVersion = 0x00010000; // major << 16 | minor
-inline constexpr const char *kProgramSchema = "plena.v2.unified_program.isa_v1.0";
+inline constexpr uint32_t kProgramVersion = 0x00020000; // major << 16 | minor
+inline constexpr const char *kProgramSchema = "plena.v2.unified_program.isa_v2.0";
 enum class MemorySpace : unsigned { DRAM = 0, L2 = 1, L1 = 2, Accumulator = 3 };
 struct Access {
   MemorySpace space;
@@ -40,11 +42,18 @@ struct Program {
 // Adds per-core order and overlapping RAW/WAR/WAW edges. Disjoint DMA is free
 // to overlap computation. Dependencies reference command indices.
 Result<Program> schedule(Program program);
+// Schedules, lowers every core block and writes the ver 2.0 records. A record
+// waits for at most 255 events, so BARRIER records join longer dependency
+// lists, and a DMA whose rows do not fit a GDMA record becomes several
+// records; the header command count includes both.
 Result<std::vector<uint8_t>> encodeProgram(const Program &program);
 Result<std::string> systemManifest(const Program &program);
 // Build metadata for an already successfully encoded program, without scheduling again.
-std::string systemManifestForEncoded(const Program &program, uint64_t wordCount);
+std::string systemManifestForEncoded(const Program &program, const std::vector<uint8_t> &encoded);
+// Builder-stream core block (ISA.h encodings): matrix operand and accumulator
+// lifetimes, loops, the closing C_FENCE_ALL.
 Result<bool> verifyCore(const std::vector<uint32_t> &words);
+// Encoded ver 2.0 program: header, records, dependencies, core block structure.
 Result<bool> verifyProgramWords(const std::vector<uint32_t> &words);
 } // namespace npu
 #endif

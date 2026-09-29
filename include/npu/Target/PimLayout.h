@@ -1,7 +1,7 @@
 #ifndef NPU_TARGET_PIMLAYOUT_H
 #define NPU_TARGET_PIMLAYOUT_H
 // LPDDR6-PIM W8A8 GEMV layout: which tiles a GEMV uses, where their packets
-// live in LP6, and the primitive records that run it.
+// live in LP6, and the PIM_GEMV commands that run it.
 //
 // It mirrors the lp6-pim-main runtime lowering (PIMRuntimeLowering::
 // BuildRuntimeTileLayout) for W8A8 GEMV streams without a block scale:
@@ -18,6 +18,7 @@
 // LP6 byte addresses follow lp6-pim-main configs/LPDDR6_PIM_Mobile_2CH.ini,
 // address_mapping = rarobacobgch (MSB -> LSB: rank, row, bank, column, bank
 // group, subchannel above the 32 B offset).
+#include "npu/Target/Result.h"
 #include <array>
 #include <cstdint>
 #include <map>
@@ -31,20 +32,6 @@ inline constexpr int64_t kKPerSweep = 256, kRowsPerStream = 512, kPacketsPerRow 
 inline constexpr int kChannels = 2, kRanks = 2;
 inline constexpr int64_t kChBytes = 32, kBgBytes = 64, kColBytes = 256, kBankBytes = 16384,
                          kRowBytes = 65536, kRankBytes = int64_t(1) << 33;
-
-// C ABI record lp6_dramsim3_pim_primitive: 30 int32 fields and a 32-byte payload.
-struct Record {
-  std::array<int32_t, 30> f;
-  std::array<uint8_t, 32> payload;
-};
-static_assert(sizeof(Record) == 152, "lp6_dramsim3_pim_primitive layout");
-enum Field {
-  F_TYPE, F_LOGICAL, F_LAYOUT_ID, F_WEIGHT_ID, F_SCOPE_ID, F_WEIGHT_TILE, F_ACT_TILE, F_SCALE_TILE, F_ACC,
-  F_OUT_TILE, F_INPUT_COUNT, F_OUTPUT_COUNT, F_W_IN_STRIDE, F_W_OUT_STRIDE, F_A_IN_STRIDE, F_S_IN_PERIOD,
-  F_S_IN_STRIDE, F_S_OUT_STRIDE, F_ACC_OUT_STRIDE, F_PLACEMENT, F_PREF_BANK_SET, F_SAME_SUBCH, F_MIRROR,
-  F_VCHANNEL, F_VBANK_SET, F_VBANK, F_HAS_PAYLOAD, F_WBITS, F_ABITS, F_SBITS
-};
-enum Primitive { STAGE_ACT, STAGE_W, STAGE_S, LOAD_ACT, LOAD_S, CLEAR, GEMV_TILE, GEMV_STREAM, STORE };
 
 // One INT8 activation vector of one token.
 struct Activation {
@@ -62,7 +49,7 @@ struct Projection {
   std::vector<int64_t> streamWeightBase;    // first weight tile of each stream, in its partition
   std::vector<int64_t> activations;         // activation per token
   std::vector<int> streamPart;              // partition of each stream
-  int64_t computeFirst = 0, computeCount = 0;
+  int64_t computeFirst = 0, computeCount = 0;   // PIM_GEMV command range
   int64_t streams() const { return nPad / kRowsPerStream; }
   int64_t sweeps() const { return k / kKPerSweep; }
   int64_t rowsPerPU() const { return nPad / kPUs; }
@@ -71,8 +58,8 @@ struct Projection {
   int tokens() const { return int(activations.size()); }
   int tilePart(int64_t t) const { return streamPart[size_t((t % (streams() * 8)) / 8)]; }
   int64_t tokenOutputTile(int m, int64_t t) const { return int64_t(m) * streams() * 8 + t; }
-  // Records emitCompute appends for this projection.
-  int64_t records() const { return int64_t(tokens()) * streams() * (kAccs + sweeps() * (kInTiles + 1) + 8); }
+  // PIM_GEMV commands emitCompute appends for this projection.
+  int64_t commands() const { return int64_t(tokens()) * streams(); }
 };
 
 // All PIM work of one program: one kernel, one tile-id space.
@@ -94,8 +81,9 @@ struct Program {
                         std::map<int, int64_t> &loads);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
-  // Compute records of projection `index`, all tokens, appended to `out`.
-  void emitCompute(int64_t index, std::vector<Record> &out);
+  // PIM_GEMV commands of projection `index`, one per token and stream, appended
+  // to `commands` (two words each).
+  Result<bool> emitCompute(int64_t index, std::vector<uint32_t> &commands);
 
   struct BaseRows { int64_t weight, activation, output; };
   BaseRows baseRows() const;

@@ -12,7 +12,7 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EncodePass)
   llvm::StringRef getArgument() const final { return "encode-npu"; }
   llvm::StringRef getName() const override { return "encode-npu"; }
-  llvm::StringRef getDescription() const final { return "Verify and encode NPU target blocks into a Unified Program (ISA ver 1.0)"; }
+  llvm::StringRef getDescription() const final { return "Verify and encode NPU target blocks into a Unified Program (ISA ver 2.0)"; }
   void getDependentDialects(mlir::DialectRegistry &r) const override { r.insert<mlir::npu::NPUDialect>(); }
   void runOnOperation() override {
     auto module = getOperation();
@@ -60,7 +60,7 @@ public:
     }
     auto encoded = encodeProgram(p);
     if (!encoded) { module.emitError(encoded.error); return signalPassFailure(); }
-    auto manifest = systemManifestForEncoded(p, encoded.value.size() / 4);
+    auto manifest = systemManifestForEncoded(p, encoded.value);
     std::vector<int32_t> words;
     for (size_t i = 0; i < encoded.value.size(); i += 4) {
       uint32_t w = 0;

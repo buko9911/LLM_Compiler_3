@@ -1,7 +1,7 @@
 //===----------------------------------------------------------------------===//
 // npu-compile — NPU 컴파일러 드라이버
 //
-// linalg 텐서 그래프(.mlir)를 NPU 칩이 읽는 Unified Program (ISA ver 1.0) 패키지로
+// linalg 텐서 그래프(.mlir)를 NPU 칩이 읽는 Unified Program (ISA ver 2.0) 패키지로
 // 바꾼다. 변환은 다섯 단계로 나뉘며, 이 파일은 그 다섯을 순서대로 부르는
 // 지휘자일 뿐이다. 실제 변환은 전부 lib/ 아래에 있다.
 //
@@ -457,7 +457,7 @@ int main(int argc, char **argv) {
   }
   binary.close();
 
-  // system.json 은 시뮬레이터가 읽는 Unified Program (ISA ver 1.0) 매니페스트,
+  // system.json 은 시뮬레이터가 읽는 Unified Program (ISA ver 2.0) 매니페스트,
   // metadata.json 은 이 컴파일러가 만든 ABI 설명이다. 소비자가 다르다.
   std::ofstream manifest(outputDir / "system.json");
   manifest << program.getManifest().str();
@@ -684,6 +684,6 @@ int main(int argc, char **argv) {
       return 1;
   }
 
-  std::cout << "wrote Unified Program (ISA ver 1.0) package to " << outputDir << '\n';
+  std::cout << "wrote Unified Program (ISA ver 2.0) package to " << outputDir << '\n';
   return 0;
 }

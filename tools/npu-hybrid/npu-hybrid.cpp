@@ -4,14 +4,14 @@
 // linalg 그래프 하나(Stage 0 캡처)를 W8A8 로 합법화한 뒤, 가중치 GEMV 묶음마다
 // NPU 와 PIM 중 어디서 돌릴지 비용 모델로 정하고(partitionGraph), PIM 묶음을
 // 경계로 NPU 페이즈들을 잘라(outlinePhases) 페이즈마다 npu-compile 과 같은
-// tile / place / lower / encode 를 돌린다. PIM 묶음은 LPDDR6-PIM 프리미티브
-// 레코드가 된다(lib/Target/PimLayout.cpp).
+// tile / place / lower / encode 를 돌린다. PIM 묶음은 PIM_GEMV 명령이 된다
+// (lib/Target/PimLayout.cpp).
 //
 //   NPU 0 | PIM 0 | NPU 1 | PIM 1 | ... | PIM G-1 | NPU G
 //
 // 출력 디렉터리:
-//   phase<i>/system.json, program.bin   NPU 페이즈 i (Unified Program, ISA ver 1.0)
-//   pim.bin                             PIM 레코드 (lp6_dramsim3_pim_primitive 배열)
+//   phase<i>/system.json, program.bin   NPU 페이즈 i (Unified Program, ISA ver 2.0)
+//   pim.bin                             PIM 명령 ("PIMC", 명령 수, 명령마다 PIM_GEMV 2 워드)
 //   schedule.json                       호스트 스케줄 (plena.v2.host_schedule.v1)
 //   partition.json                      묶음별 비용 추정과 선택
 //   metadata.json                       전역 주소, 출력의 L2 readback 주소, PIM 요약
@@ -29,6 +29,7 @@
 //===----------------------------------------------------------------------===//
 #include "npu/Dialect/NPUDialect.h"
 #include "npu/Target/HardwareConfig.h"
+#include "npu/Target/IsaV2.h"
 #include "npu/Target/PimLayout.h"
 #include "npu/Target/Quantize.h"
 #include "npu/Transforms/Hybrid.h"
@@ -434,7 +435,7 @@ int main(int argc, char **argv) {
   timed("tile+place");
 
   //===--------------------------------------------------------------------===//
-  // PIM: 타일 배치와 레코드
+  // PIM: 타일 배치와 PIM_GEMV 명령
   //===--------------------------------------------------------------------===//
   pim::Program program;
   program.partitions = model.value.pimPartitions;
@@ -465,13 +466,19 @@ int main(int argc, char **argv) {
           program.addProjection(gemv.name, gemv.n, gemv.k, activationsOf[size_t(g)], loads));
     }
   }
-  std::vector<pim::Record> records;
+  // 스케줄의 PIM 페이즈 범위(first, count)는 명령 단위다.
+  std::vector<uint32_t> pimCommands;
   std::vector<std::pair<int64_t, int64_t>> pimPhases;
   for (int64_t g = 0; g < groups; ++g) {
-    int64_t first = int64_t(records.size());
-    for (int64_t index : projectionsOf[size_t(g)]) program.emitCompute(index, records);
-    pimPhases.push_back({first, int64_t(records.size()) - first});
+    int64_t first = int64_t(pimCommands.size()) / 2;
+    for (int64_t index : projectionsOf[size_t(g)])
+      if (auto emitted = program.emitCompute(index, pimCommands); !emitted) {
+        std::cerr << emitted.error << '\n';
+        return 1;
+      }
+    pimPhases.push_back({first, int64_t(pimCommands.size()) / 2 - first});
   }
+  const int64_t pimCommandCount = int64_t(pimCommands.size()) / 2;
   if (program.rankEndAddress() > uint64_t(pim::kRankBytes)) {
     std::cerr << "PIM rows end past one rank\n";
     return 1;
@@ -578,7 +585,7 @@ int main(int argc, char **argv) {
   }
   timed("lower+encode");
 
-  // PIM 레코드와 호스트 스케줄.
+  // PIM 명령과 호스트 스케줄.
   llvm::json::Array schedulePhases;
   for (int64_t p = 0; p < phases; ++p) {
     schedulePhases.push_back(llvm::json::Object{{"npu", llvm::json::Object{
@@ -591,7 +598,10 @@ int main(int argc, char **argv) {
   llvm::json::Object schedule{{"schema", "plena.v2.host_schedule.v1"}, {"phases", std::move(schedulePhases)}};
   if (groups) {
     std::ofstream file(out / "pim.bin", std::ios::binary);
-    file.write(reinterpret_cast<const char *>(records.data()), std::streamsize(records.size() * sizeof(pim::Record)));
+    std::vector<uint32_t> words{::npu::isa2::kPimCommandMagic, uint32_t(pimCommandCount)};
+    words.insert(words.end(), pimCommands.begin(), pimCommands.end());
+    for (uint32_t word : words)   // little-endian
+      for (unsigned byte = 0; byte < 4; ++byte) file.put(char(word >> (8 * byte)));
     if (!file) return 1;
     schedule["pim"] = llvm::json::Object{
         {"program", "pim.bin"},
@@ -625,7 +635,7 @@ int main(int argc, char **argv) {
                                          {"stream_partitions", std::move(parts)}});
     }
     pimInfo.push_back(llvm::json::Object{{"group", g}, {"rank", rankOf[size_t(g)]},
-                                         {"records", pimPhases[size_t(g)].second}, {"gemvs", std::move(gemvs)}});
+                                         {"commands", pimPhases[size_t(g)].second}, {"gemvs", std::move(gemvs)}});
   }
   llvm::json::Object metadata{{"schema", "npu.hybrid.package.v1"},
                               {"lp6_bytes", int64_t(options.lp6Bytes)},
@@ -633,7 +643,7 @@ int main(int argc, char **argv) {
                               {"dram_scratch_base", int64_t(scratchBase)},
                               {"dram_end", int64_t(dramEnd)},
                               {"kernel_row", program.kernelRow},
-                              {"pim_records", int64_t(records.size())},
+                              {"pim_commands", pimCommandCount},
                               {"phases", std::move(phaseInfo)},
                               {"pim_groups", std::move(pimInfo)},
                               {"globals", std::move(globalInfo)},
@@ -735,6 +745,6 @@ int main(int argc, char **argv) {
     timed("image");
   }
   std::cout << "wrote hybrid package to " << out << ": " << phases << " NPU phases, " << groups
-            << " PIM phases, " << records.size() << " PIM records\n";
+            << " PIM phases, " << pimCommandCount << " PIM commands\n";
   return 0;
 }
