@@ -71,6 +71,9 @@ struct Options {
 
 uint64_t alignUp(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
 
+// [TRANSACTIONAL.SYSTEM] completion_event_slots of the simulator settings.
+constexpr uint32_t kCompletionEventSlots = 65536;
+
 bool save(ModuleOp module, const fs::path &path) {
   std::error_code ec;
   llvm::raw_fd_ostream out(path.string(), ec);
@@ -551,6 +554,13 @@ int main(int argc, char **argv) {
     if (options.saveStages && !save(m, dir / "03-target.mlir")) return 1;
     if (!runPass(m, ::npu::createEncodePass())) { std::cerr << "phase " << p << ": encoding failed\n"; return 1; }
     auto encoded = *m.getOps<mlir::npu::ProgramOp>().begin();
+    // Word 3 of a Unified Program is its command count. The simulator keeps one
+    // completion event per command in a fixed table.
+    if (uint32_t(encoded.getWords()[3]) > kCompletionEventSlots) {
+      std::cerr << "phase " << p << " has " << uint32_t(encoded.getWords()[3]) << " commands; the simulator runs at most "
+                << kCompletionEventSlots << " per program (split NPU phases with --split-every)\n";
+      return 1;
+    }
     {
       std::ofstream binary(dir / "program.bin", std::ios::binary);
       for (int32_t word : encoded.getWords()) {
