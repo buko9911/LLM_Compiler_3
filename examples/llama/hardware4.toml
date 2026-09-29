@@ -1,0 +1,19 @@
+# Minimal compiler configuration fixture; not a simulator configuration.
+[TRANSACTIONAL.ARCHITECTURE]
+array_rows = 32
+array_columns = 32
+l1_sram_size_bytes = 4194304
+lp6_capacity_bytes = 17179869184
+[TRANSACTIONAL.SYSTEM]
+num_cores = 4
+[TRANSACTIONAL.L2]
+size_bytes = 8388608
+[TRANSACTIONAL.DMA.GLOBAL]
+lp6_link_bytes_per_cycle = 32
+[TRANSACTIONAL.NOC]
+bytes_per_cycle = 32
+[TRANSACTIONAL.MATRIX_TIMING.FP16]
+macs_per_pe_per_cycle = 1
+pipeline_latency_cycles = 0
+[TRANSACTIONAL.MATRIX_MICROARCHITECTURE]
+accumulator_tiles = 1

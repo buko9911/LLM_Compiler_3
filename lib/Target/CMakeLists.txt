@@ -1,0 +1,5 @@
+add_library(PlenaTarget ISA.cpp Program.cpp HardwareConfig.cpp)
+target_include_directories(PlenaTarget PUBLIC "${PROJECT_SOURCE_DIR}/include")
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(PlenaTarget PRIVATE -fno-exceptions -fno-rtti)
+endif()

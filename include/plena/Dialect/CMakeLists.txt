@@ -1,0 +1,6 @@
+set(LLVM_TARGET_DEFINITIONS PlenaDialect.td)
+mlir_tablegen(PlenaDialect.h.inc -gen-dialect-decls -dialect=plena)
+mlir_tablegen(PlenaDialect.cpp.inc -gen-dialect-defs -dialect=plena)
+mlir_tablegen(PlenaOps.h.inc -gen-op-decls)
+mlir_tablegen(PlenaOps.cpp.inc -gen-op-defs)
+add_public_tablegen_target(PlenaDialectIncGen)
