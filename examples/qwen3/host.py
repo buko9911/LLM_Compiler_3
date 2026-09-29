@@ -86,8 +86,17 @@ def prepare(capture: Path, out: Path, prompt: str, quantize: bool) -> Step:
         target = source / f"arg{index}.bin"
         target.unlink(missing_ok=True)
         target.write_bytes(tensor.contiguous().numpy().tobytes())
-    return Step(manifest, source, [o.float().numpy() for o in outputs],
-                [r["name"] for r in manifest["results"]])
+    expected = [o.float().numpy() for o in outputs]
+    np.savez(out / "expected.npz", *expected)
+    return Step(manifest, source, expected, [r["name"] for r in manifest["results"]])
+
+
+def reuse(capture: Path, previous: Path) -> Step:
+    """The step prepare() wrote into `previous`: its inputs and reference outputs."""
+    manifest = json.loads((capture / "manifest.json").read_text())
+    saved = np.load(previous / "expected.npz")
+    expected = [saved[f"arr_{i}"] for i in range(len(saved.files))]
+    return Step(manifest, previous / "inputs", expected, [r["name"] for r in manifest["results"]])
 
 
 def simulator_settings(hardware: Path, out: Path, settings: Path = SETTINGS) -> Path:

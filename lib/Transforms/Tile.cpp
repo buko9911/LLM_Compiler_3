@@ -556,11 +556,18 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
     // 구간 안에서 한 번만 올리면 되기 때문이다.
     auto lane = coreLane(p.l2.n, hw.cores);
     const bool residentPanel = p.l1.m > 32 || p.l1.n > 32;
-    auto group = tile(r, *panel, {int64_t(residentPanel ? p.l2.m : divisor(p.l2.m)), int64_t(lane), 0});
+    const int64_t rowTile = residentPanel ? int64_t(p.l2.m) : int64_t(divisor(p.l2.m));
+    auto group = tile(r, *panel, {rowTile, lane != p.l2.n ? int64_t(lane) : 0, 0});
     if (failed(group)) return failure();
-    if (lane != p.l2.n)
+    if (lane != p.l2.n) {
       if (auto independent = (*group)->getParentOfType<scf::ForOp>())
         independent->setAttr("npu.core_split", r.getUnitAttr());
+    } else if (!residentPanel && hw.cores > 1 && int64_t(p.l2.m) / rowTile > 1) {
+      // 열이 코어 수만큼 나뉘지 않으면(N 이 작은 GEMV 꼴, decode 의 어텐션 점수)
+      // 행 타일을 코어에 돌려 준다. 행 타일끼리도 서로 독립이다.
+      if (auto rows = (*group)->getParentOfType<scf::ForOp>())
+        rows->setAttr("npu.core_split", r.getUnitAttr());
+    }
 
     // Full-K L1 panels reuse both operands across several array tiles. Never
     // move a K loop outside these tiles: the machine has one accumulator.

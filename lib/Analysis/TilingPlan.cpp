@@ -6,6 +6,7 @@
 namespace npu {
 namespace {
 uint64_t ceilDiv(uint64_t n, uint64_t d) { return n/d + (n%d != 0); }
+constexpr uint64_t kPanelCycles = 700;
 uint64_t arrayDivisor(uint64_t extent) {
   uint64_t tile = std::min<uint64_t>(32,extent);
   while (extent % tile) --tile;
@@ -61,6 +62,11 @@ Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &reques
       p.l2 = {m,n,s.k}; p.l1 = {lm,ln,k};
       p.array = {arrayDivisor(lm),arrayDivisor(ln),k};
       p.coreSplit = std::min<uint64_t>(h.cores,n/lane);
+      // Columns that do not split over the cores (a GEMV-like N below 64, e.g.
+      // decode attention scores with N = 4) leave the row tiles of a panel to
+      // split instead, when those are single array tiles.
+      if (lane == n && h.cores > 1 && lm <= 32 && ln <= 32)
+        p.coreSplit = std::min<uint64_t>(h.cores, m / arrayDivisor(m));
       if (request.graphResidentBytes)
         p.memory.push_back(buffer("graph.resident",MemorySpace::L2,request.graphResidentBytes));
       // L2 stages and the L1 allocations inside the unrolled panel loop are
@@ -98,6 +104,11 @@ Result<std::vector<TilingPlan>> enumerateTilingPlans(const TilingRequest &reques
       p.estimatedCycles = p.stages > 1 && panels > 1
           ? std::max(coreCycles,globalCycles) + ceilDiv(std::min(coreCycles,globalCycles),panels)
           : coreCycles + globalCycles;
+      // Every L2 panel also pays for its GDMA commands and for handing the panel
+      // to the cores and back, whatever its size. Without this term equal-traffic
+      // plans tie and the smallest panels win; measured on the simulator, a
+      // 32-row decode attention panel costs about 700 cycles beyond its bytes.
+      p.estimatedCycles += panels * kPanelCycles;
       plans.push_back(std::move(p));
     }
   }

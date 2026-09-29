@@ -22,7 +22,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import numpy as np
-from host import NPU_HZ, compare, phase_summary, prepare, run_hybrid, run_npu, simulator_settings
+from host import NPU_HZ, compare, phase_summary, prepare, reuse, run_hybrid, run_npu, simulator_settings
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--capture", type=Path, required=True, help="output directory of capture.py")
@@ -38,11 +38,12 @@ ap.add_argument("--split-every", type=int, default=0,
                      "(one program per N GEMV groups; 4 = per layer) instead of one npu-compile program")
 ap.add_argument("--reference", choices=["w8a8", "fp32"], default="w8a8",
                 help="reference model: W8A8 linears (exact GEMVs) or plain FP32 (lighter for many layers)")
+ap.add_argument("--reuse", type=Path, help="take the inputs and reference outputs an earlier run prepared there")
 a = ap.parse_args()
 a.out = a.out.resolve()
 a.out.mkdir(parents=True, exist_ok=True)
 
-step = prepare(a.capture, a.out, a.prompt, quantize=a.reference == "w8a8")
+step = reuse(a.capture, a.reuse) if a.reuse else prepare(a.capture, a.out, a.prompt, quantize=a.reference == "w8a8")
 settings = simulator_settings(a.hardware, a.out)
 graph = a.capture / "00-imported.mlir"
 npu_package, hybrid_package = a.out / "npu", a.out / "hybrid"
