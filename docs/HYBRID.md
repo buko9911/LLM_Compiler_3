@@ -144,17 +144,19 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 |---|---|---|---|
 | 층 0, M=1 | 1.759 ms (NPU 0.355 + PIM 1.404) | 5.995 ms | 3.41배 |
 | 층 0, M=2 (79b3704 이전) | 3.476 ms (NPU 0.671 + PIM 2.805) | 6.268 ms | 1.80배 |
+| 층 0, M=4, 비용 모델 혼합 (qkv·gate/up PIM, o·down NPU) | 6.508 ms (NPU 3.091 + PIM 3.417) | 7.325 ms | 1.13배 |
+| 층 0, M=4, 전부 PIM (`--policy pim`) | 6.621 ms (NPU 1.004 + PIM 5.617) | 7.325 ms | 1.11배 |
+| 층 0, M=1, 두 rank 동시 (`concurrent_ranks`, 상한 참고) | 1.258 ms (NPU 0.384 + PIM 0.874) | 5.995 ms | 4.77배 |
 
 모든 경우 하이브리드 출력은 NPU 단독과 바이트 단위로 같다. PIM 스윕 1회는 묶음과
 무관하게 3.38~3.42 µs(효율 약 0.62, 고정 비용 약 0)였다.
 
-36층 + lm_head (Qwen3-4B 전체, 프롬프트 "The capital of France is", f228302 컴파일러):
+36층 + lm_head (Qwen3-4B 전체, 프롬프트 "The capital of France is"):
 
-| | 한 토큰 |
-|---|---|
-| NPU+PIM (146 NPU 페이즈 + 145 PIM 페이즈) | 77.3 ms (NPU 20.1 + PIM 57.2, lm_head PIM 5.1) |
-| NPU 단독 W8A8 (층마다 한 프로그램, 37 페이즈) | 242.3 ms |
-| 비 | 3.13배 |
+| 컴파일러 | NPU+PIM (146 NPU 페이즈 + 145 PIM 페이즈) | NPU 단독 W8A8 (층마다 한 프로그램) | 비 |
+|---|---|---|---|
+| 79b3704 이후 | 70.26 ms (NPU 13.32 + PIM 56.94) | 235.38 ms | 3.35배 |
+| f228302 | 77.31 ms (NPU 20.11 + PIM 57.20, lm_head PIM 5.1) | 242.31 ms | 3.13배 |
 
 logits와 새 K/V 72개, 출력 73개가 전부 바이트 단위로 같고, 다음 토큰은 장치와 PyTorch FP32
 모두 " Paris"(장치 top-5: " Paris", " in", " a", " located", " __")다. logits의 FP32 대비 상대
