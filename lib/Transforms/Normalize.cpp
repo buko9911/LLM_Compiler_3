@@ -117,6 +117,89 @@ LogicalResult widenRowChain(OpBuilder &b, linalg::GenericOp gen) {
 //===----------------------------------------------------------------------===//
 namespace {
 
+/// 원소별 FP32 -> FP16 반올림 generic 하나인가 — 행렬곱 FP32 결과를 FP16 으로.
+bool isRounding(linalg::GenericOp gen) {
+  if (!gen || gen.getNumDpsInputs() != 1 || gen.getNumDpsInits() != 1 ||
+      !llvm::all_of(gen.getIndexingMapsArray(), [](AffineMap map) { return map.isIdentity(); }) ||
+      !llvm::all_of(gen.getIteratorTypesArray(),
+                    [](utils::IteratorType t) { return t == utils::IteratorType::parallel; }))
+    return false;
+  Block &body = gen.getRegion().front();
+  auto round = dyn_cast<arith::TruncFOp>(&body.front());
+  return round && std::next(body.begin()) == std::prev(body.end()) && round.getIn() == body.getArgument(0) &&
+         cast<linalg::YieldOp>(body.getTerminator()).getValues()[0] == round.getResult() &&
+         round.getType().isF16();
+}
+
+/// C = A · Xᵀ 에서 X 가 크고 A 가 작으면 Cᵀ = X · Aᵀ 를 계산한다.
+///
+/// 전치는 열을 따라 읽으므로 원소 하나가 전송 한 행이다. 전치해야 하는 원소
+/// 수가 X 는 N·K, 대신 A 와 결과는 M·K + M·N 이다. decode 의 어텐션 점수가
+/// 정확히 이 모양이다 — 키 창(N = P + M 행)은 크고 질의 행(M = G, 4개)은 적다.
+/// 결과는 FP32 로 누적한 뒤 반올림하는 generic 을 거쳐 FP16 이 되므로, 새
+/// 행렬곱 뒤에 같은 반올림을 두고 그 FP16 을 전치한다. 값은 원소마다 같은
+/// 곱셈과 덧셈이라 달라지지 않는다.
+///
+/// X 가 진입 인자이면 건드리지 않는다. 그런 전치는 pretransposeWeights 가
+/// 이미지 쪽으로 옮겨 공짜로 없앤다.
+template <typename MatmulLike>
+LogicalResult swapTransposedOperand(OpBuilder &b, ModuleOp m) {
+  SmallVector<MatmulLike> work;
+  m.walk([&](MatmulLike mm) { work.push_back(mm); });
+  for (auto mm : work) {
+    Value a = mm.getDpsInputOperand(0)->get(), t = mm.getDpsInputOperand(1)->get();
+    auto transpose = t.getDefiningOp<linalg::TransposeOp>();
+    if (!transpose || !t.hasOneUse() || isa<BlockArgument>(transpose.getInput())) continue;
+    auto aType = dyn_cast<RankedTensorType>(a.getType());
+    auto xType = dyn_cast<RankedTensorType>(transpose.getInput().getType());
+    auto cType = dyn_cast<RankedTensorType>(mm.getResult(0).getType());
+    if (!aType || !xType || !cType || !aType.hasStaticShape() || !xType.hasStaticShape()) continue;
+    const int64_t rank = aType.getRank();
+    SmallVector<int64_t> swapLast = llvm::to_vector(llvm::seq<int64_t>(0, rank));
+    std::swap(swapLast[rank - 1], swapLast[rank - 2]);
+    if (transpose.getPermutation() != ArrayRef<int64_t>(swapLast)) continue;
+    const int64_t M = aType.getDimSize(rank - 2), K = aType.getDimSize(rank - 1),
+                  N = xType.getDimSize(rank - 2);
+    if (M * K + M * N >= N * K || !isZeroFilled(mm.getDpsInitOperand(0)->get())) continue;
+    if (!mm.getResult(0).hasOneUse()) continue;
+    auto round = dyn_cast<linalg::GenericOp>(*mm.getResult(0).getUsers().begin());
+    if (!isRounding(round)) continue;
+
+    Location loc = mm.getLoc();
+    b.setInsertionPoint(mm);
+    auto transposedShape = [&](RankedTensorType type) {
+      SmallVector<int64_t> shape(type.getShape());
+      std::swap(shape[rank - 1], shape[rank - 2]);
+      return shape;
+    };
+    auto at = b.create<linalg::TransposeOp>(
+        loc, a, b.create<tensor::EmptyOp>(loc, transposedShape(aType), aType.getElementType()), swapLast);
+    auto swappedC = transposedShape(cType);
+    Value zero = b.create<arith::ConstantOp>(loc, cast<TypedAttr>(b.getZeroAttr(cType.getElementType())));
+    Value init = b.create<linalg::FillOp>(loc, ValueRange{zero},
+                                          ValueRange{b.create<tensor::EmptyOp>(loc, swappedC, cType.getElementType())})
+                     .getResult(0);
+    auto product = b.create<MatmulLike>(loc, TypeRange{RankedTensorType::get(swappedC, cType.getElementType())},
+                                        ValueRange{transpose.getInput(), at.getResult()[0]}, ValueRange{init});
+    auto roundedType = cast<RankedTensorType>(round.getResult(0).getType());
+    auto rounded = b.create<linalg::GenericOp>(
+        loc, TypeRange{RankedTensorType::get(swappedC, roundedType.getElementType())}, ValueRange{product.getResult(0)},
+        ValueRange{b.create<tensor::EmptyOp>(loc, swappedC, roundedType.getElementType())},
+        round.getIndexingMapsArray(), round.getIteratorTypesArray(),
+        [&](OpBuilder &nb, Location nl, ValueRange args) {
+          nb.create<linalg::YieldOp>(nl, ValueRange{nb.create<arith::TruncFOp>(nl, roundedType.getElementType(), args[0])});
+        });
+    auto back = b.create<linalg::TransposeOp>(
+        loc, rounded.getResult(0), b.create<tensor::EmptyOp>(loc, roundedType.getShape(), roundedType.getElementType()),
+        swapLast);
+    round.getResult(0).replaceAllUsesWith(back.getResult()[0]);
+    round.erase();
+    mm.erase();
+    transpose.erase();
+  }
+  return success();
+}
+
 /// `matmul -> f32` + `truncf -> f16` 쌍을 `matmul -> f16` 하나로 접는다.
 ///
 /// 조건이 여럿이고 하나라도 어긋나면 그 행렬곱은 건너뛴다(continue). 접지
@@ -1068,6 +1151,11 @@ LogicalResult normalizeGraph(ModuleOp m) {
     widened.add<MatmulOfWidenedInputs>(m.getContext());
     if (failed(applyPatternsGreedily(m, std::move(widened)))) return failure();
   }
+
+  // ── ⓪' 큰 쪽 대신 작은 쪽을 전치 ──────────────────────────────────
+  // C = A·Xᵀ 를 (X·Aᵀ)ᵀ 로. ①이 새 행렬곱과 그 반올림을 다시 접는다.
+  if (failed(swapTransposedOperand<linalg::BatchMatmulOp>(batched, m))) return failure();
+  if (failed(swapTransposedOperand<linalg::MatmulOp>(batched, m))) return failure();
 
   // ── ① 누적·반올림 쌍 접기 ─────────────────────────────────────────
   // 무엇이 reshape 하거나 slice 하기 전에 해야 한다. 지금은 그 한 쌍이 아직
