@@ -8,7 +8,7 @@
 
 namespace npu::isa2 {
 // PLENA ISA ver 2.0 (IESLAB_NPU_Simulator 75725ad): the core-block lowering,
-// the system records and the PIM_GEMV command. A port of the simulator's
+// the system records (with the PIM record) and the PIM_GEMV command. A port of the simulator's
 // tools/isa_v2.py, the same as hybrid-compiler lib/Target/NPU/IsaV2.cpp.
 //
 // Lower writes core code as a builder stream in the ISA ver 1.0 encodings of
@@ -51,9 +51,13 @@ std::vector<uint32_t> gdmaRecord(bool load, uint32_t ordinal, const std::vector<
 std::vector<uint32_t> coreBeginRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
                                       uint32_t coreWords, uint32_t logicalCore, uint64_t l1Bytes);
 std::vector<uint32_t> barrierRecord(uint32_t ordinal, const std::vector<uint32_t> &deps);
+// PIM record: W0 [5:0] opcode, [13:6] dependencies, [31:14] PIM_GEMV count;
+// the dependency words, then two words per PIM_GEMV. The command processor
+// hands the commands to the PIM controller; the record completes when LP6 drains.
+inline constexpr uint64_t kPimCommands = 1u << 18;    // PIM_GEMV count < 2^18
+std::vector<uint32_t> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps, const uint32_t *commands,
+                                uint32_t count);
 
-// pim.bin command stream: "PIMC", command count, two words per command.
-inline constexpr uint32_t kPimCommandMagic = 0x434d4950;
 // PIM_GEMV (command type 0): one W8A8 GEMV stream on one partition. The PIM
 // controller expands it to CLEAR x16, per 256-input sweep LOAD_ACT x32 +
 // GEMV_STREAM, then STORE x8 (lp6-pim-main lp6_dramsim3_pim_load_commands).

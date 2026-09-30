@@ -2,7 +2,7 @@
 
 The host owns the KV windows. Every step it writes x, cos, sin, mask and the
 windows into the package's LP6 image at the addresses metadata.json gives,
-runs the host schedule, takes the argmax of the logits and moves the step's new
+runs the step program, takes the argmax of the logits and moves the step's new
 K/V rows into their cache slot. The prompt is prefilled on the host with the
 FP32 module, as NPU runtimes prefill on another engine; every generated token
 is one simulator run. The same greedy loop in PyTorch FP32 is printed next to it.

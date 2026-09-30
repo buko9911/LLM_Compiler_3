@@ -78,14 +78,18 @@ npu_out = harness.read(npu, meta["readback_l2_address"], 1, 256, row_stride=meta
 hybrid = out / "hybrid"
 subprocess.run([a.hybrid, a.graph, "--settings", str(settings), "-o", str(hybrid), "--policy", "pim",
                 "--inputs", str(inputs)], check=True)
-done = subprocess.run([emulator, "--settings", str(settings), "--schedule", "schedule.json", "--schedule-report",
-                       "phases.json", "--lp6-image", "lp6.bin", "--lp6-size", "16GiB", "--log-level", "warn"],
-                      cwd=hybrid, capture_output=True, text=True, timeout=900)
+done = subprocess.run([emulator, "--settings", str(settings), "--system-program", "system.json",
+                       "--command-report", "commands.json", "--lp6-image", "lp6.bin", "--lp6-size", "16GiB",
+                       "--log-level", "warn"], cwd=hybrid, capture_output=True, text=True, timeout=900)
 (hybrid / "simulator.log").write_text(done.stdout + done.stderr)
 if done.returncode:
     raise SystemExit((done.stdout + done.stderr)[-4000:])
-report = json.loads((hybrid / "phases.json").read_text())
-assert [p["kind"] for p in report["phases"]] == ["npu", "pim", "npu", "pim", "npu"], report
+# One program: records are named <phase>.<kind>_<ordinal>, a PIM record after its phase.
+records = sorted(json.loads((hybrid / "commands.json").read_text())["commands"], key=lambda c: c["event_id"])
+phases = [c["name"].split(".")[0] for c in records]
+phases = [name for i, name in enumerate(phases) if not i or phases[i - 1] != name]
+assert phases == ["npu0", "pim0", "npu1", "pim1", "npu2"], phases
+assert [c["kind"] for c in records if c["name"].startswith("pim")] == ["pim", "pim"]
 meta = json.loads((hybrid / "metadata.json").read_text())["outputs"][0]
 hybrid_out = harness.read(hybrid, meta["readback_l2_address"], 1, 256)
 

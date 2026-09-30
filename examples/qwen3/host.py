@@ -5,9 +5,9 @@ running the PyTorch module over the earlier prompt tokens one step at a time
 (FP32), writes the checked step's inputs as arg<N>.bin beside the captured
 weights, and returns the FP32 reference outputs of that step.
 
-run_npu() runs an npu-compile package (one program), run_hybrid() an npu-hybrid
-package (a host schedule of NPU and PIM phases). Both return the outputs read
-back from the simulator's L2 dump and the cycle counts.
+run_npu() runs an npu-compile package, run_hybrid() an npu-hybrid package (one
+program whose NPU and PIM phases follow each other). Both return the outputs
+read back from the simulator's L2 dump and the cycle counts.
 """
 from __future__ import annotations
 
@@ -144,17 +144,37 @@ def run_npu(package: Path, settings: Path, timeout: int = 14400):
 
 
 def run_hybrid(package: Path, settings: Path, timeout: int = 14400):
-    """One npu-hybrid package: outputs and the per-phase report of the host schedule."""
-    _simulate(package, ["--settings", str(settings), "--schedule", "schedule.json",
-                        "--schedule-report", "phases.json", "--lp6-image", "lp6.bin",
+    """One npu-hybrid package: outputs and the per-phase report (phase_report)."""
+    _simulate(package, ["--settings", str(settings), "--system-program", "system.json",
+                        "--command-report", "commands.json", "--lp6-image", "lp6.bin",
                         "--lp6-size", "16GiB", "--log-level", "info"], timeout)
     meta = json.loads((package / "metadata.json").read_text())
-    report = json.loads((package / "phases.json").read_text())
+    report = phase_report(json.loads((package / "commands.json").read_text()))
+    (package / "phases.json").write_text(json.dumps(report, indent=1) + "\n")
     return _read_l2(package, meta["outputs"]), report
 
 
+def phase_report(commands: dict) -> dict:
+    """Phases of one npu-hybrid program from the simulator's command report.
+
+    Records are named <phase>.<kind>_<ordinal> (npu<i>), a PIM record after its
+    phase (pim<g>). A phase runs from the end of the previous one to the end of
+    its last record."""
+    phases = []
+    for c in sorted(commands["commands"], key=lambda c: c["event_id"]):
+        name = c["name"].split(".")[0]
+        if not phases or phases[-1]["name"] != name:
+            start = phases[-1]["end_npu_cycle"] if phases else 0
+            phases.append({"kind": "npu", "name": name, "start_npu_cycle": start, "end_npu_cycle": start})
+        phase = phases[-1]
+        phase["end_npu_cycle"] = max(phase["end_npu_cycle"], c["end_cycle"])
+        if c["kind"] == "pim":
+            phase["kind"] = "pim"
+    return {"phases": phases}
+
+
 def phase_summary(report: dict) -> dict:
-    """NPU cycles per kind of phase, and the total, from a schedule report."""
+    """NPU cycles per kind of phase, and the total, from a phase report."""
     total = {"npu": 0, "pim": 0}
     for phase in report["phases"]:
         total[phase["kind"]] += phase["end_npu_cycle"] - phase["start_npu_cycle"]

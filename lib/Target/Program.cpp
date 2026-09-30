@@ -354,6 +354,18 @@ Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
       coreWords += count;
       break;
     }
+    case 0x27: { // PIM
+      const uint32_t count = head >> 14;
+      if (!count) return R::failure("PIM record without PIM_GEMV commands");
+      ++at;
+      deps = readDependencies(words, at, id, head >> 6 & 0xff);
+      if (!deps) return deps;
+      if (uint64_t(count) * 2 > words.size() - at) return R::failure("truncated PIM record");
+      for (uint32_t i = 0; i < count; ++i)
+        if (words[at + 2 * size_t(i)] & 15) return R::failure("unknown PIM command type");
+      at += 2 * size_t(count);
+      break;
+    }
     default:
       return R::failure("unknown program command");
     }
@@ -362,6 +374,115 @@ Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
   if (words.size() - at != 1 || words[at] != 0x2f || coreWords != words[4])
     return R::failure("invalid program footer or core instruction count");
   return R::success(true);
+}
+
+namespace {
+// One record of a verified program: the words before its dependencies, its
+// dependencies as ordinals of that program, and the words after them.
+struct Record {
+  unsigned op;
+  std::vector<uint32_t> head, deps, tail;
+};
+std::vector<Record> readRecords(const std::vector<uint32_t> &words) {
+  std::vector<Record> records;
+  size_t at = 5;
+  for (uint32_t id = 0; id < words[3]; ++id) {
+    const uint32_t head = words[at];
+    Record r{head & 63, {}, {}, {}};
+    size_t headWords = 1, tailWords = 0;
+    uint32_t count = 0;
+    switch (r.op) {
+    case 0x2b: case 0x2c: headWords = head >> 6 & 1 ? 5 : 3; count = head >> 7 & 0xff; break;
+    case 0x26: headWords = 2; count = words[at + 1] >> 24; tailWords = words[at + 1] & 0xffffff; break;
+    case 0x27: count = head >> 6 & 0xff; tailWords = 2 * size_t(head >> 14); break;
+    default: count = head >> 6 & 0xff; break;   // BARRIER
+    }
+    r.head.assign(words.begin() + at, words.begin() + at + headWords);
+    at += headWords;
+    for (uint32_t i = 0; i < count; ++i) r.deps.push_back(id - (words[at + i / 2] >> (16 * (i % 2)) & 0xffff));
+    at += (size_t(count) + 1) / 2;
+    r.tail.assign(words.begin() + at, words.begin() + at + tailWords);
+    at += tailWords;
+    records.push_back(std::move(r));
+  }
+  return records;
+}
+// Writes `r` as record `ordinal`: its dependency count and backward distances change.
+void writeRecord(std::vector<uint32_t> &out, Record r, uint32_t ordinal) {
+  const uint32_t n = uint32_t(r.deps.size());
+  if (r.op == 0x2b || r.op == 0x2c) r.head[0] = (r.head[0] & ~(0xffu << 7)) | n << 7;
+  else if (r.op == 0x26) r.head[1] = (r.head[1] & 0xffffff) | n << 24;
+  else r.head[0] = (r.head[0] & ~(0xffu << 6)) | n << 6;
+  out.insert(out.end(), r.head.begin(), r.head.end());
+  for (size_t i = 0; i < n; i += 2)
+    out.push_back((ordinal - r.deps[i]) | (i + 1 < n ? ordinal - r.deps[i + 1] : 0) << 16);
+  out.insert(out.end(), r.tail.begin(), r.tail.end());
+}
+} // namespace
+
+Result<LinkedProgram> linkProgram(const std::vector<Segment> &segments) {
+  using R = Result<LinkedProgram>;
+  LinkedProgram linked;
+  auto &out = linked.words;
+  out.assign(5, 0);
+  uint32_t next = 0;   // ordinal of the next record
+  uint64_t coreWords = 0;
+  std::vector<uint32_t> entry;   // exit of the previous segment
+  auto near = [&](const std::vector<uint32_t> &deps) {
+    return std::all_of(deps.begin(), deps.end(), [&](uint32_t d) { return next - d <= isa2::kMaxDistance; });
+  };
+  auto tooFar = [](const std::string &name) {
+    return R::failure(name + ": a record is more than 65535 records from the phase boundary "
+                             "(split NPU phases with --split-every)");
+  };
+  for (const auto &s : segments) {
+    if (!s.pim.empty()) {
+      if (!s.program.empty() || s.pim.size() % 2 || s.pim.size() / 2 >= isa2::kPimCommands)
+        return R::failure(s.name + ": invalid PIM segment");
+      auto record = isa2::pimRecord(next, entry, s.pim.data(), uint32_t(s.pim.size() / 2));
+      out.insert(out.end(), record.begin(), record.end());
+      linked.symbols.push_back(s.name);
+      entry = {next++};
+      continue;
+    }
+    if (auto valid = verifyProgramWords(s.program); !valid) return R::failure(s.name + ": " + valid.error);
+    const uint32_t base = next;
+    auto records = readRecords(s.program);
+    std::vector<bool> waitedFor(records.size(), false);
+    for (auto &r : records) {
+      for (auto &d : r.deps) { waitedFor[d] = true; d += base; }
+      if (r.deps.empty()) r.deps = entry;
+      if (!near(r.deps)) return tooFar(s.name);
+      const char *kind = r.op == 0x26 ? ".core_block_" : r.op == 0x2d ? ".barrier_" : ".gdma_";
+      linked.symbols.push_back(s.name + kind + std::to_string(next));
+      if (r.op == 0x26) coreWords += r.tail.size();
+      writeRecord(out, std::move(r), next++);
+    }
+    // The phase ends with a BARRIER after every record nothing in it waits for.
+    std::vector<uint32_t> last;
+    for (uint32_t i = 0; i < records.size(); ++i)
+      if (!waitedFor[i]) last.push_back(base + i);
+    if (last.empty()) continue;   // an empty phase passes its entry on
+    do {
+      std::vector<uint32_t> joined;
+      for (size_t i = 0; i < last.size(); i += isa2::kMaxDependencies) {
+        std::vector<uint32_t> group(last.begin() + i, last.begin() + std::min(last.size(), i + isa2::kMaxDependencies));
+        if (!near(group)) return tooFar(s.name);
+        auto barrier = isa2::barrierRecord(next, group);
+        out.insert(out.end(), barrier.begin(), barrier.end());
+        linked.symbols.push_back(s.name + ".barrier_" + std::to_string(next));
+        joined.push_back(next++);
+      }
+      last = std::move(joined);
+    } while (last.size() > 1);
+    entry = last;
+  }
+  out.push_back(0x2f);
+  if (out.size() > UINT32_MAX || coreWords > UINT32_MAX) return R::failure("program exceeds binary field size");
+  out[0] = kProgramMagic; out[1] = kProgramVersion; out[2] = uint32_t(out.size());
+  out[3] = next; out[4] = uint32_t(coreWords);
+  if (auto verified = verifyProgramWords(out); !verified) return R::failure(verified.error);
+  return R::success(std::move(linked));
 }
 
 Result<std::vector<uint8_t>> encodeProgram(const Program &program) {

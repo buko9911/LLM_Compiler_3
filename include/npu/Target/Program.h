@@ -55,5 +55,24 @@ std::string systemManifestForEncoded(const Program &program, const std::vector<u
 Result<bool> verifyCore(const std::vector<uint32_t> &words);
 // Encoded ver 2.0 program: header, records, dependencies, core block structure.
 Result<bool> verifyProgramWords(const std::vector<uint32_t> &words);
+
+// One decode step of npu-hybrid as one program. A segment is an NPU phase (an
+// encoded program) or a PIM phase (PIM_GEMV commands, two words each), in run
+// order. The records of an NPU phase keep their order and dependencies; the
+// ones without dependencies wait for the previous segment, and a BARRIER joins
+// the phase's last records. A PIM phase is one PIM record after the previous
+// segment.
+struct Segment {
+  std::string name;
+  std::vector<uint32_t> program;   // NPU phase: encodeProgram words
+  std::vector<uint32_t> pim;       // PIM phase: PIM_GEMV words
+};
+struct LinkedProgram {
+  std::vector<uint32_t> words;
+  // Per record: <segment>.<core_block|gdma|barrier>_<ordinal>; a PIM record is
+  // named after its segment.
+  std::vector<std::string> symbols;
+};
+Result<LinkedProgram> linkProgram(const std::vector<Segment> &segments);
 } // namespace npu
 #endif

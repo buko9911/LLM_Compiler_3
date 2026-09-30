@@ -70,6 +70,14 @@ TEST(IsaV2, SystemRecordsMatchTheSimulatorDecoder) {
   EXPECT_EQ(npu::isa2::barrierRecord(5, {1, 2}), (std::vector<uint32_t>{0x2d | 2u << 6, 4 | 3u << 16}));
 }
 
+TEST(IsaV2, PimRecordCarriesItsCommands) {
+  // runner.rs pim_record_carries_its_commands_and_dependencies: W0 count and
+  // dependencies, the dependency words, two words per PIM_GEMV.
+  const uint32_t commands[] = {1, 2, 3, 4};
+  EXPECT_EQ(npu::isa2::pimRecord(3, {1}, commands, 2),
+            (std::vector<uint32_t>{0x27 | 1u << 6 | 2u << 14, 2, 1, 2, 3, 4}));
+}
+
 TEST(IsaV2, PimGemvFields) {
   auto command = npu::isa2::pimGemv(1, 10, 1024, 320, 16);
   ASSERT_TRUE(bool(command)) << command.error;

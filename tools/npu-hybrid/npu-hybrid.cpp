@@ -10,12 +10,17 @@
 //   NPU 0 | PIM 0 | NPU 1 | PIM 1 | ... | PIM G-1 | NPU G
 //
 // 출력 디렉터리:
-//   phase<i>/system.json, program.bin   NPU 페이즈 i (Unified Program, ISA ver 2.0)
-//   pim.bin                             PIM 명령 ("PIMC", 명령 수, 명령마다 PIM_GEMV 2 워드)
-//   schedule.json                       호스트 스케줄 (plena.v2.host_schedule.v1)
-//   partition.json                      묶음별 비용 추정과 선택
-//   metadata.json                       전역 주소, 출력의 L2 readback 주소, PIM 요약
-//   lp6.bin                             LP6 이미지 (--inputs 가 있을 때)
+//   program.bin, system.json   디코드 한 스텝 = Unified Program 하나 (ISA ver 2.0).
+//                              NPU 페이즈는 레코드 구간, PIM 페이즈는 PIM 레코드 하나
+//                              (PIM_GEMV 명령들). system.json 에 PIM 커널 설정과
+//                              레코드 이름 <페이즈>.<종류>_<번호> (npu<i>, pim<g>).
+//   partition.json             묶음별 비용 추정과 선택
+//   metadata.json              전역 주소, 출력의 L2 readback 주소, PIM 요약
+//   lp6.bin                    LP6 이미지 (--inputs 가 있을 때)
+//   phase<i>/                  --save-stages 일 때 페이즈 i 의 단계별 MLIR
+//
+// 페이즈 순서는 레코드 의존성이다(linkProgram). NPU 페이즈의 의존성 없는
+// 레코드는 앞 페이즈의 끝을 기다리고, 페이즈 끝은 BARRIER 하나다.
 //
 // 페이즈 경계는 GDMA 명령으로 이어 붙인다. NPU 는 PIM 을 모른다.
 //   * PIM 묶음 g 의 INT8 활성값은 NPU 페이즈 g 끝에서 DRAM 전역 -> L2 -> PIM
@@ -31,6 +36,7 @@
 #include "npu/Target/HardwareConfig.h"
 #include "npu/Target/IsaV2.h"
 #include "npu/Target/PimLayout.h"
+#include "npu/Target/Program.h"
 #include "npu/Target/Quantize.h"
 #include "npu/Transforms/Hybrid.h"
 #include "npu/Transforms/Passes.h"
@@ -71,9 +77,6 @@ struct Options {
 };
 
 uint64_t alignUp(uint64_t value, uint64_t alignment) { return (value + alignment - 1) / alignment * alignment; }
-
-// [TRANSACTIONAL.SYSTEM] completion_event_slots of the simulator settings.
-constexpr uint32_t kCompletionEventSlots = 65536;
 
 bool save(ModuleOp module, const fs::path &path) {
   std::error_code ec;
@@ -319,6 +322,14 @@ int main(int argc, char **argv) {
   std::error_code ec;
   fs::create_directories(out, ec);
   if (ec) { std::cerr << ec.message() << '\n'; return 1; }
+  // 예전 형식(페이즈별 program.bin, pim.bin, schedule.json)의 남은 출력.
+  for (const char *stale : {"pim.bin", "schedule.json", "phases.json"}) fs::remove(out / stale, ec);
+  for (const auto &entry : fs::directory_iterator(out, ec)) {
+    const std::string name = entry.path().filename().string();
+    if (entry.is_directory() && name.rfind("phase", 0) == 0 && name.size() > 5 &&
+        name.find_first_not_of("0123456789", 5) == std::string::npos)
+      fs::remove_all(entry.path(), ec);
+  }
   std::vector<std::string> names = readNames(!options.names.empty() ? fs::path(options.names)
                                              : !options.inputsDir.empty() ? fs::path(options.inputsDir) / "arguments.txt"
                                                                           : fs::path());
@@ -400,7 +411,7 @@ int main(int argc, char **argv) {
     ModuleOp m = *plan->npuPhases[size_t(p)];
     auto f = *m.getOps<func::FuncOp>().begin();
     fs::path dir = out / ("phase" + std::to_string(p));
-    fs::create_directories(dir, ec);
+    if (options.saveStages) fs::create_directories(dir, ec);
     for (unsigned i = 0; i < f.getNumArguments(); ++i) {
       auto id = f.getArgAttrOfType<IntegerAttr>(i, "npu.global").getInt();
       f.setArgAttr(i, "npu.address", integer(int64_t(globals[size_t(id)].address)));
@@ -466,7 +477,7 @@ int main(int argc, char **argv) {
           program.addProjection(gemv.name, gemv.n, gemv.k, activationsOf[size_t(g)], loads));
     }
   }
-  // 스케줄의 PIM 페이즈 범위(first, count)는 명령 단위다.
+  // PIM 페이즈 g 의 명령 범위(first, count). 명령 하나가 두 워드.
   std::vector<uint32_t> pimCommands;
   std::vector<std::pair<int64_t, int64_t>> pimPhases;
   for (int64_t g = 0; g < groups; ++g) {
@@ -495,6 +506,8 @@ int main(int argc, char **argv) {
   //===--------------------------------------------------------------------===//
   llvm::json::Array outputs;
   llvm::json::Array phaseInfo;
+  std::vector<::npu::Segment> segments;
+  int64_t l2Required = 0, cores = 1;
   for (int64_t p = 0; p < phases; ++p) {
     ModuleOp m = *plan->npuPhases[size_t(p)];
     fs::path dir = out / ("phase" + std::to_string(p));
@@ -503,7 +516,7 @@ int main(int argc, char **argv) {
       if (!runPass(m, ::npu::createLowerPass())) { std::cerr << "phase " << p << ": lowering failed\n"; return 1; }
       staging = uint64_t(m->getAttrOfType<IntegerAttr>("npu.l2_staging").getInt());
       stagingBytes = uint64_t(m->getAttrOfType<IntegerAttr>("npu.l2_staging_bytes").getInt());
-      if (auto metadata = m->getAttrOfType<StringAttr>("npu.metadata")) {
+      if (auto metadata = m->getAttrOfType<StringAttr>("npu.metadata"); metadata && options.saveStages) {
         std::ofstream file(dir / "metadata.json");
         file << metadata.getValue().str();
       }
@@ -561,56 +574,60 @@ int main(int argc, char **argv) {
     if (options.saveStages && !save(m, dir / "03-target.mlir")) return 1;
     if (!runPass(m, ::npu::createEncodePass())) { std::cerr << "phase " << p << ": encoding failed\n"; return 1; }
     auto encoded = *m.getOps<mlir::npu::ProgramOp>().begin();
-    // Word 3 of a Unified Program is its command count. The simulator keeps one
-    // completion event per command in a fixed table.
-    if (uint32_t(encoded.getWords()[3]) > kCompletionEventSlots) {
-      std::cerr << "phase " << p << " has " << uint32_t(encoded.getWords()[3]) << " commands; the simulator runs at most "
-                << kCompletionEventSlots << " per program (split NPU phases with --split-every)\n";
-      return 1;
-    }
-    {
-      std::ofstream binary(dir / "program.bin", std::ios::binary);
-      for (int32_t word : encoded.getWords()) {
-        uint32_t bits = uint32_t(word);
-        for (unsigned byte = 0; byte < 4; ++byte) binary.put(char(bits >> (8 * byte)));
-      }
-      std::ofstream manifest(dir / "system.json");
-      manifest << encoded.getManifest().str();
-      if (!binary || !manifest) return 1;
+    ::npu::Segment segment{"npu" + std::to_string(p), {}, {}};
+    for (int32_t word : encoded.getWords()) segment.program.push_back(uint32_t(word));
+    // 페이즈 매니페스트에서 L2 요구량과 코어 수만 가져온다.
+    auto manifest = llvm::json::parse(encoded.getManifest().str());
+    if (!manifest) { llvm::consumeError(manifest.takeError()); std::cerr << "phase " << p << ": bad manifest\n"; return 1; }
+    if (auto *o = manifest->getAsObject()) {
+      l2Required = std::max(l2Required, o->getInteger("l2_bytes_required").value_or(0));
+      if (auto *placement = o->getArray("logical_to_physical")) cores = std::max(cores, int64_t(placement->size()));
     }
     phaseInfo.push_back(llvm::json::Object{{"phase", p},
-                                           {"program", "phase" + std::to_string(p) + "/system.json"},
-                                           {"words", int64_t(encoded.getWords().size())},
+                                           {"name", segment.name},
+                                           {"records", int64_t(segment.program[3])},
                                            {"transfer_only", bool(empty[size_t(p)])}});
+    segments.push_back(std::move(segment));
+    if (int64_t g = p + 1 < phases ? plan->pimAfter[size_t(p)] : -1; g >= 0) {
+      auto [first, count] = pimPhases[size_t(g)];
+      segments.push_back({"pim" + std::to_string(g), {},
+                          std::vector<uint32_t>(pimCommands.begin() + 2 * first,
+                                                pimCommands.begin() + 2 * (first + count))});
+    }
   }
   timed("lower+encode");
 
-  // PIM 명령과 호스트 스케줄.
-  llvm::json::Array schedulePhases;
-  for (int64_t p = 0; p < phases; ++p) {
-    schedulePhases.push_back(llvm::json::Object{{"npu", llvm::json::Object{
-        {"name", "npu" + std::to_string(p)}, {"program", "phase" + std::to_string(p) + "/system.json"}}}});
-    if (int64_t g = p + 1 < phases ? plan->pimAfter[size_t(p)] : -1; g >= 0)
-      schedulePhases.push_back(llvm::json::Object{{"pim", llvm::json::Object{
-          {"name", "pim" + std::to_string(g)}, {"first", pimPhases[size_t(g)].first},
-          {"count", pimPhases[size_t(g)].second}}}});
-  }
-  llvm::json::Object schedule{{"schema", "plena.v2.host_schedule.v1"}, {"phases", std::move(schedulePhases)}};
-  if (groups) {
-    std::ofstream file(out / "pim.bin", std::ios::binary);
-    std::vector<uint32_t> words{::npu::isa2::kPimCommandMagic, uint32_t(pimCommandCount)};
-    words.insert(words.end(), pimCommands.begin(), pimCommands.end());
+  // 페이즈들을 프로그램 하나로.
+  auto linked = ::npu::linkProgram(segments);
+  if (!linked) { std::cerr << "program.bin: " << linked.error << '\n'; return 1; }
+  const auto &words = linked.value.words;
+  {
+    std::ofstream binary(out / "program.bin", std::ios::binary);
     for (uint32_t word : words)   // little-endian
-      for (unsigned byte = 0; byte < 4; ++byte) file.put(char(word >> (8 * byte)));
-    if (!file) return 1;
-    schedule["pim"] = llvm::json::Object{
-        {"program", "pim.bin"},
-        {"kernel", llvm::json::Object{{"channel", 0}, {"rank", 0}, {"row", program.kernelRow},
-                                      {"start_column", 0}, {"bank_set", 1}, {"weight_bits", 8},
-                                      {"activation_bits", 8}, {"scale_bits", 0},
-                                      {"input_register_count", 8}, {"output_register_count", 8}}}};
+      for (unsigned byte = 0; byte < 4; ++byte) binary.put(char(word >> (8 * byte)));
+    if (!binary) return 1;
   }
-  if (!writeJSON(out / "schedule.json", std::move(schedule))) return 1;
+  llvm::json::Array symbols, placement;
+  for (auto [id, name] : llvm::enumerate(linked.value.symbols))
+    symbols.push_back(llvm::json::Object{{"id", int64_t(id)}, {"name", name}});
+  for (int64_t c = 0; c < cores; ++c) placement.push_back(c);
+  llvm::json::Object system{{"schema", ::npu::kProgramSchema},
+                            {"program", "program.bin"},
+                            {"scheduling_policy", "compiler_static"},
+                            {"logical_to_physical", std::move(placement)},
+                            {"program_word_count", int64_t(words[2])},
+                            {"command_count", int64_t(words[3])},
+                            {"core_instruction_count", int64_t(words[4])},
+                            {"command_symbols", std::move(symbols)},
+                            {"l2_bytes_required", l2Required},
+                            {"l2_regions", llvm::json::Array{llvm::json::Object{
+                                {"name", "l2"}, {"offset", 0}, {"size", l2Required}, {"alignment", 64}}}}};
+  if (groups)
+    system["pim_kernel"] = llvm::json::Object{{"channel", 0}, {"rank", 0}, {"row", program.kernelRow},
+                                              {"start_column", 0}, {"bank_set", 1}, {"weight_bits", 8},
+                                              {"activation_bits", 8}, {"scale_bits", 0},
+                                              {"input_register_count", 8}, {"output_register_count", 8}};
+  if (!writeJSON(out / "system.json", std::move(system))) return 1;
 
   llvm::json::Array globalInfo, pimInfo;
   for (auto [id, g] : llvm::enumerate(globals)) {
@@ -745,6 +762,6 @@ int main(int argc, char **argv) {
     timed("image");
   }
   std::cout << "wrote hybrid package to " << out << ": " << phases << " NPU phases, " << groups
-            << " PIM phases, " << pimCommandCount << " PIM commands\n";
+            << " PIM phases, " << pimCommandCount << " PIM commands, " << words[3] << " records\n";
   return 0;
 }

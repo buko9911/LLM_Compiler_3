@@ -2,7 +2,7 @@
 
 2026-09-29. Qwen3 디코드 스텝을 W8A8로 양자화하고, 가중치 GEMV 묶음마다 NPU와
 LPDDR6-PIM 중 어디서 돌릴지 비용 모델로 정해, 두 장치가 한 LP6 메모리를 나눠 쓰는
-호스트 스케줄로 컴파일한다. NPU 쪽은 `npu-compile`과 같은 tile / place / lower / encode를
+program 하나(`program.bin`)로 컴파일한다. NPU 쪽은 `npu-compile`과 같은 tile / place / lower / encode를
 그대로 쓰고, PIM 쪽은 PIM_GEMV 명령을 낸다. NPU 프로그램은 PLENA ISA ver 2.0이다(7절).
 
 ## 1. 전체 흐름
@@ -19,13 +19,15 @@ PyTorch decode step (examples/qwen3: KV 창을 제자리에 쓰는 decode, FP16)
   │ ⑤ NPU 페이즈마다        tile → place (고정 주소 존중)
   │ ⑥ PIM 배치              PimLayout: 타일 id, 패킷 주소, 한 페이즈 = 한 rank
   │ ⑦ NPU 페이즈마다        lower → 경계 전송(GDMA) 붙이기 → encode (ISA ver 2.0)
-  │ ⑧ pim.bin(PIM_GEMV), schedule.json, lp6.bin(sparse, PIM 가중치 패킷 포함), metadata.json
+  │ ⑧ linkProgram          NPU 페이즈 레코드 + PIM 레코드(PIM_GEMV)를 program.bin 하나로
+  │ ⑨ program.bin, system.json(pim_kernel), lp6.bin(sparse, PIM 가중치 패킷 포함), metadata.json
   ▼
-IESLAB_NPU_Simulator --schedule  (NPU 페이즈와 PIM 페이즈를 차례로, LP6 하나를 공유)
+IESLAB_NPU_Simulator --system-program system.json  (페이즈는 레코드 의존성으로 차례로, LP6 하나를 공유)
 ```
 
-스케줄은 `NPU 0 | PIM 0 | NPU 1 | PIM 1 | ... | PIM G-1 | NPU G` 이다. `--split-every N`을
-주면 NPU에 남는 묶음에서도 페이즈를 자른다(시뮬레이터 프로그램 하나는 명령 65,536개까지).
+페이즈 순서는 `NPU 0 | PIM 0 | NPU 1 | PIM 1 | ... | PIM G-1 | NPU G` 이다. `--split-every N`을
+주면 NPU에 남는 묶음에서도 페이즈를 자른다. 의존성 거리는 65,535 레코드까지라 NPU 페이즈 하나가
+그보다 길면 잘라야 한다(7절).
 
 ## 2. W8A8 계약 (`--quantize=w8a8`, lib/Transforms/Quantize.cpp)
 
@@ -101,9 +103,10 @@ hybrid-compiler의 PimLayout을 옮겼다. lp6-pim-main 런타임 lowering과 �
   가중치를 덜 가진 rank 하나에서.
 - 타일 id는 종류별로 조밀하고, 런타임이 커널 행부터 가중치 행 → 활성값 행 → 출력 행 순으로 놓는다.
 - 주소: rarobacobgch (rank, row, bank, column, bank group, subchannel; 32 B 위).
-- 명령: (토큰, 스트림)마다 PIM_GEMV 1개(2 워드; `pim.bin` = "PIMC", 명령 수, 명령들). lp6-pim-main이
+- 명령: (토큰, 스트림)마다 PIM_GEMV 1개(2 워드). lp6-pim-main이
   CLEAR×16, 스윕마다 LOAD_ACT×32 + GEMV_STREAM, STORE×8로 펼친다(예전 레코드 열과 같다).
-  `schedule.json`의 PIM 페이즈 범위(first, count)는 명령 단위다.
+- PIM 페이즈 하나 = program.bin 안의 PIM 레코드 하나(그 페이즈의 PIM_GEMV 전부). 커널 위치(kernel row 등)는
+  system.json `pim_kernel`.
 
 ## 7. ISA ver 2.0 (lib/Target/IsaV2.cpp, lib/Target/Program.cpp)
 
@@ -116,7 +119,7 @@ ver 1.0 인코딩의 builder stream을 만들고, encode가 ver 2.0으로 바꾼
 | GDMA | 96비트 레코드(+2-D 확장 2워드). 행이 1 MiB 이상인 연속 전송(NPU 단독 down 패널 1,245,184 B)은 64 B 배수의 같은 행 여러 개로 — 시뮬레이터가 같은 LP6 블록을 같은 순서로 요청한다. strided면 열 조각 레코드 여러 개 |
 | 의존성 | 16비트 backward 거리, 레코드당 255개까지. 넘으면 `BARRIER`가 묶는다 |
 | `CORE_BEGIN` | 2워드(논리 코어, L1/8, 코어 워드 수, 의존성 수). `CORE_END`와 L1 span은 없다 |
-| PIM | `pim.bin` = PIM_GEMV 명령(6절) |
+| PIM | PIM 레코드(`0x27`): 대기 목록 + PIM_GEMV 명령(6절) |
 
 층 0 검사: ver 1.0 program과 레코드 단위로 비교해 core body가 `isa_v2.py` lowering과 같고, GDMA가
 같은 바이트를 옮기고, 의존성 집합이 같다. 시뮬레이터의 L2 dump와 코어 4개 L1 dump 전체가 ver 1.0
@@ -153,6 +156,36 @@ ver 1.0 인코딩의 builder stream을 만들고, encode가 ver 2.0으로 바꾼
   - 같은 일을 하는 PIM 페이즈도 한 실행 안에서 시작 시점에 따라 최대 13% 다르다(gate/up 518,746 ~ 585,537 사이클).
   - 그래서 NPU 페이즈 시간이 바뀌면 PIM 합도 움직인다.
 
+### 한 program (09-30)
+
+예전에는 NPU 페이즈마다 `phase<i>/program.bin`, PIM 명령은 `pim.bin`("PIMC"), 순서는 `schedule.json`(시뮬레이터
+host runtime)이었다. 지금은 디코드 한 스텝이 `program.bin` 하나다(`linkProgram`, lib/Target/Program.cpp).
+
+- NPU 페이즈: 페이즈마다 따로 schedule/encode한 레코드를 순서·상대 의존성 그대로 잇는다. 페이즈 안에서
+  기다릴 것이 없는 레코드는 앞 페이즈의 끝을 기다린다.
+- NPU 페이즈 끝: 페이즈 안에서 누구도 기다리지 않는 레코드들을 `BARRIER` 하나로 모은다(255개 넘으면 겹쳐 모음).
+- PIM 페이즈: PIM 레코드 하나. 앞 페이즈의 끝을 기다린다.
+- 레코드 이름(system.json `command_symbols`): `npu<i>.<core_block|gdma|barrier>_<순번>`, PIM 레코드는 `pim<g>`.
+- 시간: 시뮬레이터 `--command-report commands.json`의 레코드별 end cycle. 페이즈 시간 = 마지막 end − 앞 페이즈 끝
+  (`examples/qwen3/host.py` `phase_report`).
+- 시뮬레이터 event slot은 65,536개 ring이라 program 길이 제한이 없다. 예전 "program 하나 65,536 명령" 검사는 없앴다.
+
+| Qwen3-4B 층 0, M=1 | 페이즈별 program + `pim.bin` | program 하나 |
+|---|---:|---:|
+| NPU+PIM | 1,399,308 사이클 (1.749 ms) | 1,399,346 사이클 (1.749 ms) |
+| NPU 단독 (`npu-compile`) | 4,793,223 사이클 | 4,793,223 사이클 |
+| 출력 | | 하이브리드 L2 dump 전체가 예전과 바이트 동일, 출력 3개 = NPU 단독 |
+
+| Qwen3-4B 36층 + lm_head, M=1 | 페이즈별 program + `pim.bin` | program 하나 |
+|---|---:|---:|
+| NPU+PIM | 70.520 ms (NPU 12.97 + PIM 57.55) | 70.039 ms (NPU 12.92 + PIM 57.12) |
+| NPU 단독 (`--split-every 4`, 페이즈 37개) | 234.259 ms | 234.402 ms |
+| program | NPU 146개 + `pim.bin` | 2.98 MB, 레코드 43,901개 (PIM 레코드 145개) |
+| NPU 단독 program | 37개 | 6.26 MB, 레코드 80,415개 (예전 한 program 한도 65,536 넘음) |
+
+- 출력 73개가 하이브리드 = NPU 단독이고, 둘 다 예전 실행과 바이트 동일하다. 다음 토큰 " Paris".
+- 시간 차(−0.7%, +0.06%)는 페이즈 경계가 host 전환에서 BARRIER·PIM 레코드 대기로 바뀐 몫으로 추정한다.
+
 ## 8. 사용법
 
 ```bash
@@ -177,8 +210,8 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 ```
 
 시뮬레이터 실행(드라이버 스크립트가 하는 것):
-`LP6_DRAMSIM3_ROOT=lp6-pim-main transactional_emulator --settings <num_cores=4> --schedule schedule.json
---schedule-report phases.json --lp6-image lp6.bin --lp6-size 16GiB`
+`LP6_DRAMSIM3_ROOT=lp6-pim-main transactional_emulator --settings <num_cores=4> --system-program system.json
+--command-report commands.json --lp6-image lp6.bin --lp6-size 16GiB`
 
 ## 9. 검증
 
@@ -222,6 +255,25 @@ logits와 새 K/V 72개, 출력 73개가 전부 바이트 단위로 같고, 다�
 | f228302 | PIM 활성값 scatter를 256 B 열 블록 단위로 | 0.413 ms |
 | b974936 | 텐서 전체인 L2 패널을 DRAM 대신 바로 읽음 | 0.383 ms |
 | 79b3704 | 열이 안 나뉘면 행 타일을 코어에 나눔, 패널당 고정 비용을 타일 비용 모델에 | 0.355 ms |
+
+### M별 비교 (09-30, ISA ver 2.0, program 하나, `--policy pim`)
+
+Qwen3-4B 층 0 하나(lm_head 없음), P + M = 256, 4 코어, PIM 한 rank. NPU+PIM은 GEMV 묶음 4개를 모두 PIM에,
+NPU 단독은 `npu-compile --quantize=w8a8`. 모든 M에서 출력 3개(x, new_k, new_v)가 두 쪽 바이트 동일.
+
+| M | NPU+PIM (NPU + PIM) | NPU 단독 | 비 |
+|---:|---:|---:|---|
+| 1 | 1.749 ms (0.345 + 1.405) | 5.992 ms | 3.43배 빠름 |
+| 2 | 3.389 ms (0.582 + 2.807) | 7.017 ms | 2.07배 빠름 |
+| 4 | 6.592 ms (0.974 + 5.618) | 7.288 ms | 1.11배 빠름 |
+| 8 | 13.029 ms (1.810 + 11.219) | 8.244 ms | 1.58배 느림 |
+| 16 | 26.401 ms (3.625 + 22.776) | 10.044 ms | 2.63배 느림 |
+
+- PIM 시간은 토큰마다 약 1.40 ms로 M에 비례한다(PIM_GEMV가 토큰마다 가중치를 다시 읽는다).
+- NPU 단독은 가중치를 한 번 읽어 M개 토큰이 나눠 쓴다. M 1 → 16에서 1.68배.
+- 교차점: M = 4와 8 사이 직선 보간으로 약 4.5.
+- M ≥ 8은 프롬프트가 M보다 길어야 해서 다른 프롬프트로 돌렸다. M = 4를 두 프롬프트로 돌린 사이클이 같다
+  (정적 모양이라 시간은 데이터와 무관).
 
 ## 11. 한계와 다음 일
 

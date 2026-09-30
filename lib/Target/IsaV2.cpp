@@ -13,7 +13,7 @@ constexpr uint32_t C_LI = 0x20, C_SET = 0x21, C_ADDI = 0x22, C_LOOP_BEGIN = 0x23
                    S_LD = 0x35, S_ST = 0x36, M_LD = 0x37, LDMA_R = 0x38, LDMA_I = 0x39, M_LD_ACC = 0x3a,
                    M_MMA = 0x3b, M_WB = 0x3c, C_SYNC = 0x3f;
 // System records.
-constexpr uint32_t CORE_BEGIN = 0x26, GDMA_LOAD = 0x2b, GDMA_STORE = 0x2c, BARRIER = 0x2d;
+constexpr uint32_t CORE_BEGIN = 0x26, PIM = 0x27, GDMA_LOAD = 0x2b, GDMA_STORE = 0x2c, BARRIER = 0x2d;
 constexpr uint32_t F16 = 0, F32 = 1, I8 = 2, I32 = 3;
 constexpr int SET_ROWS = 0, SET_SRC = 1, SET_DST = 2, SET_VL = 3, SET_BYTES = 4, kSets = 5;
 constexpr uint32_t SYNC_EVENT = 4, kMaxEvent = 15, kImm22 = 1u << 22, kWbStrideExtended = 1023;
@@ -463,6 +463,14 @@ std::vector<uint32_t> coreBeginRecord(uint32_t ordinal, const std::vector<uint32
 std::vector<uint32_t> barrierRecord(uint32_t ordinal, const std::vector<uint32_t> &deps) {
   std::vector<uint32_t> words{BARRIER | field(deps.size(), 8) << 6};
   for (uint32_t d : dependencyWords(ordinal, deps)) words.push_back(d);
+  return words;
+}
+
+std::vector<uint32_t> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps, const uint32_t *commands,
+                                uint32_t count) {
+  std::vector<uint32_t> words{PIM | field(deps.size(), 8) << 6 | field(count, 18) << 14};
+  for (uint32_t d : dependencyWords(ordinal, deps)) words.push_back(d);
+  words.insert(words.end(), commands, commands + 2 * size_t(count));
   return words;
 }
 
