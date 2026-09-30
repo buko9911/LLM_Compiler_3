@@ -30,6 +30,10 @@ LP6 = Path("/home/jongjip/LP6")
 EMULATOR = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
 SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
 BACKEND = LP6 / "lp6-pim-main"
+# PIM layouts target one LPDDR6 channel (two subchannels x two ranks); the simulator's default
+# LP6 is four channels. NPU-only and NPU + PIM both run on the one-channel LP6 so they compare
+# on the same memory.
+LP6_CONFIG = BACKEND / "configs/LPDDR6_PIM_Mobile_2CH.ini"
 NPU_HZ = 800e6
 DTYPES = {"float16": "<f2", "float32": "<f4", "int8": "i1", "int32": "<i4"}
 
@@ -110,8 +114,8 @@ def simulator_settings(hardware: Path, out: Path, settings: Path = SETTINGS) -> 
 
 def _simulate(package: Path, args: list[str], timeout: int) -> str:
     env = dict(os.environ, LP6_DRAMSIM3_ROOT=str(BACKEND))
-    done = subprocess.run([str(EMULATOR)] + args, cwd=package, capture_output=True, text=True,
-                          timeout=timeout, env=env)
+    done = subprocess.run([str(EMULATOR), "--lp6-config", str(LP6_CONFIG)] + args, cwd=package,
+                          capture_output=True, text=True, timeout=timeout, env=env)
     log = re.sub(r"\x1b\[[0-9;]*m", "", done.stdout + done.stderr)
     (package / "simulator.log").write_text(log)
     if done.returncode:

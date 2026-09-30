@@ -17,14 +17,15 @@ import numpy as np
 
 
 def run(package: Path, emulator: Path, settings: Path, timeout: int = 900,
-        log_level: str = "warn") -> str:
+        log_level: str = "warn", extra: tuple[str, ...] = ()) -> str:
     """Execute package/system.json with package/hbm.bin; return the simulator log.
 
     ``log_level="info"`` makes the simulator print its summary (total_cycles=...).
+    ``extra`` are more simulator arguments (e.g. ``--lp6-config``).
     """
     completed = subprocess.run([str(emulator), "--system-program", "system.json",
                                 "--lp6-image", "hbm.bin", "--settings", str(settings),
-                                "--log-level", log_level],
+                                "--log-level", log_level, *extra],
                                cwd=package, capture_output=True, text=True, timeout=timeout)
     log = completed.stdout + completed.stderr
     (package / "simulator.log").write_text(log)

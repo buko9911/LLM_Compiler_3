@@ -274,6 +274,11 @@ NPU 단독은 `npu-compile --quantize=w8a8`. 모든 M에서 출력 3개(x, new_k
 - 교차점: M = 4와 8 사이 직선 보간으로 약 4.5.
 - M ≥ 8은 프롬프트가 M보다 길어야 해서 다른 프롬프트로 돌렸다. M = 4를 두 프롬프트로 돌린 사이클이 같다
   (정적 모양이라 시간은 데이터와 무관).
+- 위 표는 시뮬레이터 기본 NPU 설정이 GDMA 동시 요청 32개였을 때 값이다(NPU 단독이 약 18 GB/s로 약했다).
+  09-30 기본 설정(GDMA 동시 256, NoC 64 B/cycle, L2 slice 16; LP6는 PIM 때문에 `--lp6-config`로 1 channel)에서
+  층 0, M=1: NPU 단독 5.022 ms, NPU+PIM 1.682 ms (NPU 0.277 + PIM 1.405) → 2.99배, 출력 3개 예전과 바이트 동일.
+- `examples/qwen3/host.py`는 모든 실행을 1 channel LP6(`LPDDR6_PIM_Mobile_2CH.ini`)로 돌린다. PIM 배치가 1 channel
+  기준이고, NPU 단독과 NPU+PIM이 같은 메모리에서 비교되게 하기 위해서다.
 
 ## 11. 한계와 다음 일
 
