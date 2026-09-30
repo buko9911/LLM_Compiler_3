@@ -99,8 +99,9 @@ encode의 DRAM/L2 frontier가 RAW/WAR/WAW로 잡는다.
 hybrid-compiler의 PimLayout을 옮겼다. lp6-pim-main 런타임 lowering과 같은 규칙이다.
 
 - GEMV_STREAM 하나 = 출력 512행(PU 8 × 누산기 16 × 레인 4) × 입력 256(스윕), K가 길면 스윕 여러 번.
-- 파티션 p = 서브채널 p % 2, rank p / 2. 스트림은 부하가 적은 파티션으로, 한 페이즈는
-  가중치를 덜 가진 rank 하나에서.
+- 파티션 p = 서브채널 p % C, rank p / C (C = LP6 서브채널 수 `pim.channels`: `configs/hybrid.json` 8 = LPDDR6
+  channel 4개, `configs/hybrid_1ch.json` 2). 스트림은 부하가 적은 파티션으로, 한 페이즈는 가중치를 덜 가진 rank 하나의
+  서브채널 전부에서. PIM_GEMV partition 필드는 4 bit(W0 [5:2]), system.json `pim_kernel.subchannels` = C.
 - 타일 id는 종류별로 조밀하고, 런타임이 커널 행부터 가중치 행 → 활성값 행 → 출력 행 순으로 놓는다.
 - 주소: rarobacobgch (rank, row, bank, column, bank group, subchannel; 32 B 위).
 - 명령: (토큰, 스트림)마다 PIM_GEMV 1개(2 워드). lp6-pim-main이
@@ -277,8 +278,10 @@ NPU 단독은 `npu-compile --quantize=w8a8`. 모든 M에서 출력 3개(x, new_k
 - 위 표는 시뮬레이터 기본 NPU 설정이 GDMA 동시 요청 32개였을 때 값이다(NPU 단독이 약 18 GB/s로 약했다).
   09-30 기본 설정(GDMA 동시 256, NoC 64 B/cycle, L2 slice 16; LP6는 PIM 때문에 `--lp6-config`로 1 channel)에서
   층 0, M=1: NPU 단독 5.022 ms, NPU+PIM 1.682 ms (NPU 0.277 + PIM 1.405) → 2.99배, 출력 3개 예전과 바이트 동일.
-- `examples/qwen3/host.py`는 모든 실행을 1 channel LP6(`LPDDR6_PIM_Mobile_2CH.ini`)로 돌린다. PIM 배치가 1 channel
-  기준이고, NPU 단독과 NPU+PIM이 같은 메모리에서 비교되게 하기 위해서다.
+- `examples/qwen3/host.py`는 하이브리드 패키지의 `pim_kernel.subchannels`에 맞는 LP6 설정(8 → 4 channel, 2 → 1 channel)을
+  고르고, NPU 단독도 같은 설정으로 돌린다(같은 메모리 비교).
+- 10-01, LP6 4 channel(서브채널 8개, PIM rank 하나씩): 층 0, M=1 NPU 단독 3.033 ms, NPU+PIM 0.631 ms (NPU 0.211 +
+  PIM 0.420) → 4.80배, 출력 3개가 1 channel 실행과 바이트 동일.
 
 ## 11. 한계와 다음 일
 

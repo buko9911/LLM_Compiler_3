@@ -30,10 +30,10 @@ LP6 = Path("/home/jongjip/LP6")
 EMULATOR = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
 SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
 BACKEND = LP6 / "lp6-pim-main"
-# PIM layouts target one LPDDR6 channel (two subchannels x two ranks); the simulator's default
-# LP6 is four channels. NPU-only and NPU + PIM both run on the one-channel LP6 so they compare
-# on the same memory.
-LP6_CONFIG = BACKEND / "configs/LPDDR6_PIM_Mobile_2CH.ini"
+# LP6 configuration per subchannel count of a package's PIM layout (npu-hybrid pim.channels):
+# four LPDDR6 channels (the simulator's default) or one. The NPU-only run of a comparison uses
+# the hybrid package's so both sides share one memory system.
+LP6_CONFIGS = {8: BACKEND / "configs/LPDDR6_PIM_Mobile_4CH.ini", 2: BACKEND / "configs/LPDDR6_PIM_Mobile_2CH.ini"}
 NPU_HZ = 800e6
 DTYPES = {"float16": "<f2", "float32": "<f4", "int8": "i1", "int32": "<i4"}
 
@@ -112,9 +112,15 @@ def simulator_settings(hardware: Path, out: Path, settings: Path = SETTINGS) -> 
     return path
 
 
-def _simulate(package: Path, args: list[str], timeout: int) -> str:
+def subchannels_of(package: Path) -> int:
+    """LP6 subchannels a package's PIM layout targets; 8 (the default LP6) without PIM."""
+    kernel = json.loads((package / "system.json").read_text()).get("pim_kernel")
+    return int(kernel.get("subchannels", 2)) if kernel else 8
+
+
+def _simulate(package: Path, args: list[str], timeout: int, subchannels: int) -> str:
     env = dict(os.environ, LP6_DRAMSIM3_ROOT=str(BACKEND))
-    done = subprocess.run([str(EMULATOR), "--lp6-config", str(LP6_CONFIG)] + args, cwd=package,
+    done = subprocess.run([str(EMULATOR), "--lp6-config", str(LP6_CONFIGS[subchannels])] + args, cwd=package,
                           capture_output=True, text=True, timeout=timeout, env=env)
     log = re.sub(r"\x1b\[[0-9;]*m", "", done.stdout + done.stderr)
     (package / "simulator.log").write_text(log)
@@ -135,10 +141,10 @@ def _read_l2(package: Path, outputs: list[dict]) -> list[np.ndarray]:
     return result
 
 
-def run_npu(package: Path, settings: Path, timeout: int = 14400):
+def run_npu(package: Path, settings: Path, timeout: int = 14400, subchannels: int = 8):
     """One npu-compile package (compiled with --readback): outputs and total cycles."""
     log = _simulate(package, ["--system-program", "system.json", "--lp6-image", "hbm.bin",
-                              "--settings", str(settings), "--log-level", "info"], timeout)
+                              "--settings", str(settings), "--log-level", "info"], timeout, subchannels)
     meta = json.loads((package / "metadata.json").read_text())
     outputs = [dict(o, bytes=o["rows"] * o["cols"] * (4 if o["dtype"] in ("float32", "int32") else
                                                       1 if o["dtype"] == "int8" else 2),
@@ -147,11 +153,12 @@ def run_npu(package: Path, settings: Path, timeout: int = 14400):
     return _read_l2(package, outputs), int(cycles.group(1)) if cycles else None
 
 
-def run_hybrid(package: Path, settings: Path, timeout: int = 14400):
+def run_hybrid(package: Path, settings: Path, timeout: int = 14400, subchannels: int | None = None):
     """One npu-hybrid package: outputs and the per-phase report (phase_report)."""
     _simulate(package, ["--settings", str(settings), "--system-program", "system.json",
                         "--command-report", "commands.json", "--lp6-image", "lp6.bin",
-                        "--lp6-size", "16GiB", "--log-level", "info"], timeout)
+                        "--lp6-size", "16GiB", "--log-level", "info"], timeout,
+              subchannels or subchannels_of(package))
     meta = json.loads((package / "metadata.json").read_text())
     report = phase_report(json.loads((package / "commands.json").read_text()))
     (package / "phases.json").write_text(json.dumps(report, indent=1) + "\n")

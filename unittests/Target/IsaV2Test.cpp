@@ -81,10 +81,13 @@ TEST(IsaV2, PimRecordCarriesItsCommands) {
 TEST(IsaV2, PimGemvFields) {
   auto command = npu::isa2::pimGemv(1, 10, 1024, 320, 16);
   ASSERT_TRUE(bool(command)) << command.error;
-  EXPECT_EQ(command.value.first, 1u << 4 | 9u << 6 | 2u << 14);
+  EXPECT_EQ(command.value.first, 1u << 2 | 9u << 6 | 2u << 14);
   EXPECT_EQ(command.value.second, 10u | 2u << 16);
+  auto last = npu::isa2::pimGemv(15, 1, 0, 0, 0);            // subchannel 7 of rank 1 on four channels
+  ASSERT_TRUE(bool(last));
+  EXPECT_EQ(last.value.first, 15u << 2);
   EXPECT_FALSE(bool(npu::isa2::pimGemv(0, 1, 100, 0, 0)));   // weight tile not a multiple of 512
-  EXPECT_FALSE(bool(npu::isa2::pimGemv(4, 1, 0, 0, 0)));     // partition
+  EXPECT_FALSE(bool(npu::isa2::pimGemv(16, 1, 0, 0, 0)));    // partition
   EXPECT_FALSE(bool(npu::isa2::pimGemv(0, 257, 0, 0, 0)));   // sweeps
 }
 } // namespace

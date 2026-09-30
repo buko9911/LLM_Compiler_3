@@ -22,7 +22,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import numpy as np
-from host import NPU_HZ, compare, phase_summary, prepare, reuse, run_hybrid, run_npu, simulator_settings
+from host import NPU_HZ, compare, phase_summary, prepare, reuse, run_hybrid, run_npu, simulator_settings, subchannels_of
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--capture", type=Path, required=True, help="output directory of capture.py")
@@ -64,9 +64,12 @@ for m in a.map:
     command += ["--map", m]
 subprocess.run(command, check=True)
 
+# Both runs use the LP6 the hybrid package's PIM layout targets (same memory system).
+subchannels = subchannels_of(hybrid_package)
 with ThreadPoolExecutor(2) as pool:
-    hybrid_job = pool.submit(run_hybrid, hybrid_package, settings)
-    npu_job = None if a.skip_npu else pool.submit(run_hybrid if a.split_every else run_npu, npu_package, settings)
+    hybrid_job = pool.submit(run_hybrid, hybrid_package, settings, subchannels=subchannels)
+    npu_job = None if a.skip_npu else pool.submit(run_hybrid if a.split_every else run_npu, npu_package, settings,
+                                                  subchannels=subchannels)
     hybrid_outputs, report = hybrid_job.result()
     npu_outputs, npu_cycles = npu_job.result() if npu_job else (None, None)
     if a.split_every and npu_job:

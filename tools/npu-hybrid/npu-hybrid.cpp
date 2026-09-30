@@ -142,20 +142,22 @@ void emitDma(OpBuilder &b, Location loc, const Dma &d) {
 // The INT8 activation [M, K] of a PIM group into the activation rows.
 //
 // Under rarobacobgch the column is above the bank group and the subchannel, so
-// one column of one bank is a 256 B block: 4 bank groups x 2 subchannels x 32 B.
-// The even PUs 0,2,4,6 sit in bank 0 of bank groups 0..3 and the odd PUs in
-// bank 2, and every PU reads the same packet from its own bank. So packet i,
-// copied 8 times into a 256 B block, is what column i of bank 0 and of bank 2
-// hold in every rank the group computes on. Eight GDMA loads build those blocks
-// in L2 (the packet 32 B apart in DRAM, 256 B apart in L2), and then one store
-// per bank and DRAM row writes n whole columns as 256 n contiguous bytes. The
-// slots of a subchannel the group does not use belong to this activation too
-// (its tile id owns that column in every partition), so writing them is free.
+// one column of one bank is a block of 4 bank groups x C subchannels x 32 B
+// (colBytes: 1 KiB for four LPDDR6 channels, 256 B for one). The even PUs
+// 0,2,4,6 sit in bank 0 of bank groups 0..3 and the odd PUs in bank 2, and
+// every PU reads the same packet from its own bank. So packet i, copied 4 C
+// times into a block, is what column i of bank 0 and of bank 2 hold in every
+// rank the group computes on. 4 C GDMA loads build those blocks in L2 (the
+// packet 32 B apart in DRAM, one block apart in L2), and then one store per bank
+// and DRAM row writes n whole columns as n contiguous blocks. The slots of a
+// subchannel the group does not use belong to this activation too (its tile id
+// owns that column in every partition), so writing them is free.
 std::vector<Dma> scatter(const pim::Program &program, const ::npu::PimGroup &group,
                          const std::vector<int64_t> &activations, const ::npu::HybridGlobal &input,
                          uint64_t staging, uint64_t stagingBytes, std::string &error) {
   std::vector<Dma> out;
-  const int64_t block = pim::kColBytes, perChunk = int64_t(stagingBytes) / block;
+  const int64_t block = program.colBytes(), perChunk = int64_t(stagingBytes) / block;
+  const int slots = 4 * program.channels;
   if (!perChunk) {
     error = "L2 staging window smaller than one column block";
     return out;
@@ -167,14 +169,14 @@ std::vector<Dma> scatter(const pim::Program &program, const ::npu::PimGroup &gro
     for (int64_t chunk = 0; chunk < a.packets(); chunk += perChunk) {
       const int64_t count = std::min(perChunk, a.packets() - chunk);
       const uint64_t source = input.address + uint64_t(m * group.k + chunk * 32);
-      for (int slot = 0; slot < 8; ++slot)   // bank group slot / 2, subchannel slot % 2
+      for (int slot = 0; slot < slots; ++slot)   // bank group slot / C, subchannel slot % C
         out.push_back({true, source, staging + uint64_t(slot) * 32, 32, uint64_t(count), 32, uint64_t(block)});
       for (int rank : ranks)
         for (int parity = 0; parity < 2; ++parity)   // PU 0 -> bank 0 of group 0, PU 1 -> bank 2 of group 0
           for (int64_t first = chunk; first < chunk + count;) {
             int64_t packet = a.packetBase() + first;
             int64_t n = std::min(chunk + count - first, pim::kPacketsPerRow - packet % pim::kPacketsPerRow);
-            out.push_back({false, program.activationPacketAddress(a, first, parity, rank * pim::kChannels),
+            out.push_back({false, program.activationPacketAddress(a, first, parity, rank * program.channels),
                            staging + uint64_t((first - chunk) * block), uint64_t(n * block)});
             first += n;
           }
@@ -208,7 +210,7 @@ std::vector<Dma> gather(const pim::Program &program, const pim::Projection &p, c
           int64_t n = std::min({last - t, pim::kPacketsPerRow - packet % pim::kPacketsPerRow, partitionEnd(t) - t});
           out.push_back({true, program.outputTileAddress(p, tile, pu),
                          staging + uint64_t((pu * rows + t * 8 - c0) * 4), 32, uint64_t(n),
-                         uint64_t(pim::kColBytes), 32});
+                         uint64_t(program.colBytes()), 32});
           t += n;
         }
       }
@@ -449,9 +451,14 @@ int main(int argc, char **argv) {
   // PIM: 타일 배치와 PIM_GEMV 명령
   //===--------------------------------------------------------------------===//
   pim::Program program;
+  program.channels = model.value.pimChannels;
   program.partitions = model.value.pimPartitions;
+  if (program.channels < 1 || program.partitions < 1 || program.partitions > program.channels * pim::kRanks) {
+    std::cerr << "pim.partitions must be 1 .. pim.channels x " << pim::kRanks << '\n';
+    return 1;
+  }
   program.nextWeight.assign(size_t(program.partitions), 0);
-  program.kernelRow = int64_t(alignUp(dramEnd, uint64_t(pim::kRowBytes)) / uint64_t(pim::kRowBytes)) + 1;
+  program.kernelRow = int64_t(alignUp(dramEnd, uint64_t(program.rowBytes())) / uint64_t(program.rowBytes())) + 1;
   std::vector<std::vector<int64_t>> activationsOf, projectionsOf;
   activationsOf.resize(static_cast<size_t>(groups));
   projectionsOf.resize(static_cast<size_t>(groups));
@@ -461,7 +468,7 @@ int main(int argc, char **argv) {
     if (group.k % pim::kKPerSweep) { std::cerr << "PIM group " << g << ": K % 256 != 0\n"; return 1; }
     for (int64_t m = 0; m < group.tokens; ++m) activationsOf[size_t(g)].push_back(program.addActivation(group.k));
     std::map<int, int64_t> loads;
-    if (!model.value.pimConcurrentRanks && program.partitions > pim::kChannels) {
+    if (!model.value.pimConcurrentRanks && program.partitions > program.channels) {
       // 한 페이즈는 한 rank 의 두 서브채널에서 돈다. 가중치를 덜 가진 rank 로.
       int rank = 0;
       for (int r = 1; r <= program.partRank(program.partitions - 1); ++r)
@@ -626,7 +633,8 @@ int main(int argc, char **argv) {
     system["pim_kernel"] = llvm::json::Object{{"channel", 0}, {"rank", 0}, {"row", program.kernelRow},
                                               {"start_column", 0}, {"bank_set", 1}, {"weight_bits", 8},
                                               {"activation_bits", 8}, {"scale_bits", 0},
-                                              {"input_register_count", 8}, {"output_register_count", 8}};
+                                              {"input_register_count", 8}, {"output_register_count", 8},
+                                              {"subchannels", program.channels}};
   if (!writeJSON(out / "system.json", std::move(system))) return 1;
 
   llvm::json::Array globalInfo, pimInfo;

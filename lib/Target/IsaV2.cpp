@@ -477,14 +477,14 @@ std::vector<uint32_t> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &d
 Result<std::pair<uint32_t, uint32_t>> pimGemv(unsigned partition, uint32_t sweeps, uint32_t weightTile,
                                               uint32_t activationTile, uint32_t outputTile) {
   using R = Result<std::pair<uint32_t, uint32_t>>;
-  if (partition > 3 || sweeps < 1 || sweeps > 256) return R::failure("PIM_GEMV partition or sweeps out of range");
+  if (partition > 15 || sweeps < 1 || sweeps > 256) return R::failure("PIM_GEMV partition or sweeps out of range");
   if (weightTile % 512 || activationTile % 32 || outputTile % 8)
     return R::failure("PIM_GEMV tiles must be multiples of 512 (weight), 32 (activation) and 8 (output)");
   if (weightTile / 512 >= 1u << 18 || activationTile / 32 >= 1u << 16 || outputTile / 8 >= 1u << 16)
     return R::failure("PIM_GEMV tile id does not fit its field");
-  // W0 [3:0] type 0, [5:4] partition, [13:6] sweeps - 1, [31:14] weight tile / 512;
+  // W0 [1:0] type 0, [5:2] partition, [13:6] sweeps - 1, [31:14] weight tile / 512;
   // W1 [15:0] activation tile / 32, [31:16] output tile / 8.
-  return R::success({partition << 4 | (sweeps - 1) << 6 | (weightTile / 512) << 14,
+  return R::success({partition << 2 | (sweeps - 1) << 6 | (weightTile / 512) << 14,
                      activationTile / 32 | (outputTile / 8) << 16});
 }
 } // namespace npu::isa2

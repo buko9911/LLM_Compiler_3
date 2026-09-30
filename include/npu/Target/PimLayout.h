@@ -11,13 +11,15 @@
 //  * a GEMV_STREAM covers 512 output rows (8 PUs x 16 accumulators x 4 lanes)
 //    and 256 inputs (8 input registers x 4 slices x 8); a longer K is several
 //    sweeps;
-//  * a partition p is subchannel p % 2 of rank p / 2;
+//  * a partition p is subchannel p % C of rank p / C, C = LP6 subchannels (8 for
+//    four LPDDR6 channels, 2 for one);
 //  * tile ids are dense per kind; the runtime places weight rows from the
 //    kernel row, then activation rows, then output rows (no scale rows).
 //
-// LP6 byte addresses follow lp6-pim-main configs/LPDDR6_PIM_Mobile_2CH.ini,
-// address_mapping = rarobacobgch (MSB -> LSB: rank, row, bank, column, bank
-// group, subchannel above the 32 B offset).
+// LP6 byte addresses follow lp6-pim-main configs/LPDDR6_PIM_Mobile_4CH.ini (C = 8)
+// and LPDDR6_PIM_Mobile_2CH.ini (C = 2), address_mapping = rarobacobgch (MSB ->
+// LSB: rank, row, bank, column, bank group, subchannel above the 32 B offset):
+// the strides below the rank grow with C; a rank is 8 GiB in both.
 #include "npu/Target/Result.h"
 #include <array>
 #include <cstdint>
@@ -29,9 +31,8 @@ namespace npu::pim {
 
 inline constexpr int kPUs = 8, kLanes = 4, kAccs = 16, kGroup = 8, kSlices = 4, kInTiles = 32;
 inline constexpr int64_t kKPerSweep = 256, kRowsPerStream = 512, kPacketsPerRow = 64;
-inline constexpr int kChannels = 2, kRanks = 2;
-inline constexpr int64_t kChBytes = 32, kBgBytes = 64, kColBytes = 256, kBankBytes = 16384,
-                         kRowBytes = 65536, kRankBytes = int64_t(1) << 33;
+inline constexpr int kRanks = 2;
+inline constexpr int64_t kChBytes = 32, kRankBytes = int64_t(1) << 33;
 
 // One INT8 activation vector of one token.
 struct Activation {
@@ -64,15 +65,20 @@ struct Projection {
 
 // All PIM work of one program: one kernel, one tile-id space.
 struct Program {
-  int partitions = 4;
+  int channels = 2;     // LP6 subchannels of the address decode
+  int partitions = 4;   // at most channels x kRanks
   int64_t kernelRow = 0;
   std::vector<int64_t> nextWeight = std::vector<int64_t>(4, 0);  // weight tile ids per partition
   int64_t nextActivation = 0, nextOutput = 0;
   std::vector<Activation> activations;
   std::vector<Projection> projections;
 
-  int partChannel(int p) const { return p % kChannels; }
-  int partRank(int p) const { return p / kChannels; }
+  int partChannel(int p) const { return p % channels; }
+  int partRank(int p) const { return p / channels; }
+  int64_t bgBytes() const { return kChBytes * channels; }
+  int64_t colBytes() const { return 4 * bgBytes(); }
+  int64_t bankBytes() const { return kPacketsPerRow * colBytes(); }
+  int64_t rowBytes() const { return 4 * bankBytes(); }
   int64_t addActivation(int64_t k);
   // Adds a GEMV reading `activations` (one per token). Each stream goes to the
   // least loaded partition of `loads`, shared by the GEMVs of one PIM phase; a

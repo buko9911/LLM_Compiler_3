@@ -362,7 +362,7 @@ Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
       if (!deps) return deps;
       if (uint64_t(count) * 2 > words.size() - at) return R::failure("truncated PIM record");
       for (uint32_t i = 0; i < count; ++i)
-        if (words[at + 2 * size_t(i)] & 15) return R::failure("unknown PIM command type");
+        if (words[at + 2 * size_t(i)] & 3) return R::failure("unknown PIM command type");   // W0 [1:0]
       at += 2 * size_t(count);
       break;
     }

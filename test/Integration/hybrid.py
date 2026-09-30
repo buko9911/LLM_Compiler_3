@@ -32,8 +32,6 @@ emulator = str(Path(a.emulator).resolve())
 settings = Path(a.settings).resolve()
 if not os.environ.get("LP6_DRAMSIM3_ROOT"):
     raise SystemExit("set LP6_DRAMSIM3_ROOT to lp6-pim-main: the PIM phases need its DRAMSim3 backend")
-# PIM layouts target one LPDDR6 channel; both runs use it so they share one memory system.
-LP6_CONFIG = ("--lp6-config", str(Path(os.environ["LP6_DRAMSIM3_ROOT"]) / "configs/LPDDR6_PIM_Mobile_2CH.ini"))
 
 rng = np.random.default_rng(7)
 x = (rng.standard_normal((1, 256)) * 0.5).astype(np.float16)
@@ -73,14 +71,14 @@ expected = linear(g, w2)
 npu = out / "npu"
 subprocess.run([a.compiler, "--from=graph", a.graph, "--settings", str(settings), "-o", str(npu), "--fp16",
                 "--readback", "--quantize=w8a8", "--inputs", str(inputs)], check=True)
-harness.run(npu, Path(emulator), settings, extra=LP6_CONFIG)
+harness.run(npu, Path(emulator), settings)
 meta = json.loads((npu / "metadata.json").read_text())["outputs"][0]
 npu_out = harness.read(npu, meta["readback_l2_address"], 1, 256, row_stride=meta.get("readback_row_stride_bytes"))
 
 hybrid = out / "hybrid"
 subprocess.run([a.hybrid, a.graph, "--settings", str(settings), "-o", str(hybrid), "--policy", "pim",
                 "--inputs", str(inputs)], check=True)
-done = subprocess.run([emulator, "--settings", str(settings), *LP6_CONFIG, "--system-program", "system.json",
+done = subprocess.run([emulator, "--settings", str(settings), "--system-program", "system.json",
                        "--command-report", "commands.json", "--lp6-image", "lp6.bin", "--lp6-size", "16GiB",
                        "--log-level", "warn"], cwd=hybrid, capture_output=True, text=True, timeout=900)
 (hybrid / "simulator.log").write_text(done.stdout + done.stderr)

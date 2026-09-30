@@ -26,9 +26,10 @@ struct HybridCostModel {
   // NPU GEMV: the weight streamed from LP6 once, or the array, whichever is slower.
   double npuClockMHz = 800, npuReadGBps = 22.51, npuGemvFixedUs = 2.0;
   int npuCores = 4;
-  // PIM GEMV: LdMAC streams balanced over the partitions that compute.
+  // PIM GEMV: LdMAC streams balanced over the partitions that compute. The LP6 is
+  // four LPDDR6 channels: 8 subchannels x 2 ranks (configs/hybrid_1ch.json: one).
   double pimClockMHz = 2400, pimEfficiency = 0.5725, pimPhaseFixedUs = 1.0;
-  int pimPUs = 8, pimLanes = 4, pimChannels = 2, pimRanks = 2, pimPartitions = 4, pimLdmacCK = 10;
+  int pimPUs = 8, pimLanes = 4, pimChannels = 8, pimRanks = 2, pimPartitions = 16, pimLdmacCK = 10;
   // Whether partitions on different ranks compute at the same time. The draft
   // defines no rank-to-rank rule for PIM compute, so a phase uses one rank.
   bool pimConcurrentRanks = false;

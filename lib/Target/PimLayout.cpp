@@ -97,17 +97,18 @@ uint64_t Program::packetAddress(int64_t baseRow, int64_t packet, int pu, int par
   int64_t row = baseRow + packet / kPacketsPerRow, column = packet % kPacketsPerRow;
   int bank = pu * 2;   // the even bank set
   int group = bank / 4, inGroup = bank % 4;
-  return uint64_t(rank) * uint64_t(kRankBytes) + uint64_t(row) * kRowBytes + uint64_t(inGroup) * kBankBytes +
-         uint64_t(column) * kColBytes + uint64_t(group) * kBgBytes + uint64_t(channel) * kChBytes;
+  return uint64_t(rank) * uint64_t(kRankBytes) + uint64_t(row) * uint64_t(rowBytes()) +
+         uint64_t(inGroup) * uint64_t(bankBytes()) + uint64_t(column) * uint64_t(colBytes()) +
+         uint64_t(group) * uint64_t(bgBytes()) + uint64_t(channel) * kChBytes;
 }
 
 uint64_t Program::rankEndAddress() const {
-  return uint64_t(baseRows().output + rowsFor(nextOutput)) * kRowBytes;
+  return uint64_t(baseRows().output + rowsFor(nextOutput)) * uint64_t(rowBytes());
 }
 
 uint64_t Program::endAddress() const {
   uint64_t end = rankEndAddress();
-  if (end == uint64_t(kernelRow) * kRowBytes) return end;   // no PIM rows at all
+  if (end == uint64_t(kernelRow) * uint64_t(rowBytes())) return end;   // no PIM rows at all
   return uint64_t(partRank(partitions - 1)) * uint64_t(kRankBytes) + end;
 }
 } // namespace npu::pim
