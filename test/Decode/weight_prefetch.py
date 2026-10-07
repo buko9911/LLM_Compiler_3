@@ -47,8 +47,8 @@ def main():
     root = Path(__file__).resolve().parents[2]
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", type=Path, default=root / "build/bin/npu-compile")
-    ap.add_argument("--npu-root", type=Path, default=root.parent / "IESLAB_NPU_Simulator")
-    ap.add_argument("--pim-root", type=Path, default=root.parent / "lp6-pim-main")
+    ap.add_argument("--npu-root", type=Path, default=root.parent / "simulator/npu")
+    ap.add_argument("--pim-root", type=Path, default=root.parent / "simulator/dram-pim")
     ap.add_argument("--dramsim-library", type=Path, help="explicit library (overrides the emulator's DT_RPATH)")
     ap.add_argument("--emulator", type=Path, help="frozen simulator executable")
     ap.add_argument("--settings", type=Path, help="simulator settings to copy")

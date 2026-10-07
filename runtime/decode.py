@@ -24,14 +24,15 @@ from decoder import DecoderDims, DecodeStep, weight_names, rope_tables, step_mas
 from weights import SafetensorStore  # noqa: E402
 from prefill import prefill_kv  # noqa: E402
 
-LP6 = ROOT.parent
-EMU = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
+import workspace  # noqa: E402
+
+EMU = workspace.EMULATOR
 # The simulator's default settings: four LPDDR6 channels (102.4 GB/s), matching configs/target.json.
 # Builds of configs/target_1ch.json (one channel) run with --lp6-config
 # configs/LPDDR6_PIM_Mobile_2CH.ini; the simulator refuses a PIM program laid out for another
 # subchannel count.
-SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
-BACKEND = LP6 / "lp6-pim-main"
+SETTINGS = workspace.SETTINGS
+BACKEND = workspace.DRAM_PIM
 DT = {"f16": np.float16, "f32": np.float32, "i8": np.int8, "i32": np.int32}
 
 

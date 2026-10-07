@@ -31,7 +31,7 @@ out.mkdir(parents=True, exist_ok=True)
 emulator = str(Path(a.emulator).resolve())
 settings = Path(a.settings).resolve()
 if not os.environ.get("LP6_DRAMSIM3_ROOT"):
-    raise SystemExit("set LP6_DRAMSIM3_ROOT to lp6-pim-main: the PIM phases need its DRAMSim3 backend")
+    raise SystemExit("set LP6_DRAMSIM3_ROOT to core/simulator/dram-pim: the PIM phases need its DRAMSim3 backend")
 
 rng = np.random.default_rng(7)
 x = (rng.standard_normal((1, 256)) * 0.5).astype(np.float16)

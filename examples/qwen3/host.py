@@ -26,10 +26,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from qwen3 import Checkpoint, Config, DecodeStep, load, rope_tables, step_mask, w8a8
 
-LP6 = Path("/home/jongjip/LP6")
-EMULATOR = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
-SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
-BACKEND = LP6 / "lp6-pim-main"
+sys.path.insert(0, str(HERE.parents[1] / "runtime"))
+import workspace  # noqa: E402
+
+EMULATOR = workspace.EMULATOR
+SETTINGS = workspace.SETTINGS
+BACKEND = workspace.DRAM_PIM
 # LP6 configuration per subchannel count of a package's PIM layout (npu-compile --pipeline=graph-hybrid pim.channels):
 # four LPDDR6 channels (the simulator's default) or one. The NPU-only run of a comparison uses
 # the hybrid package's so both sides share one memory system.

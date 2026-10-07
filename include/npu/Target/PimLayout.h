@@ -3,7 +3,7 @@
 // LPDDR6-PIM W8A8 GEMV layout: which tiles a GEMV uses, where their packets
 // live in LP6, and the compiler-lowered primitives that run it.
 //
-// It mirrors the lp6-pim-main runtime lowering (PIMRuntimeLowering::
+// It mirrors the dram-pim runtime lowering (PIMRuntimeLowering::
 // BuildRuntimeTileLayout) for W8A8 GEMV streams without a block scale:
 //  * one LdMAC drives the 8 PUs of the even bank set; a PU packet holds 4 lanes
 //    x 8 INT8 weights; an activation packet holds 32 INT8 values, 4 input
@@ -16,7 +16,7 @@
 //  * tile ids are dense per kind; the runtime places weight rows from the
 //    kernel row, then activation rows, then output rows (no scale rows).
 //
-// LP6 byte addresses follow lp6-pim-main configs/LPDDR6_PIM_Mobile_4CH.ini (C = 8)
+// LP6 byte addresses follow dram-pim configs/LPDDR6_PIM_Mobile_4CH.ini (C = 8)
 // and LPDDR6_PIM_Mobile_2CH.ini (C = 2), address_mapping = rarobacobgch (MSB ->
 // LSB: rank, row, bank, column, bank group, subchannel above the 32 B offset):
 // the strides below the rank grow with C; a rank is 8 GiB in both.

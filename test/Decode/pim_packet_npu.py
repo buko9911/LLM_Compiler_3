@@ -25,9 +25,11 @@ import numpy as np
 from safetensors.numpy import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
-LP6 = ROOT.parent
 sys.path.insert(0, str(ROOT / "runtime"))
-sys.path.insert(0, str(LP6 / "IESLAB_NPU_Simulator/transactional_emulator/tools"))
+import workspace  # noqa: E402
+
+LP6 = workspace.WORKSPACE
+sys.path.insert(0, str(workspace.NPU_TOOLS))
 from decode import Device, EMU, SETTINGS, phase_times  # noqa: E402
 from isa_v2 import core_instructions, decode_program  # noqa: E402
 from pim_weight_storage import audit_images, save, seal, sha  # noqa: E402
@@ -167,7 +169,7 @@ def audit_packet_metadata(build: Path, storage, m: int, n: int, k: int, spec):
 def provenance_files(args):
     paths = [args.compiler, args.emulator, args.dramsim_library, args.settings, args.lp6_config,
              Path(__file__), ROOT / "test/Decode/pim_weight_storage.py", ROOT / "runtime/decode.py",
-             ROOT / "configs/target.json", LP6 / "IESLAB_NPU_Simulator/transactional_emulator/tools/isa_v2.py"]
+             ROOT / "configs/target.json", workspace.NPU_TOOLS / "isa_v2.py"]
     paths += sorted((ROOT / "lib/Decode").rglob("*.cpp"))
     paths += sorted((ROOT / "include/npu/Decode").rglob("*.h"))
     paths += [ROOT / rel for rel in ["include/npu/Target/PimLayout.h", "lib/Target/PimLayout.cpp",
@@ -185,7 +187,7 @@ def main():
     parser.add_argument("--emulator", type=Path, default=EMU)
     parser.add_argument("--dramsim-library", type=Path, required=True)
     parser.add_argument("--settings", type=Path, default=SETTINGS)
-    parser.add_argument("--lp6-config", type=Path, default=LP6 / "lp6-pim-main/configs/LPDDR6_PIM_Mobile_4CH.ini")
+    parser.add_argument("--lp6-config", type=Path, default=workspace.LP6_CONFIG)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--m", type=int, default=7)
     parser.add_argument("--n", type=int, default=4096)

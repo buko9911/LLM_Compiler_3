@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 
 import numpy as np
 from safetensors.numpy import save_file
@@ -25,8 +26,9 @@ def main():
     a = ap.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    npu = root.parent / "IESLAB_NPU_Simulator"
-    pim = root.parent / "lp6-pim-main"
+    sys.path.insert(0, str(root / "runtime"))
+    import workspace
+    npu, pim = workspace.NPU, workspace.DRAM_PIM
     emu = npu / "transactional_emulator/target/release/transactional_emulator"
     env = dict(os.environ, LD_PRELOAD=str(a.dramsim_library.resolve()), LP6_DRAMSIM3_ROOT=str(pim))
     linked = subprocess.check_output(["ldd", str(emu)], text=True, env=env)

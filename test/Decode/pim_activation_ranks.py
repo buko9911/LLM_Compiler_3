@@ -20,8 +20,9 @@ from safetensors.numpy import save_file
 
 from pim_packet_npu import ROOT, LP6, Device, fixture, json_attributes, save, sha
 from pim_activation_cores import check_plan, ancestors
+import workspace
 
-EVIDENCE = LP6 / "lp6-pim-main/docs/evidence/2026-10-06/research"
+EVIDENCE = workspace.EVIDENCE / "2026-10-06/research"
 
 
 def compile_case(compiler, out, name, source, manifest, target, cores=1,
@@ -218,8 +219,8 @@ def main():
                    help="only audit saved actual.npz/commands.json; never compile or execute")
     p.add_argument("--emulator", type=Path)
     p.add_argument("--library", type=Path)
-    p.add_argument("--settings", type=Path, default=LP6 / "IESLAB_NPU_Simulator/plena_settings.toml")
-    p.add_argument("--dram-config", type=Path, default=LP6 / "lp6-pim-main/configs/LPDDR6_PIM_Mobile_4CH.ini")
+    p.add_argument("--settings", type=Path, default=workspace.SETTINGS)
+    p.add_argument("--dram-config", type=Path, default=workspace.LP6_CONFIG)
     a = p.parse_args(); globals()[a.action](a)
 
 

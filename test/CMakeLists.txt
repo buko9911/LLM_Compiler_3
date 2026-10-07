@@ -46,9 +46,9 @@ if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
     --out "${CMAKE_CURRENT_BINARY_DIR}/vpu32")
   set_tests_properties(npu-vpu32 PROPERTIES TIMEOUT 600 LABELS integration)
   # NPU only against NPU + PIM on one W8A8 graph. The PIM phases need the
-  # lp6-pim-main DRAMSim3 backend: NPU_TEST_LP6_ROOT, or LP6_DRAMSIM3_ROOT
+  # dram-pim DRAMSim3 backend: NPU_TEST_LP6_ROOT, or LP6_DRAMSIM3_ROOT
   # in the environment ctest runs in.
-  set(NPU_TEST_LP6_ROOT "" CACHE PATH "lp6-pim-main checkout for the PIM integration test")
+  set(NPU_TEST_LP6_ROOT "" CACHE PATH "core/simulator/dram-pim checkout for the PIM integration test")
   add_test(NAME npu-hybrid COMMAND "${NPU_TEST_PYTHON}"
     "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid.py"
     --compiler $<TARGET_FILE:npu-compile> --hybrid $<TARGET_FILE:npu-compile>

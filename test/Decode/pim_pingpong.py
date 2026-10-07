@@ -13,6 +13,7 @@ from weight_prefetch import run, sha256
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "runtime"))
 from decode import Device, phase_times  # noqa: E402
+import workspace  # noqa: E402
 
 
 def main():
@@ -62,7 +63,7 @@ def main():
             run([a.compiler.resolve(), source, "--manifest", manifest, "--spec", a.spec.resolve(),
                  "--force=pim", f"--pim-bankset-pingpong={lead}", "-o", build], ROOT, case / f"compile{lead}.log")
             dev = Device(build, emulator=a.emulator,
-                         lp6_config=ROOT.parent / "lp6-pim-main/configs/LPDDR6_PIM_Mobile_4CH.ini")
+                         lp6_config=workspace.LP6_CONFIG)
             dev.write("x", x)
             outputs, report, wall = dev.run()
             actual = outputs["y"]

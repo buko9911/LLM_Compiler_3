@@ -23,6 +23,7 @@ import numpy as np
 
 from pim_packet_npu import (ROOT, LP6, Device, EMU, SETTINGS, core_instructions,
                             decode_program, json_attributes, phase_times, save, sha)
+import workspace  # noqa: E402
 
 
 def ancestors(commands, event):
@@ -212,7 +213,7 @@ def main():
         assert json.loads((build / "pim_weight_storage_verified.json").read_text()) == json.loads(manifest.read_text())
         os.environ["LD_PRELOAD"] = str(library)
         os.environ.pop("LP6PIM_BANKSET_PINGPONG", None)
-        dev = Device(build, args.settings, LP6 / "lp6-pim-main/configs/LPDDR6_PIM_Mobile_4CH.ini", args.emulator)
+        dev = Device(build, args.settings, workspace.LP6_CONFIG, args.emulator)
         dev.write("x", reference["x"])
         assert sha(build / "lp6.bin") == sha(old / "lp6.bin"), "complete LP6 image bytes changed"
         result["whole_LP6_image_after_X_identical"] = True

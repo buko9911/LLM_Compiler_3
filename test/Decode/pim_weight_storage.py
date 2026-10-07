@@ -20,6 +20,7 @@ from safetensors.numpy import save_file
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'runtime'))
 from decode import Device, phase_times  # noqa: E402
+import workspace  # noqa: E402
 
 
 class Digest:
@@ -191,7 +192,7 @@ def main():
         x = xq.astype(np.float16)/np.float16(64)
         expected_i32 = xq.astype(np.int32)@wq.astype(np.int32).T
         expected_f16 = (expected_i32.astype(np.float32)/4096).astype(np.float16)
-        dev = Device(build,emulator=a.emulator,lp6_config=ROOT.parent/'lp6-pim-main/configs/LPDDR6_PIM_Mobile_4CH.ini')
+        dev = Device(build,emulator=a.emulator,lp6_config=workspace.LP6_CONFIG)
         dev.write('x',x); outputs,report,wall = dev.run()
         assert outputs['y'].tobytes()==expected_f16.tobytes(),(m,'FP16 output')
         partials = [outputs[name] for name,meta in dev.outputs.items() if meta['layout']=='pim_out' and meta['dtype']=='i32']
