@@ -23,7 +23,6 @@
 #include "npu/Decode/Dialect/Hyb/HybDialect.h"
 #include "npu/Decode/Support/TargetSpec.h"
 #include "npu/Decode/Target/NpuCodegen.h"
-#include "npu/Target/IsaV2.h"
 #include "npu/Decode/PimMetadata.h"
 #include "npu/Decode/Target/PlenaProgram.h"
 #include "npu/Decode/Transforms/Passes.h"
