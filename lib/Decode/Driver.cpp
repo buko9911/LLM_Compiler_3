@@ -13,6 +13,7 @@
 //                          packets (INT8, per-row symmetric), NPU constant pools
 //===----------------------------------------------------------------------===//
 
+#include "DriverPackage.h"
 #include "npu/Decode/Dialect/Hyb/HybDialect.h"
 #include "npu/Decode/Support/SafeTensors.h"
 #include "npu/Decode/Support/TargetSpec.h"
@@ -89,20 +90,6 @@ namespace {
 
 double seconds(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-}
-
-std::string dtypeName(Type t) {
-  if (t.isF16()) return "f16";
-  if (t.isF32()) return "f32";
-  if (t.isInteger(8)) return "i8";
-  if (t.isInteger(32)) return "i32";
-  return "?";
-}
-
-json::Array shapeOf(Type t) {
-  json::Array a;
-  for (int64_t d : cast<ShapedType>(t).getShape()) a.push_back(d);
-  return a;
 }
 
 DictionaryAttr lp6Of(func::FuncOp step, Value v) {
@@ -185,27 +172,6 @@ private:
   uint8_t *base = nullptr;
 };
 
-bool writeAtomicJSON(const std::string &path, const json::Value &value, std::string &err) {
-  llvm::SmallString<256> parent(path), temporary;
-  llvm::sys::path::remove_filename(parent);
-  if (!parent.empty())
-    if (auto ec = llvm::sys::fs::create_directories(parent)) { err = ec.message(); return false; }
-  int fd = -1;
-  if (auto ec = llvm::sys::fs::createUniqueFile(path + ".tmp-%%%%%%", fd, temporary)) {
-    err = ec.message(); return false;
-  }
-  llvm::raw_fd_ostream os(fd, true);
-  os << llvm::formatv("{0:2}", value) << '\n';
-  os.close();
-  if (os.has_error()) {
-    err = "cannot write " + path; llvm::sys::fs::remove(temporary); return false;
-  }
-  if (auto ec = llvm::sys::fs::rename(temporary, path)) {
-    err = ec.message(); llvm::sys::fs::remove(temporary); return false;
-  }
-  return true;
-}
-
 } // namespace
 
 int compileDecode(int argc, char **argv) {
@@ -279,18 +245,7 @@ int compileDecode(int argc, char **argv) {
   ctx.loadAllAvailableDialects();
 
   llvm::sys::fs::create_directories(outDir);
-  // Outputs of the former one-program-per-phase layout would shadow the single program.
-  {
-    std::error_code ec;
-    for (llvm::sys::fs::directory_iterator it(outDir, ec), end; it != end && !ec; it.increment(ec)) {
-      StringRef base = llvm::sys::path::filename(it->path());
-      // <index>_npu_<n> / <index>_pim_<n>, any number of index digits.
-      StringRef rest = base.drop_while([](char c) { return isdigit(c); });
-      bool phaseDir = rest.size() < base.size() && (rest.starts_with("_npu_") || rest.starts_with("_pim_"));
-      if (phaseDir || base == "collect") llvm::sys::fs::remove_directories(it->path());
-      else if (base == "schedule.json" || base == "pim.bin" || base == "phases.json") llvm::sys::fs::remove(it->path());
-    }
-  }
+  driver::removeStaleOutputs(outDir);
   llvm::SourceMgr sm;
   OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(inputFile, sm, &ctx);
   if (!module) return 1;
@@ -382,12 +337,7 @@ int compileDecode(int argc, char **argv) {
     llvm::errs() << "PIM packet NPU storage-only plan unexpectedly emitted PIM commands\n";
     return 1;
   }
-  {
-    std::error_code ec;
-    llvm::raw_fd_ostream os(outDir + "/pim_primitives.txt", ec);
-    if (ec) { llvm::errs() << ec.message() << "\n"; return 1; }
-    os << pim::printProgram(pimCommands);
-  }
+  if (!driver::writePimPrimitives(outDir, pimCommands)) return 1;
 
   // ---- NPU / PIM phases in program order, one program --------------------------------------
   plena::ProgramBuilder program;
@@ -516,7 +466,7 @@ int compileDecode(int argc, char **argv) {
       }
       uint64_t at = l1;
       outputs.push_back(json::Object{{"name", name}, {"l1", int64_t(at)}, {"bytes", bytes},
-                                     {"dtype", dtypeName(cast<ShapedType>(v.getType()).getElementType())},
+                                     {"dtype", driver::dtypeName(cast<ShapedType>(v.getType()).getElementType())},
                                      {"shape", std::move(shape)}, {"layout", layout}});
       l1 = (l1 + uint64_t(bytes) + 63) / 64 * 64;
       return at;
@@ -524,7 +474,7 @@ int compileDecode(int argc, char **argv) {
     auto collectDense = [&](const std::string &name, Value v, DictionaryAttr a) {
       uint64_t addr = uint64_t(a.getAs<IntegerAttr>("addr").getInt());
       uint64_t bytes = uint64_t(a.getAs<IntegerAttr>("bytes").getInt());
-      uint64_t at = item(name, v, int64_t(bytes), shapeOf(v.getType()), "dense");
+      uint64_t at = item(name, v, int64_t(bytes), driver::shapeOf(v.getType()), "dense");
       if (overflow) return;
       constexpr uint64_t chunk = (1 << 20) - 64;
       for (uint64_t o = 0; o < bytes; o += chunk) {
@@ -567,7 +517,7 @@ int compileDecode(int argc, char **argv) {
           } else if (layout == "pim_act") {
             int64_t K = ty.getDimSize(1);
             auto acts = a.getAs<ArrayAttr>("acts");
-            uint64_t at = item(name, v, ty.getNumElements(), shapeOf(ty), layout);
+            uint64_t at = item(name, v, ty.getNumElements(), driver::shapeOf(ty), layout);
             if (overflow) break;
             for (auto [m, ai] : llvm::enumerate(acts)) {
               const pim::Activation &act = prog.activations[size_t(cast<IntegerAttr>(ai).getInt())];
@@ -619,43 +569,10 @@ int compileDecode(int argc, char **argv) {
 
   // ---- io.json -------------------------------------------------------------------------------
   uint64_t imageBytes = std::max(prog.endAddress(), extra.limit);
-  json::Array args;
-  for (BlockArgument a : step.getArguments()) {
-    DictionaryAttr p = step.getArgAttrOfType<DictionaryAttr>(a.getArgNumber(), kLP6);
-    auto name = step.getArgAttrOfType<StringAttr>(a.getArgNumber(), kName);
-    auto kind = step.getArgAttrOfType<StringAttr>(a.getArgNumber(), kKind);
-    json::Object o{{"name", name ? name.str() : ""},
-                   {"kind", kind ? kind.str() : ""},
-                   {"addr", p.getAs<IntegerAttr>("addr").getInt()},
-                   {"bytes", p.getAs<IntegerAttr>("bytes").getInt()},
-                   {"dtype", dtypeName(cast<ShapedType>(a.getType()).getElementType())},
-                   {"shape", shapeOf(a.getType())}};
-    if (auto layer = step.getArgAttrOfType<IntegerAttr>(a.getArgNumber(), "hyb.layer")) o["layer"] = layer.getInt();
-    args.push_back(std::move(o));
-  }
+  json::Array args = driver::argumentsJSON(step);
   std::string model = modelDir.empty() ? mod->getAttrOfType<StringAttr>("hyb.model").str() : modelDir.getValue();
-  {
-    auto manifest = llvm::MemoryBuffer::getFile(manifestFile);
-    json::Value dims = nullptr;
-    if (manifest)
-      if (auto m = json::parse((*manifest)->getBuffer()))
-        if (auto *d = m->getAsObject()->get("dims")) dims = *d;
-    json::Object io{{"model", model},
-                    {"tokens", mod->getAttrOfType<IntegerAttr>("hyb.tokens").getInt()},
-                    {"capacity", mod->getAttrOfType<IntegerAttr>("hyb.capacity").getInt()},
-                    {"mask_min", mod->getAttrOfType<FloatAttr>("hyb.mask_min").getValueAsDouble()},
-                    {"dims", std::move(dims)},
-                    {"image", json::Object{{"path", "lp6.bin"}, {"bytes", int64_t((imageBytes + 63) / 64 * 64)}}},
-                    {"dense_end", int64_t(extra.cursor)},
-                    {"kernel_row", prog.kernelRow},
-                    {"pim_commands", int64_t(pimCommandCount)},
-                    {"args", std::move(args)},
-                    {"outputs", std::move(outputs)},
-                    {"phases", std::move(report)}};
-    std::error_code ec;
-    llvm::raw_fd_ostream os(outDir + "/io.json", ec);
-    os << llvm::formatv("{0:1}", json::Value(std::move(io))) << "\n";
-  }
+  driver::writeIO(outDir, manifestFile, mod, model, imageBytes, extra, prog, pimCommandCount, std::move(args),
+                  std::move(outputs), std::move(report));
   llvm::outs() << llvm::formatv("codegen: {0:f1} s, {1} PIM commands, LP6 image {2:f2} GB\n", seconds(t0),
                                 pimCommandCount, double(imageBytes) / 1e9);
   // This checked plan is produced during ISA emission, after the initial IR dump.
@@ -826,8 +743,8 @@ int compileDecode(int argc, char **argv) {
       llvm::errs() << "PIM weight storage verified manifest differs from import\n"; return 1;
     }
     auto value = ::npu::decode::toJSON(storage);
-    if (!writeAtomicJSON(outDir + "/pim_weight_storage_verified.json", value, err) ||
-        (!weightStorageExport.empty() && !writeAtomicJSON(weightStorageExport, value, err))) {
+    if (!driver::writeAtomicJSON(outDir + "/pim_weight_storage_verified.json", value, err) ||
+        (!weightStorageExport.empty() && !driver::writeAtomicJSON(weightStorageExport, value, err))) {
       llvm::errs() << "PIM weight storage export failed: " << err << '\n'; return 1;
     }
     mod->setAttr("hyb.pim_weight_storage_layout_sha256", StringAttr::get(&ctx, layoutHash));
@@ -838,17 +755,7 @@ int compileDecode(int argc, char **argv) {
       if (ec) { llvm::errs() << ec.message() << '\n'; return 1; }
       mod.print(os, OpPrintingFlags().elideLargeElementsAttrs());
     }
-    auto file = llvm::MemoryBuffer::getFile(outDir + "/io.json");
-    if (!file) { llvm::errs() << "cannot update verified storage io.json\n"; return 1; }
-    auto io = json::parse((*file)->getBuffer());
-    if (!io || !io->getAsObject()) {
-      if (!io) llvm::consumeError(io.takeError());
-      llvm::errs() << "invalid generated io.json\n"; return 1;
-    }
-    (*io->getAsObject())["pim_weight_storage"] = json::Object{
-      {"layout_sha256", layoutHash}, {"manifest_sha256", manifestHash}, {"content_verified", true},
-      {"verified_manifest", "pim_weight_storage_verified.json"}};
-    if (!writeAtomicJSON(outDir + "/io.json", *io, err)) { llvm::errs() << err << '\n'; return 1; }
+    if (!driver::addStorageToIO(outDir, layoutHash, manifestHash, err)) return 1;
   }
   llvm::outs() << llvm::formatv("image: {0:f1} s ({1} quantized weights)\n", seconds(t0), names.size());
   return 0;
