@@ -1,7 +1,7 @@
 """NPU only against NPU + PIM on one W8A8 graph, both against a numpy oracle.
 
 hybrid-graph.mlir holds two weight GEMVs with an elementwise step between
-them. npu-compile --quantize=w8a8 runs everything on the NPU; npu-hybrid
+them. npu-compile --quantize=w8a8 runs everything on the NPU; npu-compile --pipeline=graph-hybrid
 --policy pim sends both GEMVs to the LPDDR6-PIM. An INT32 GEMV sum is exact on
 either side and the rest is the same NPU code, so the two outputs must match
 byte for byte. The oracle follows the W8A8 contract one IEEE operation at a
@@ -76,7 +76,7 @@ meta = json.loads((npu / "metadata.json").read_text())["outputs"][0]
 npu_out = harness.read(npu, meta["readback_l2_address"], 1, 256, row_stride=meta.get("readback_row_stride_bytes"))
 
 hybrid = out / "hybrid"
-subprocess.run([a.hybrid, a.graph, "--settings", str(settings), "-o", str(hybrid), "--policy", "pim",
+subprocess.run([a.hybrid, "--pipeline=graph-hybrid", a.graph, "--settings", str(settings), "-o", str(hybrid), "--policy", "pim",
                 "--inputs", str(inputs)], check=True)
 done = subprocess.run([emulator, "--settings", str(settings), "--system-program", "system.json",
                        "--command-report", "commands.json", "--lp6-image", "lp6.bin", "--lp6-size", "16GiB",

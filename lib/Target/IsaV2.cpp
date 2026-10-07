@@ -13,7 +13,7 @@ constexpr uint32_t C_LI = 0x20, C_SET = 0x21, C_ADDI = 0x22, C_LOOP_BEGIN = 0x23
                    S_LD = 0x35, S_ST = 0x36, M_LD = 0x37, LDMA_R = 0x38, LDMA_I = 0x39, M_LD_ACC = 0x3a,
                    M_MMA = 0x3b, M_WB = 0x3c, C_SYNC = 0x3f;
 // System records.
-constexpr uint32_t CORE_BEGIN = 0x26, PIM = 0x27, GDMA_LOAD = 0x2b, GDMA_STORE = 0x2c, BARRIER = 0x2d;
+constexpr uint32_t CORE_BEGIN = 0x26, GDMA_LOAD = 0x2b, GDMA_STORE = 0x2c, BARRIER = 0x2d;
 constexpr uint32_t F16 = 0, F32 = 1, I8 = 2, I32 = 3;
 constexpr int SET_ROWS = 0, SET_SRC = 1, SET_DST = 2, SET_VL = 3, SET_BYTES = 4, kSets = 5;
 constexpr uint32_t SYNC_EVENT = 4, kMaxEvent = 15, kImm22 = 1u << 22, kWbStrideExtended = 1023;
@@ -466,25 +466,33 @@ std::vector<uint32_t> barrierRecord(uint32_t ordinal, const std::vector<uint32_t
   return words;
 }
 
-std::vector<uint32_t> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps, const uint32_t *commands,
-                                uint32_t count) {
-  std::vector<uint32_t> words{PIM | field(deps.size(), 8) << 6 | field(count, 18) << 14};
+template <typename Primitive>
+static Result<std::vector<uint32_t>> pimRecordImpl(uint32_t ordinal, const std::vector<uint32_t> &deps,
+                                       const Primitive *commands, uint32_t count) {
+  using R = Result<std::vector<uint32_t>>;
+  if (!count || !commands) return R::failure("PIM record needs executable primitives");
+  if (deps.size() > kMaxDependencies) return R::failure("too many PIM dependencies");
+  for (uint32_t d : deps)
+    if (d >= ordinal || ordinal - d > kMaxDistance) return R::failure("invalid PIM dependency distance");
+  // Zero inline count selects a full-width count word. Large token batches
+  // must not acquire a new phase-size limit when macros become primitives.
+  const uint32_t inlineCount = count < kPimCommands ? count : 0;
+  std::vector<uint32_t> words{OP_PIM_PRIMITIVES | field(deps.size(), 8) << 6 | inlineCount << 14};
+  if (!inlineCount) words.push_back(count);
   for (uint32_t d : dependencyWords(ordinal, deps)) words.push_back(d);
-  words.insert(words.end(), commands, commands + 2 * size_t(count));
-  return words;
+  for (uint32_t i = 0; i < count; ++i) {
+    auto encoded = pim::encode(commands[i]);
+    if (!encoded) return R::failure("PIM primitive " + std::to_string(i) + ": " + encoded.error);
+    words.insert(words.end(), encoded.value.begin(), encoded.value.end());
+  }
+  return R::success(std::move(words));
 }
-
-Result<std::pair<uint32_t, uint32_t>> pimGemv(unsigned partition, uint32_t sweeps, uint32_t weightTile,
-                                              uint32_t activationTile, uint32_t outputTile) {
-  using R = Result<std::pair<uint32_t, uint32_t>>;
-  if (partition > 15 || sweeps < 1 || sweeps > 256) return R::failure("PIM_GEMV partition or sweeps out of range");
-  if (weightTile % 512 || activationTile % 32 || outputTile % 8)
-    return R::failure("PIM_GEMV tiles must be multiples of 512 (weight), 32 (activation) and 8 (output)");
-  if (weightTile / 512 >= 1u << 18 || activationTile / 32 >= 1u << 16 || outputTile / 8 >= 1u << 16)
-    return R::failure("PIM_GEMV tile id does not fit its field");
-  // W0 [1:0] type 0, [5:2] partition, [13:6] sweeps - 1, [31:14] weight tile / 512;
-  // W1 [15:0] activation tile / 32, [31:16] output tile / 8.
-  return R::success({partition << 2 | (sweeps - 1) << 6 | (weightTile / 512) << 14,
-                     activationTile / 32 | (outputTile / 8) << 16});
+Result<std::vector<uint32_t>> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
+                                       const pim::Primitive *commands, uint32_t count) {
+  return pimRecordImpl(ordinal, deps, commands, count);
+}
+Result<std::vector<uint32_t>> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
+                                       const pim::PaPrimitive *commands, uint32_t count) {
+  return pimRecordImpl(ordinal, deps, commands, count);
 }
 } // namespace npu::isa2

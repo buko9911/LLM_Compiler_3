@@ -1,6 +1,7 @@
 #ifndef NPU_TARGET_ISAV2_H
 #define NPU_TARGET_ISAV2_H
 #include "npu/Target/Result.h"
+#include "npu/Target/PimPrimitive.h"
 #include <cstddef>
 #include <cstdint>
 #include <utility>
@@ -8,8 +9,8 @@
 
 namespace npu::isa2 {
 // PLENA ISA ver 2.0 (IESLAB_NPU_Simulator 75725ad): the core-block lowering,
-// the system records (with the PIM record) and the PIM_GEMV command. A port of the simulator's
-// tools/isa_v2.py, the same as hybrid-compiler lib/Target/NPU/IsaV2.cpp.
+// the system records and the PIM primitive extension. A port of the simulator's
+// tools/isa_v2.py. Both graph and decode pipelines use this implementation.
 //
 // Lower writes core code as a builder stream in the ISA ver 1.0 encodings of
 // ISA.h: every GP value is set with C_LUI/C_ADDI, C_SET reads a GP, vector
@@ -26,6 +27,8 @@ namespace npu::isa2 {
 // Inside a hardware loop every GP and control write stays in the output.
 
 // Record field limits.
+inline constexpr uint32_t kMagic = 0x414e4c50, kVersion = 2u << 16;
+inline constexpr uint32_t kHeaderWords = 5, OP_PROGRAM_END = 0x2f;
 inline constexpr uint32_t kCoreAny = 31;              // CORE_BEGIN logical core: dynamic placement
 inline constexpr size_t kMaxDependencies = 255;       // per record; more are joined by a BARRIER
 inline constexpr uint64_t kMaxDistance = 0xffff;      // 16-bit backward distance
@@ -51,18 +54,15 @@ std::vector<uint32_t> gdmaRecord(bool load, uint32_t ordinal, const std::vector<
 std::vector<uint32_t> coreBeginRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
                                       uint32_t coreWords, uint32_t logicalCore, uint64_t l1Bytes);
 std::vector<uint32_t> barrierRecord(uint32_t ordinal, const std::vector<uint32_t> &deps);
-// PIM record: W0 [5:0] opcode, [13:6] dependencies, [31:14] PIM_GEMV count;
-// the dependency words, then two words per PIM_GEMV. The command processor
-// hands the commands to the PIM controller; the record completes when LP6 drains.
-inline constexpr uint64_t kPimCommands = 1u << 18;    // PIM_GEMV count < 2^18
-std::vector<uint32_t> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps, const uint32_t *commands,
-                                uint32_t count);
-
-// PIM_GEMV (command type 0): one W8A8 GEMV stream on one partition. The PIM
-// controller expands it to CLEAR x16, per 256-input sweep LOAD_ACT x32 +
-// GEMV_STREAM, then STORE x8 (lp6-pim-main lp6_dramsim3_pim_load_commands).
-// Tiles must be multiples of 512 (weight), 32 (activation) and 8 (output).
-Result<std::pair<uint32_t, uint32_t>> pimGemv(unsigned partition, uint32_t sweeps, uint32_t weightTile,
-                                              uint32_t activationTile, uint32_t outputTile);
+// PIM primitive record: W0 opcode 0x2e, dependencies[13:6], primitive count[31:14];
+// Zero inline count selects a following 32-bit count word (>= 2^18), before
+// dependencies. Then variable-length primitives. 0x27 is retired and
+// rejected: old two-word PIM_GEMV packages must be recompiled.
+inline constexpr uint32_t OP_PIM_PRIMITIVES = 0x2e;
+inline constexpr uint64_t kPimCommands = 1u << 18;
+Result<std::vector<uint32_t>> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
+                                       const pim::Primitive *commands, uint32_t count);
+Result<std::vector<uint32_t>> pimRecord(uint32_t ordinal, const std::vector<uint32_t> &deps,
+                                       const pim::PaPrimitive *commands, uint32_t count);
 } // namespace npu::isa2
 #endif

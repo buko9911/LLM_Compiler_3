@@ -354,16 +354,31 @@ Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
       coreWords += count;
       break;
     }
-    case 0x27: { // PIM
-      const uint32_t count = head >> 14;
-      if (!count) return R::failure("PIM record without PIM_GEMV commands");
+    case 0x27:
+      return R::failure("retired PIM_GEMV record; recompile with the PIM primitive backend");
+    case isa2::OP_PIM_PRIMITIVES: {
+      uint32_t count = head >> 14;
       ++at;
+      if (!count) {
+        if (at >= words.size()) return R::failure("truncated PIM extended count");
+        count = words[at++];
+        if (count < isa2::kPimCommands) return R::failure("noncanonical PIM extended count");
+      }
       deps = readDependencies(words, at, id, head >> 6 & 0xff);
       if (!deps) return deps;
-      if (uint64_t(count) * 2 > words.size() - at) return R::failure("truncated PIM record");
-      for (uint32_t i = 0; i < count; ++i)
-        if (words[at + 2 * size_t(i)] & 3) return R::failure("unknown PIM command type");   // W0 [1:0]
-      at += 2 * size_t(count);
+      for (uint32_t i = 0; i < count; ++i) {
+        if (at >= words.size()) return R::failure("truncated PIM record");
+        size_t n = pim::instructionWords(words[at]);
+        if (!n || n > words.size() - at) return R::failure("invalid PIM primitive header or truncated operands");
+        if (words[at] >> 24 == pim::kPaPrimitiveVersion) {
+          auto p = pim::decodePa(words.data() + at, n);
+          if (!p) return R::failure("invalid PA PIM primitive: " + p.error);
+        } else {
+          auto p = pim::decode(words.data() + at, n);
+          if (!p) return R::failure("invalid PIM primitive: " + p.error);
+        }
+        at += n;
+      }
       break;
     }
     default:
@@ -394,7 +409,15 @@ std::vector<Record> readRecords(const std::vector<uint32_t> &words) {
     switch (r.op) {
     case 0x2b: case 0x2c: headWords = head >> 6 & 1 ? 5 : 3; count = head >> 7 & 0xff; break;
     case 0x26: headWords = 2; count = words[at + 1] >> 24; tailWords = words[at + 1] & 0xffffff; break;
-    case 0x27: count = head >> 6 & 0xff; tailWords = 2 * size_t(head >> 14); break;
+    case isa2::OP_PIM_PRIMITIVES: {
+      count = head >> 6 & 0xff;
+      uint32_t primitives = head >> 14;
+      if (!primitives) { headWords = 2; primitives = words[at + 1]; }
+      size_t body = at + headWords + (count + 1) / 2;
+      for (uint32_t i = 0; i < primitives; ++i)
+        tailWords += pim::instructionWords(words[body + tailWords]);
+      break;
+    }
     default: count = head >> 6 & 0xff; break;   // BARRIER
     }
     r.head.assign(words.begin() + at, words.begin() + at + headWords);
@@ -436,11 +459,15 @@ Result<LinkedProgram> linkProgram(const std::vector<Segment> &segments) {
                              "(split NPU phases with --split-every)");
   };
   for (const auto &s : segments) {
-    if (!s.pim.empty()) {
-      if (!s.program.empty() || s.pim.size() % 2 || s.pim.size() / 2 >= isa2::kPimCommands)
+    if (!s.pim.empty() || !s.paPim.empty()) {
+      if (!s.program.empty() || (!s.pim.empty() && !s.paPim.empty()) ||
+          s.pim.size() > UINT32_MAX || s.paPim.size() > UINT32_MAX)
         return R::failure(s.name + ": invalid PIM segment");
-      auto record = isa2::pimRecord(next, entry, s.pim.data(), uint32_t(s.pim.size() / 2));
-      out.insert(out.end(), record.begin(), record.end());
+      auto record = s.paPim.empty()
+        ? isa2::pimRecord(next, entry, s.pim.data(), uint32_t(s.pim.size()))
+        : isa2::pimRecord(next, entry, s.paPim.data(), uint32_t(s.paPim.size()));
+      if (!record) return R::failure(s.name + ": " + record.error);
+      out.insert(out.end(), record.value.begin(), record.value.end());
       linked.symbols.push_back(s.name);
       entry = {next++};
       continue;

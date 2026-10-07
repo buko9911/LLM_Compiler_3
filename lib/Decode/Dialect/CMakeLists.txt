@@ -1,0 +1,4 @@
+add_mlir_dialect_library(NPUDecodeDialect
+  Hyb/HybDialect.cpp
+  DEPENDS MLIRHybOpsIncGen
+  LINK_LIBS PUBLIC MLIRIR MLIRBufferizationDialect MLIRBufferizationTransforms MLIRDestinationStyleOpInterface MLIRSideEffectInterfaces MLIRTensorDialect MLIRTilingInterface)

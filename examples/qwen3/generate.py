@@ -1,4 +1,4 @@
-"""Greedy decoding with a compiled Qwen3 step (npu-hybrid package) on the simulator.
+"""Greedy decoding with a compiled Qwen3 step (graph-hybrid package) on the simulator.
 
 The host owns the KV windows. Every step it writes x, cos, sin, mask and the
 windows into the package's LP6 image at the addresses metadata.json gives,
@@ -25,7 +25,7 @@ from qwen3 import Checkpoint, Config, DecodeStep, load, rope_tables, step_mask
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--capture", type=Path, required=True)
-ap.add_argument("--package", type=Path, required=True, help="npu-hybrid output directory with lp6.bin")
+ap.add_argument("--package", type=Path, required=True, help="graph-hybrid output directory with lp6.bin")
 ap.add_argument("--prompt", default="The capital of France is")
 ap.add_argument("--tokens", type=int, default=8)
 ap.add_argument("--hardware", type=Path, default=ROOT / "examples/llama/hardware4.toml")

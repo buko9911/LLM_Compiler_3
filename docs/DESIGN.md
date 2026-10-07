@@ -1,5 +1,10 @@
 # NPU 컴파일러 v3 설계
 
+이 문서는2026-09-16의 범용 graph 설계 배경이다. 초기 목표와 과거 binary 표현을
+현재 Llama/Qwen decode의 구현 상태로 해석하지 않는다.
+현재 소스의 책임·호출 관계는 [개발자 가이드](../../lp6-pim-main/docs/developer/README.md#compiler-source-map),
+실제 decode pass/IR은 [compiler 해설](../../lp6-pim-main/docs/compiler/README.md)을 따른다.
+
 2026-09-16. MLIR 기반. v1(`LLM_Compiler`), v2(`LLM_Compiler_v2`), 같은 하드웨어를
 타깃하는 외부 구현(`kimjongjip/NPU-compiler`), 그리고 공개된 NPU 컴파일러 스택
 (Qualcomm Hexagon-MLIR, MiniNPU, XLA, IREE, TVM)을 비교해 확정했다.

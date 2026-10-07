@@ -1,6 +1,10 @@
 add_llvm_executable(npu-opt npu-opt.cpp)
 llvm_update_compile_flags(npu-opt)
 target_link_libraries(npu-opt PRIVATE
+  NPUDecodeTransforms
+  MLIRRegisterAllDialects
+  MLIRRegisterAllPasses
+  MLIRRegisterAllExtensions
   NPUDialect
   NPUTransforms
   MLIRArithDialect

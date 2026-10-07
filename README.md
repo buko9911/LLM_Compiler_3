@@ -1,5 +1,27 @@
 # LLM_Compiler_3
 
+코드 읽기·수정의 출발점은 [compiler 개발자 가이드](../lp6-pim-main/docs/developer/README.md#compiler-source-map)다.
+함수별 책임·실제 호출 경로·입출력 계약과 [리팩토링 계획](../lp6-pim-main/docs/developer/README.md#refactor-plan)을 설명한다.
+
+현재 LP6의 컴파일러 소스·빌드 진입점은 **이 저장소 하나**다. 별도 `hybrid-compiler` 저장소의
+Llama/Qwen decode 기능과 2026-10-01 L2/prefetch 수정은 이곳의 `lib/Decode`로 통합했다.
+실행 파일은 `build/bin/npu-compile`, pass 도구는 `build/bin/npu-opt`다.
+
+| 입력 | 실행 | 구현 |
+|---|---|---|
+| Llama/Qwen `step.mlir` + manifest + HF weights | `npu-compile --pipeline=decode` | `lib/Decode/`, `configs/target.json` |
+| 일반 tensor/linalg 또는 target IR | `npu-compile --pipeline=graph` (기본) | `lib/Transforms/`, `lib/Analysis/` |
+| 캡처한 그래프의 NPU/PIM 분할 | `npu-compile --pipeline=graph-hybrid` | 같은 graph passes + `HybridGraphDriver.cpp` |
+
+`--manifest`를 주면 decode를 자동 선택한다. 세 입력 경로는 **하나의 `lib/Target/IsaV2.cpp`와
+`lib/Target/PimLayout.cpp`**를 사용한다. graph의 in-place KV/L2 readback 계약과 decode의
+explicit KV/L1 collect 계약이 달라 상위 lowering은 구분한다. 기존 일반 matmul·attention 지원을
+삭제해서 하나처럼 만들지 않았다. 최신 Llama 성능 수치는 decode 경로에서 검증한 결과다.
+
+[decode 설계·최적화](docs/DECODE.md), [빌드와 재현](../lp6-pim-main/docs/simulator/BUILD_AND_RUN.md),
+[통합·삭제 내역](../lp6-pim-main/docs/history/20261001/CONSOLIDATION.md)을 따른다.
+실험 산출물은 `experiments/`, 현재 실행 바이너리는 `build/bin/`에 둔다.
+
 NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main에 맞춘 판이다. 타깃은 PLENA ISA ver 2.0이다
 (2026-09-29부터, 그 전은 ver 1.0).
 
@@ -17,7 +39,7 @@ matmul·elementwise·리덕션·전치·ReLU와 캡처한 Llama 디코더 층을
 
 **브랜치 `jongjip/PIM-hybrid`**: Qwen3 디코드 스텝(`examples/qwen3`), W8A8 양자화(`--quantize=w8a8`,
 INT8 MMA·양자화·역양자화 lowering), 그리고 가중치 GEMV 묶음을 비용 모델로 NPU와 LPDDR6-PIM에
-나눠 싣는 하이브리드 컴파일러 `npu-hybrid`(NPU 페이즈 + PIM_GEMV 명령 + 호스트 스케줄)를 더했다.
+나눠 싣는 `npu-compile --pipeline=graph-hybrid` 경로(NPU/PIM 레코드가 들어간 단일 프로그램)를 더했다.
 설계·사용법·결과는 [docs/HYBRID.md](docs/HYBRID.md)에 있다.
 
 ## LLM_Compiler_2 에서 달라진 점

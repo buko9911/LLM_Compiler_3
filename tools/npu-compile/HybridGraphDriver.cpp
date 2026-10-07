@@ -1,10 +1,10 @@
 //===----------------------------------------------------------------------===//
-// npu-hybrid — NPU + LPDDR6-PIM 하이브리드 컴파일러 드라이버
+// npu-compile --pipeline=graph-hybrid — NPU + LPDDR6-PIM 하이브리드 컴파일러 드라이버
 //
 // linalg 그래프 하나(Stage 0 캡처)를 W8A8 로 합법화한 뒤, 가중치 GEMV 묶음마다
 // NPU 와 PIM 중 어디서 돌릴지 비용 모델로 정하고(partitionGraph), PIM 묶음을
 // 경계로 NPU 페이즈들을 잘라(outlinePhases) 페이즈마다 npu-compile 과 같은
-// tile / place / lower / encode 를 돌린다. PIM 묶음은 PIM_GEMV 명령이 된다
+// tile / place / lower / encode 를 돌린다. PIM 묶음은 PIM primitive 명령이 된다
 // (lib/Target/PimLayout.cpp).
 //
 //   NPU 0 | PIM 0 | NPU 1 | PIM 1 | ... | PIM G-1 | NPU G
@@ -12,7 +12,7 @@
 // 출력 디렉터리:
 //   program.bin, system.json   디코드 한 스텝 = Unified Program 하나 (ISA ver 2.0).
 //                              NPU 페이즈는 레코드 구간, PIM 페이즈는 PIM 레코드 하나
-//                              (PIM_GEMV 명령들). system.json 에 PIM 커널 설정과
+//                              (PIM primitive 명령들). system.json 에 PIM 커널 설정과
 //                              레코드 이름 <페이즈>.<종류>_<번호> (npu<i>, pim<g>).
 //   partition.json             묶음별 비용 추정과 선택
 //   metadata.json              전역 주소, 출력의 L2 readback 주소, PIM 요약
@@ -256,13 +256,13 @@ bool readFile(const fs::path &path, std::vector<char> &bytes) {
 }
 } // namespace
 
-int main(int argc, char **argv) {
+int compileHybridGraph(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     auto value = [&]() -> std::string { return i + 1 < argc ? argv[++i] : std::string(); };
     if (arg == "--help") {
-      std::cout << "usage: npu-hybrid graph.mlir --settings hardware.toml -o directory\n"
+      std::cout << "usage: npu-compile --pipeline=graph-hybrid graph.mlir --settings hardware.toml -o directory\n"
                    "  --inputs dir          arg<N>.bin of the capture; builds lp6.bin\n"
                    "  --config hybrid.json  cost model and mapping policy (default: built-in values)\n"
                    "  --policy cost|npu|pim override the configured policy\n"
@@ -448,7 +448,7 @@ int main(int argc, char **argv) {
   timed("tile+place");
 
   //===--------------------------------------------------------------------===//
-  // PIM: 타일 배치와 PIM_GEMV 명령
+  // PIM: 타일 배치와 PIM primitive 명령
   //===--------------------------------------------------------------------===//
   pim::Program program;
   program.channels = model.value.pimChannels;
@@ -484,19 +484,24 @@ int main(int argc, char **argv) {
           program.addProjection(gemv.name, gemv.n, gemv.k, activationsOf[size_t(g)], loads));
     }
   }
-  // PIM 페이즈 g 의 명령 범위(first, count). 명령 하나가 두 워드.
-  std::vector<uint32_t> pimCommands;
+  // PIM 페이즈 g 의 명령 범위(first, count). 최종 primitive 단위.
+  std::vector<pim::Primitive> pimCommands;
   std::vector<std::pair<int64_t, int64_t>> pimPhases;
   for (int64_t g = 0; g < groups; ++g) {
-    int64_t first = int64_t(pimCommands.size()) / 2;
+    int64_t first = int64_t(pimCommands.size());
     for (int64_t index : projectionsOf[size_t(g)])
       if (auto emitted = program.emitCompute(index, pimCommands); !emitted) {
         std::cerr << emitted.error << '\n';
         return 1;
       }
-    pimPhases.push_back({first, int64_t(pimCommands.size()) / 2 - first});
+    pimPhases.push_back({first, int64_t(pimCommands.size()) - first});
   }
-  const int64_t pimCommandCount = int64_t(pimCommands.size()) / 2;
+  const int64_t pimCommandCount = int64_t(pimCommands.size());
+  {
+    std::ofstream ir(out / "pim_primitives.txt");
+    if (!ir) { std::cerr << "cannot write PIM primitive IR\n"; return 1; }
+    ir << pim::printProgram(pimCommands);
+  }
   if (program.rankEndAddress() > uint64_t(pim::kRankBytes)) {
     std::cerr << "PIM rows end past one rank\n";
     return 1;
@@ -598,8 +603,8 @@ int main(int argc, char **argv) {
     if (int64_t g = p + 1 < phases ? plan->pimAfter[size_t(p)] : -1; g >= 0) {
       auto [first, count] = pimPhases[size_t(g)];
       segments.push_back({"pim" + std::to_string(g), {},
-                          std::vector<uint32_t>(pimCommands.begin() + 2 * first,
-                                                pimCommands.begin() + 2 * (first + count))});
+                          std::vector<pim::Primitive>(pimCommands.begin() + first,
+                                                  pimCommands.begin() + first + count)});
     }
   }
   timed("lower+encode");
@@ -629,6 +634,7 @@ int main(int argc, char **argv) {
                             {"l2_bytes_required", l2Required},
                             {"l2_regions", llvm::json::Array{llvm::json::Object{
                                 {"name", "l2"}, {"offset", 0}, {"size", l2Required}, {"alignment", 64}}}}};
+  if (groups) system["pim_primitive_abi"] = int64_t(pim::kPrimitiveVersion);
   if (groups)
     system["pim_kernel"] = llvm::json::Object{{"channel", 0}, {"rank", 0}, {"row", program.kernelRow},
                                               {"start_column", 0}, {"bank_set", 1}, {"weight_bits", 8},

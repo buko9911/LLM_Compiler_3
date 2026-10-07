@@ -28,10 +28,12 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   // Least-loaded partition per stream, then regrouped so the streams of one
   // partition are contiguous and its stored output tiles stay contiguous.
   std::vector<int64_t> count(size_t(partitions), 0);
+  if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
+  auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.streamTiles(); };
   for (int64_t s = 0; s < p.streams(); ++s) {
     int best = 0;
     for (int c = 1; c < partitions; ++c)
-      if (loads[c] < loads[best]) best = c;
+      if (loads[c] < loads[best] || (loads[c] == loads[best] && stored(c) < stored(best))) best = c;
     count[size_t(best)]++;
     loads[best] += p.sweeps() * int64_t(inputs.size());
   }
@@ -40,7 +42,6 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   // Weight tile ids are per partition: a stream's packets live only in its
   // partition's banks, and the runtime addresses a tile inside the partition
   // of the GEMV_STREAM.
-  if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
   for (int c : p.streamPart) {
     p.streamWeightBase.push_back(nextWeight[size_t(c)]);
     nextWeight[size_t(c)] += p.streamTiles();
@@ -62,24 +63,54 @@ int64_t Program::storedTiles(int rank) const {
   return tiles;
 }
 
-Result<bool> Program::emitCompute(int64_t index, std::vector<uint32_t> &commands) {
-  // The PIM controller expands one PIM_GEMV to CLEAR x16, per sweep LOAD_ACT x32
-  // + GEMV_STREAM, then STORE x8 of the 8 output registers.
+Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &commands) {
+  // Scheduling is a compiler decision. The runtime receives this exact
+  // primitive sequence; it does not reconstruct a fixed GEMV macro.
   Projection &p = projections[size_t(index)];
-  p.computeFirst = int64_t(commands.size()) / 2;
+  p.computeFirst = int64_t(commands.size());
   const int64_t streams = p.streams();
   for (int m = 0; m < p.tokens(); ++m) {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
     for (int64_t g = 0; g < streams; ++g) {
-      auto command = isa2::pimGemv(unsigned(p.streamPart[size_t(g)]), uint32_t(p.sweeps()),
-                                   uint32_t(p.streamWeightBase[size_t(g)]), uint32_t(a.base),
-                                   uint32_t(p.outputBase + (int64_t(m) * streams + g) * 8));
-      if (!command) return Result<bool>::failure(p.name + ": " + command.error);
-      commands.push_back(command.value.first);
-      commands.push_back(command.value.second);
+      auto make = [&](Opcode opcode) {
+        Primitive q;
+        q.opcode = opcode;
+        q.partition = uint32_t(p.streamPart[size_t(g)]);
+        return q;
+      };
+      for (int acc = 0; acc < kAccs; ++acc) {
+        auto q = make(Opcode::ClearOutput); q.accumulator = acc;
+        commands.push_back(q);
+      }
+      for (int64_t sweep = 0; sweep < p.sweeps(); ++sweep) {
+        int64_t firstA = a.base + sweep * kInTiles;
+        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * kAccs * kInTiles;
+        if (firstA + kInTiles > INT32_MAX || firstW + kAccs * kInTiles > INT32_MAX)
+          return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
+        // A load fills a whole 32-byte input register (four logical K=8
+        // slices). Emit it once per packet; all slices remain addressable.
+        for (int i = 0; i < kInTiles; i += kSlices) {
+          auto q = make(Opcode::LoadActivation); q.activation = int32_t(firstA + i);
+          commands.push_back(q);
+        }
+        auto q = make(Opcode::GemvStream);
+        q.weight = int32_t(firstW); q.activation = int32_t(firstA); q.accumulator = 0;
+        q.inputs = kInTiles; q.outputs = kAccs;
+        q.weightInputStride = 1; q.weightOutputStride = kInTiles;
+        q.activationInputStride = 1; q.accumulatorOutputStride = 1;
+        commands.push_back(q);
+      }
+      int64_t firstO = p.outputBase + (int64_t(m) * streams + g) * (kAccs / 2);
+      if (firstO + kAccs / 2 > INT32_MAX)
+        return Result<bool>::failure(p.name + ": PIM output tile ID exceeds INT32_MAX");
+      for (int reg = 0; reg < kAccs / 2; ++reg) {
+        auto q = make(Opcode::StoreOutput);
+        q.accumulator = 2 * reg; q.output = int32_t(firstO + reg);
+        commands.push_back(q);
+      }
     }
   }
-  p.computeCount = int64_t(commands.size()) / 2 - p.computeFirst;
+  p.computeCount = int64_t(commands.size()) - p.computeFirst;
   return Result<bool>::success(true);
 }
 

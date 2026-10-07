@@ -51,7 +51,7 @@ if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
   set(NPU_TEST_LP6_ROOT "" CACHE PATH "lp6-pim-main checkout for the PIM integration test")
   add_test(NAME npu-hybrid COMMAND "${NPU_TEST_PYTHON}"
     "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid.py"
-    --compiler $<TARGET_FILE:npu-compile> --hybrid $<TARGET_FILE:npu-hybrid>
+    --compiler $<TARGET_FILE:npu-compile> --hybrid $<TARGET_FILE:npu-compile>
     --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
     --graph "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid-graph.mlir"
     --out "${CMAKE_CURRENT_BINARY_DIR}/hybrid")

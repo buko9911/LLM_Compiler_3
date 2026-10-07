@@ -70,24 +70,93 @@ TEST(IsaV2, SystemRecordsMatchTheSimulatorDecoder) {
   EXPECT_EQ(npu::isa2::barrierRecord(5, {1, 2}), (std::vector<uint32_t>{0x2d | 2u << 6, 4 | 3u << 16}));
 }
 
-TEST(IsaV2, PimRecordCarriesItsCommands) {
-  // runner.rs pim_record_carries_its_commands_and_dependencies: W0 count and
-  // dependencies, the dependency words, two words per PIM_GEMV.
-  const uint32_t commands[] = {1, 2, 3, 4};
-  EXPECT_EQ(npu::isa2::pimRecord(3, {1}, commands, 2),
-            (std::vector<uint32_t>{0x27 | 1u << 6 | 2u << 14, 2, 1, 2, 3, 4}));
+TEST(IsaV2, PimPrimitiveRecordFields) {
+  npu::pim::Primitive clear; clear.accumulator = 3; clear.partition = 13;
+  auto record = npu::isa2::pimRecord(3, {1}, &clear, 1);
+  ASSERT_TRUE(bool(record)) << record.error;
+  EXPECT_EQ(record.value.size(), 4u);
+  EXPECT_EQ(record.value[0], 0x2eu | 1u << 6 | 1u << 14);
+  EXPECT_EQ(record.value[1], 2u);
+  EXPECT_EQ(record.value[2], 1u << 24 | 13u << 8 | 5u);
+  EXPECT_EQ(record.value[3], 3u);
 }
 
-TEST(IsaV2, PimGemvFields) {
-  auto command = npu::isa2::pimGemv(1, 10, 1024, 320, 16);
-  ASSERT_TRUE(bool(command)) << command.error;
-  EXPECT_EQ(command.value.first, 1u << 2 | 9u << 6 | 2u << 14);
-  EXPECT_EQ(command.value.second, 10u | 2u << 16);
-  auto last = npu::isa2::pimGemv(15, 1, 0, 0, 0);            // subchannel 7 of rank 1 on four channels
-  ASSERT_TRUE(bool(last));
-  EXPECT_EQ(last.value.first, 15u << 2);
-  EXPECT_FALSE(bool(npu::isa2::pimGemv(0, 1, 100, 0, 0)));   // weight tile not a multiple of 512
-  EXPECT_FALSE(bool(npu::isa2::pimGemv(16, 1, 0, 0, 0)));    // partition
-  EXPECT_FALSE(bool(npu::isa2::pimGemv(0, 257, 0, 0, 0)));   // sweeps
+TEST(IsaV2, PimPaPrimitivePreservesUpperAddressAndByteStrides) {
+  npu::pim::PaPrimitive p;
+  p.opcode = npu::pim::Opcode::GemvStream; p.pa = 0x208000020ull;
+  p.inputs = 32; p.outputs = 8; p.weightInputByteStride = 256; p.weightOutputByteStride = 1u << 17;
+  auto e = npu::pim::encode(p);
+  ASSERT_TRUE(bool(e)) << e.error;
+  EXPECT_EQ(e.value, (std::vector<uint32_t>{2u << 24 | 7, 0x08000020, 2, 0, UINT32_MAX, 0,
+                                          32, 8, 256, 0, 1u << 17, 0, 1}));
+  auto d = npu::pim::decodePa(e.value.data(), e.value.size());
+  ASSERT_TRUE(bool(d));
+  EXPECT_EQ(d.value.pa, p.pa);
+  EXPECT_EQ(npu::pim::print(d.value), npu::pim::print(p));
+  EXPECT_FALSE(bool(npu::pim::decode(e.value.data(), e.value.size())));
+  auto bad = e.value; bad[0] |= 1u << 8;
+  EXPECT_FALSE(bool(npu::pim::decodePa(bad.data(), bad.size())));
+  p.pa = UINT64_MAX - 31;
+  EXPECT_FALSE(bool(npu::pim::encode(p)));
+  npu::pim::PaPrimitive clear; clear.pa = 0x208000000ull;
+  auto record = npu::isa2::pimRecord(0, {}, &clear, 1);
+  ASSERT_TRUE(bool(record));
+  auto program = std::vector<uint32_t>{npu::isa2::kMagic, npu::isa2::kVersion,
+      uint32_t(6 + record.value.size()), 1, 0};
+  program.insert(program.end(), record.value.begin(), record.value.end());
+  program.push_back(npu::isa2::OP_PROGRAM_END);
+  EXPECT_TRUE(bool(npu::verifyProgramWords(program)));
+  npu::Segment segment; segment.name = "pa_pim"; segment.paPim = {clear};
+  auto linked = npu::linkProgram({segment});
+  ASSERT_TRUE(bool(linked)) << linked.error;
+  EXPECT_TRUE(bool(npu::verifyProgramWords(linked.value.words)));
+}
+
+TEST(IsaV2, PimPrimitivePreservesArbitraryTileAndStreamOperands) {
+  // Not the retired macro's 512/32/8 aligned addresses or 32x16 geometry.
+  npu::pim::Primitive p;
+  p.opcode = npu::pim::Opcode::GemvStream; p.partition = 13; p.bankSet = 1;
+  p.weight = 7; p.activation = 5; p.scale = 9; p.accumulator = 2;
+  p.inputs = 3; p.outputs = 2;
+  p.weightInputStride = 2; p.weightOutputStride = 11; p.activationInputStride = 1;
+  p.scaleInputPeriod = 2; p.scaleInputStride = 3; p.scaleOutputStride = 4;
+  p.accumulatorOutputStride = 2;
+  auto e = npu::pim::encode(p);
+  ASSERT_TRUE(bool(e)) << e.error;
+  const npu::pim::EncodedPrimitive golden{1u << 24 | 1u << 16 | 13u << 8 | 7u,
+      7, 5, 9, 2, 3, 2, 2, 11, 1, 2, 3, 4, 2};
+  EXPECT_EQ(e.value, golden);
+  auto d = npu::pim::decode(golden.data(), golden.size());
+  ASSERT_TRUE(bool(d));
+  EXPECT_EQ(npu::pim::print(d.value), npu::pim::print(p));
+  p.inputs = 0;
+  EXPECT_FALSE(bool(npu::pim::encode(p)));
+  p.inputs = 3; p.weight = INT32_MAX;
+  EXPECT_FALSE(bool(npu::pim::encode(p)));
+  auto bad = golden; bad[0] = 1u << 24; // STAGE cannot be executed.
+  EXPECT_FALSE(bool(npu::pim::decode(bad.data(), bad.size())));
+  bad = golden; bad[0] |= 2u << 24;
+  EXPECT_FALSE(bool(npu::pim::decode(bad.data(), bad.size())));
+  EXPECT_FALSE(bool(npu::pim::decode(golden.data(), golden.size() - 1)));
+}
+
+TEST(IsaV2, LargePimPhaseUsesExtendedCountWithoutSplittingLiveState) {
+  npu::pim::Primitive clear; clear.accumulator = 0;
+  std::vector<npu::pim::Primitive> instructions(1u << 18, clear);
+  auto record = npu::isa2::pimRecord(0, {}, instructions.data(), instructions.size());
+  ASSERT_TRUE(bool(record)) << record.error;
+  EXPECT_EQ(record.value[0], npu::isa2::OP_PIM_PRIMITIVES);
+  EXPECT_EQ(record.value[1], instructions.size());
+  auto program = std::vector<uint32_t>{npu::isa2::kMagic, npu::isa2::kVersion,
+      uint32_t(6 + record.value.size()), 1, 0};
+  program.insert(program.end(), record.value.begin(), record.value.end());
+  program.push_back(npu::isa2::OP_PROGRAM_END);
+  EXPECT_TRUE(bool(npu::verifyProgramWords(program)));
+  // Relinking an extended record must preserve its payload and dependency boundary.
+  auto linked = npu::linkProgram({{"large", program, {}}});
+  ASSERT_TRUE(bool(linked)) << linked.error;
+  EXPECT_TRUE(bool(npu::verifyProgramWords(linked.value.words)));
+  program[6] = 1; // short counts must use the inline encoding
+  EXPECT_FALSE(bool(npu::verifyProgramWords(program)));
 }
 } // namespace

@@ -5,7 +5,7 @@ running the PyTorch module over the earlier prompt tokens one step at a time
 (FP32), writes the checked step's inputs as arg<N>.bin beside the captured
 weights, and returns the FP32 reference outputs of that step.
 
-run_npu() runs an npu-compile package, run_hybrid() an npu-hybrid package (one
+run_npu() runs an npu-compile package, run_hybrid() an graph-hybrid package (one
 program whose NPU and PIM phases follow each other). Both return the outputs
 read back from the simulator's L2 dump and the cycle counts.
 """
@@ -30,7 +30,7 @@ LP6 = Path("/home/jongjip/LP6")
 EMULATOR = LP6 / "IESLAB_NPU_Simulator/transactional_emulator/target/release/transactional_emulator"
 SETTINGS = LP6 / "IESLAB_NPU_Simulator/plena_settings.toml"
 BACKEND = LP6 / "lp6-pim-main"
-# LP6 configuration per subchannel count of a package's PIM layout (npu-hybrid pim.channels):
+# LP6 configuration per subchannel count of a package's PIM layout (npu-compile --pipeline=graph-hybrid pim.channels):
 # four LPDDR6 channels (the simulator's default) or one. The NPU-only run of a comparison uses
 # the hybrid package's so both sides share one memory system.
 LP6_CONFIGS = {8: BACKEND / "configs/LPDDR6_PIM_Mobile_4CH.ini", 2: BACKEND / "configs/LPDDR6_PIM_Mobile_2CH.ini"}
@@ -154,7 +154,7 @@ def run_npu(package: Path, settings: Path, timeout: int = 14400, subchannels: in
 
 
 def run_hybrid(package: Path, settings: Path, timeout: int = 14400, subchannels: int | None = None):
-    """One npu-hybrid package: outputs and the per-phase report (phase_report)."""
+    """One graph-hybrid package: outputs and the per-phase report (phase_report)."""
     _simulate(package, ["--settings", str(settings), "--system-program", "system.json",
                         "--command-report", "commands.json", "--lp6-image", "lp6.bin",
                         "--lp6-size", "16GiB", "--log-level", "info"], timeout,
@@ -166,7 +166,7 @@ def run_hybrid(package: Path, settings: Path, timeout: int = 14400, subchannels:
 
 
 def phase_report(commands: dict) -> dict:
-    """Phases of one npu-hybrid program from the simulator's command report.
+    """Phases of one npu-compile --pipeline=graph-hybrid program from the simulator's command report.
 
     Records are named <phase>.<kind>_<ordinal> (npu<i>), a PIM record after its
     phase (pim<g>). A phase runs from the end of the previous one to the end of

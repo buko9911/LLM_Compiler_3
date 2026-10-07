@@ -2,7 +2,7 @@
 the simulator and compare them.
 
   NPU only    npu-compile --quantize=w8a8     one Unified Program
-  NPU + PIM   npu-hybrid                      NPU phases and PIM phases on one LP6
+  NPU + PIM   npu-compile --pipeline=graph-hybrid                      NPU phases and PIM phases on one LP6
 
 Both follow the same W8A8 contract on the same per-channel INT8 weights, so the
 outputs must match byte for byte: an INT32 GEMV sum is exact on either side,
@@ -29,12 +29,12 @@ ap.add_argument("--capture", type=Path, required=True, help="output directory of
 ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--prompt", default="The capital of France is")
 ap.add_argument("--hardware", type=Path, default=ROOT / "examples/llama/hardware4.toml")
-ap.add_argument("--config", type=Path, default=ROOT / "configs/hybrid.json", help="npu-hybrid cost model")
+ap.add_argument("--config", type=Path, default=ROOT / "configs/hybrid.json", help="npu-compile --pipeline=graph-hybrid cost model")
 ap.add_argument("--policy", choices=["cost", "npu", "pim"], help="override the configured mapping policy")
-ap.add_argument("--map", action="append", default=[], help="name=npu|pim, as npu-hybrid --map")
+ap.add_argument("--map", action="append", default=[], help="name=npu|pim, as npu-compile --pipeline=graph-hybrid --map")
 ap.add_argument("--skip-npu", action="store_true", help="run only the hybrid package")
 ap.add_argument("--split-every", type=int, default=0,
-                help="build the NPU-only baseline with npu-hybrid --policy npu --split-every N "
+                help="build the NPU-only baseline with npu-compile --pipeline=graph-hybrid --policy npu --split-every N "
                      "(one program per N GEMV groups; 4 = per layer) instead of one npu-compile program")
 ap.add_argument("--reference", choices=["w8a8", "fp32"], default="w8a8",
                 help="reference model: W8A8 linears (exact GEMVs) or plain FP32 (lighter for many layers)")
@@ -48,7 +48,7 @@ settings = simulator_settings(a.hardware, a.out)
 graph = a.capture / "00-imported.mlir"
 npu_package, hybrid_package = a.out / "npu", a.out / "hybrid"
 if not a.skip_npu and a.split_every:
-    subprocess.run([str(ROOT / "build/bin/npu-hybrid"), str(graph), "--settings", str(a.hardware), "-o",
+    subprocess.run([str(ROOT / "build/bin/npu-compile"), "--pipeline=graph-hybrid", str(graph), "--settings", str(a.hardware), "-o",
                     str(npu_package), "--config", str(a.config), "--inputs", str(step.inputs), "--names",
                     str(step.inputs / "arguments.txt"), "--policy", "npu", "--split-every", str(a.split_every)],
                    check=True)
@@ -56,7 +56,7 @@ elif not a.skip_npu:
     subprocess.run([str(ROOT / "build/bin/npu-compile"), "--from=graph", str(graph), "--settings", str(a.hardware),
                     "-o", str(npu_package), "--fp16", "--reciprocal-division", "--readback", "--quantize=w8a8",
                     "--inputs", str(step.inputs)], check=True)
-command = [str(ROOT / "build/bin/npu-hybrid"), str(graph), "--settings", str(a.hardware), "-o", str(hybrid_package),
+command = [str(ROOT / "build/bin/npu-compile"), "--pipeline=graph-hybrid", str(graph), "--settings", str(a.hardware), "-o", str(hybrid_package),
            "--config", str(a.config), "--inputs", str(step.inputs), "--names", str(step.inputs / "arguments.txt")]
 if a.policy:
     command += ["--policy", a.policy]

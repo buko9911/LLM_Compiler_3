@@ -3,7 +3,7 @@
 2026-09-29. Qwen3 디코드 스텝을 W8A8로 양자화하고, 가중치 GEMV 묶음마다 NPU와
 LPDDR6-PIM 중 어디서 돌릴지 비용 모델로 정해, 두 장치가 한 LP6 메모리를 나눠 쓰는
 program 하나(`program.bin`)로 컴파일한다. NPU 쪽은 `npu-compile`과 같은 tile / place / lower / encode를
-그대로 쓰고, PIM 쪽은 PIM_GEMV 명령을 낸다. NPU 프로그램은 PLENA ISA ver 2.0이다(7절).
+그대로 쓰고, PIM 쪽은 load·compute·store primitive를 직접 낸다. NPU 프로그램은 PLENA ISA ver 2.0이다(7절).
 
 ## 1. 전체 흐름
 
@@ -11,15 +11,15 @@ program 하나(`program.bin`)로 컴파일한다. NPU 쪽은 `npu-compile`과 �
 PyTorch decode step (examples/qwen3: KV 창을 제자리에 쓰는 decode, FP16)
   │ Stage 0  capture.py                         00-imported.mlir + arg<N>.bin
   ▼
-  │ npu-hybrid (tools/npu-hybrid)
+  │ npu-compile --pipeline=graph-hybrid (tools/npu-compile/HybridGraphDriver.cpp)
   │ ① legalizeGraph        정규화 → W8A8 양자화(quantizeGraph) → 검사 → 상수 인자화
   │ ② partitionGraph       GEMV 묶음마다 NPU / PIM 결정 (비용 모델, configs/hybrid.json)
   │ ③ outlinePhases        PIM 묶음을 경계로 NPU 페이즈들로 자름, 페이즈 간 값 = 전역
   │ ④ 전역 DRAM 배치        전역마다 고정 주소, 페이즈 지역 버퍼는 그 위(npu.dram_base)
   │ ⑤ NPU 페이즈마다        tile → place (고정 주소 존중)
-  │ ⑥ PIM 배치              PimLayout: 타일 id, 패킷 주소, 한 페이즈 = 한 rank
+  │ ⑥ PIM 배치              PimLayout: 타일 id, 패킷 주소, 설정에 따른 rank 배분
   │ ⑦ NPU 페이즈마다        lower → 경계 전송(GDMA) 붙이기 → encode (ISA ver 2.0)
-  │ ⑧ linkProgram          NPU 페이즈 레코드 + PIM 레코드(PIM_GEMV)를 program.bin 하나로
+  │ ⑧ linkProgram          NPU 페이즈 레코드 + PIM 레코드(executable primitives)를 program.bin 하나로
   │ ⑨ program.bin, system.json(pim_kernel), lp6.bin(sparse, PIM 가중치 패킷 포함), metadata.json
   ▼
 IESLAB_NPU_Simulator --system-program system.json  (페이즈는 레코드 의존성으로 차례로, LP6 하나를 공유)
@@ -60,8 +60,18 @@ PIM  = max(파티션별 스윕 수) × 16 × 32 × M × nLLD / f_PIM / efficienc
 NPU  = max(가중치 바이트 / lp6_read_gbps, MAC / (cores·32·32·2·f_NPU)) + gemv_fixed × GEMV 수
 ```
 
-를 비교해 `npu.target = "npu" | "pim"`을 붙인다. 파티션은 `concurrent_ranks = false`(기본)면
-한 rank의 두 서브채널이다 — 초안에 rank 간 PIM 연산 규칙이 없기 때문이다.
+를 비교해 `npu.target = "npu" | "pim"`을 붙인다. `concurrent_ranks = false`(현재 기본값)면
+한 phase의 PIM 계산을 한 rank에 배치한다. 현재 4-channel 설정에서는 그 rank의
+8개 서브채널, `*_1ch.json`에서는 2개 서브채널이다.
+
+2026-10-06 정정: 이 기본값은 기존 비교·보정 조건을 보존한 것이며, rank 간 PIM
+규칙이 없기 때문에 반드시 직렬화해야 한다는 뜻이 아니다. 초안 §13.6은 PIMX를
+본 명세의 Meta timing에 연결한다. 현재 WCK always-on/ODT-off 조건의 Table 410은
+rank 간 2 CK를 요구하며 simulator의 공유 CA가 이를 적용한다. 두 rank의 외부 DQ는
+공유한다. `concurrent_ranks=true`의 두-rank 실행도 검증했지만, PIMX→CAS의 TBD와
+입력 공급 코드의 지원 범위는 따로 남아 있다.
+[명세 감사](/home/jongjip/LP6/lp6-pim-main/docs/research/20261006/RANK_OVERLAP_SPEC_REVIEW.md),
+[동일 M4의 두-rank 대조](/home/jongjip/LP6/lp6-pim-main/docs/research/20261006/TWO_RANK_PIM_BASELINE.md).
 
 | 설정 | 뜻 |
 |---|---|
@@ -83,7 +93,7 @@ PIM에 갈 수 있는 묶음: 가중치가 진입 인자이고 K가 256의 배�
 - 페이즈를 건너는 값, 진입 인자, PIM 결과는 **전역**이다. 모든 페이즈가 같은 DRAM 주소로
   부른다(`npu.global`, place가 고정 주소로 존중).
 
-## 5. 페이즈 경계 전송 (tools/npu-hybrid, GDMA 명령)
+## 5. 페이즈 경계 전송 (tools/npu-compile/HybridGraphDriver.cpp, GDMA 명령)
 
 NPU는 PIM을 모른다. 드라이버가 lower 뒤의 명령 목록에 GDMA를 붙인다. 순서는
 encode의 DRAM/L2 frontier가 RAW/WAR/WAW로 잡는다.
@@ -96,18 +106,22 @@ encode의 DRAM/L2 frontier가 RAW/WAR/WAW로 잡는다.
 
 ## 6. PIM 배치 (lib/Target/PimLayout.cpp)
 
-hybrid-compiler의 PimLayout을 옮겼다. lp6-pim-main 런타임 lowering과 같은 규칙이다.
+decode 경로와 공통 `lib/Target/PimLayout.cpp`를 사용한다. lp6-pim-main 런타임 lowering과 같은 규칙이다.
 
 - GEMV_STREAM 하나 = 출력 512행(PU 8 × 누산기 16 × 레인 4) × 입력 256(스윕), K가 길면 스윕 여러 번.
 - 파티션 p = 서브채널 p % C, rank p / C (C = LP6 서브채널 수 `pim.channels`: `configs/hybrid.json` 8 = LPDDR6
   channel 4개, `configs/hybrid_1ch.json` 2). 스트림은 부하가 적은 파티션으로, 한 페이즈는 가중치를 덜 가진 rank 하나의
-  서브채널 전부에서. PIM_GEMV partition 필드는 4 bit(W0 [5:2]), system.json `pim_kernel.subchannels` = C.
+  서브채널 전부에서. primitive partition 필드는 8 bit(W0 [15:8]), system.json `pim_kernel.subchannels` = C.
 - 타일 id는 종류별로 조밀하고, 런타임이 커널 행부터 가중치 행 → 활성값 행 → 출력 행 순으로 놓는다.
 - 주소: rarobacobgch (rank, row, bank, column, bank group, subchannel; 32 B 위).
-- 명령: (토큰, 스트림)마다 PIM_GEMV 1개(2 워드). lp6-pim-main이
-  CLEAR×16, 스윕마다 LOAD_ACT×32 + GEMV_STREAM, STORE×8로 펼친다(예전 레코드 열과 같다).
-- PIM 페이즈 하나 = program.bin 안의 PIM 레코드 하나(그 페이즈의 PIM_GEMV 전부). 커널 위치(kernel row 등)는
+- 최종 IR: `npu::pim::Primitive`. 컴파일러가 CLEAR×16, 스윕마다 LOAD_ACT×8 + GEMV_STREAM, STORE×8을 직접 생성한다.
+  load는 32 B packet마다 한 번이다. `pim_primitives.txt`에 operand와 순서를 출력한다.
+  LOAD_SCALE와 GEMV_TILE도 ABI에 있다. 현재 LLM W8A8 scale 적용은 NPU 후처리다.
+- PIM 페이즈 하나 = program.bin 안의 PIM 레코드 하나(그 페이즈의 primitive 전부). 커널 위치(kernel row 등)는
   system.json `pim_kernel`.
+
+이전 `0x27` PIM_GEMV package는 재컴파일한다. 아래 과거 성능/크기 표는 당시 매크로 형식의 측정 기록이며
+새 primitive 형식의 크기·시간을 나타내지 않는다. 현재 ABI는 [명령 계약](../../lp6-pim-main/docs/compiler/PIM_PRIMITIVES.md)을 따른다.
 
 ## 7. ISA ver 2.0 (lib/Target/IsaV2.cpp, lib/Target/Program.cpp)
 
@@ -116,11 +130,11 @@ ver 1.0 인코딩의 builder stream을 만들고, encode가 ver 2.0으로 바꾼
 
 | 부분 | ver 2.0 |
 |---|---|
-| core block | builder stream 검사(`verifyCore`) 뒤 block마다 lowering. 시뮬레이터 `tools/isa_v2.py`의 C++ 이식(hybrid-compiler와 같은 규칙) |
+| core block | builder stream 검사(`verifyCore`) 뒤 block마다 lowering. 시뮬레이터 `tools/isa_v2.py`의 C++ 이식(decode 경로와 공유) |
 | GDMA | 96비트 레코드(+2-D 확장 2워드). 행이 1 MiB 이상인 연속 전송(NPU 단독 down 패널 1,245,184 B)은 64 B 배수의 같은 행 여러 개로 — 시뮬레이터가 같은 LP6 블록을 같은 순서로 요청한다. strided면 열 조각 레코드 여러 개 |
 | 의존성 | 16비트 backward 거리, 레코드당 255개까지. 넘으면 `BARRIER`가 묶는다 |
 | `CORE_BEGIN` | 2워드(논리 코어, L1/8, 코어 워드 수, 의존성 수). `CORE_END`와 L1 span은 없다 |
-| PIM | PIM 레코드(`0x27`): 대기 목록 + PIM_GEMV 명령(6절) |
+| PIM | PIM 레코드(`0x2e`): 대기 목록 + 가변 길이 primitive(6절), ABI v1 |
 
 층 0 검사: ver 1.0 program과 레코드 단위로 비교해 core body가 `isa_v2.py` lowering과 같고, GDMA가
 같은 바이트를 옮기고, 의존성 집합이 같다. 시뮬레이터의 L2 dump와 코어 4개 L1 dump 전체가 ver 1.0
@@ -202,7 +216,7 @@ $PY examples/qwen3/capture.py --out /path/q36 --layers 36 --head
   --fp16 --reciprocal-division --readback --quantize=w8a8 --inputs <inputs> -o /path/npu
 
 # 하이브리드
-./build/bin/npu-hybrid /path/q1/00-imported.mlir --settings examples/llama/hardware4.toml \
+./build/bin/npu-compile --pipeline=graph-hybrid /path/q1/00-imported.mlir --settings examples/llama/hardware4.toml \
   --config configs/hybrid.json --inputs <inputs> -o /path/hybrid [--policy npu|pim] [--map mlp.down=npu]
 
 # 입력 준비 + 둘 다 실행 + 바이트 비교 + 사이클
@@ -218,7 +232,7 @@ $PY examples/qwen3/hybrid.py --capture /path/q36 --out /path/run36 --split-every
 
 | 검사 | 내용 |
 |---|---|
-| ctest `npu-hybrid` | GEMV 두 개 그래프: NPU 단독 = numpy W8A8 오라클, 하이브리드 = NPU 단독 (바이트) |
+| ctest `npu-compile --pipeline=graph-hybrid` | GEMV 두 개 그래프: NPU 단독 = numpy W8A8 오라클, 하이브리드 = NPU 단독 (바이트) |
 | `examples/qwen3/hybrid.py` | 실제 Qwen3-4B 층: 하이브리드 = NPU 단독 (바이트), PyTorch 기준 대비 오차 |
 | `examples/qwen3/verify.py` | NPU 단독 FP16 / W8A8 vs PyTorch |
 
@@ -270,7 +284,7 @@ NPU 단독은 `npu-compile --quantize=w8a8`. 모든 M에서 출력 3개(x, new_k
 | 8 | 13.029 ms (1.810 + 11.219) | 8.244 ms | 1.58배 느림 |
 | 16 | 26.401 ms (3.625 + 22.776) | 10.044 ms | 2.63배 느림 |
 
-- PIM 시간은 토큰마다 약 1.40 ms로 M에 비례한다(PIM_GEMV가 토큰마다 가중치를 다시 읽는다).
+- PIM 시간은 토큰마다 약 1.40 ms로 M에 비례한다(PIM GEMV가 토큰마다 가중치를 다시 읽는다).
 - NPU 단독은 가중치를 한 번 읽어 M개 토큰이 나눠 쓴다. M 1 → 16에서 1.68배.
 - 교차점: M = 4와 8 사이 직선 보간으로 약 4.5.
 - M ≥ 8은 프롬프트가 M보다 길어야 해서 다른 프롬프트로 돌렸다. M = 4를 두 프롬프트로 돌린 사이클이 같다

@@ -37,6 +37,7 @@ include_directories("${PROJECT_SOURCE_DIR}/include" "${PROJECT_BINARY_DIR}/inclu
 add_definitions(${LLVM_DEFINITIONS})
 
 add_subdirectory(include/npu)
+add_subdirectory(include/npu/Decode)
 add_subdirectory(lib)
 add_subdirectory(tools)
 
@@ -44,4 +45,5 @@ include(CTest)
 if(BUILD_TESTING)
   add_subdirectory(unittests)
   add_subdirectory(test)
+  add_subdirectory(test/Decode)
 endif()

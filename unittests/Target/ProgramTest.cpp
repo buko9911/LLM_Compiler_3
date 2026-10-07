@@ -198,10 +198,9 @@ TEST(Program, LinkedPhasesRunInOrder) {
   npu::Program second{1, 64, 128, 128, {load(0), core({{M::L2, 0, 64, false}})}};
   auto a = npu::encodeProgram(first), b = npu::encodeProgram(second);
   ASSERT_TRUE(bool(a) && bool(b));
-  auto gemv = npu::isa2::pimGemv(0, 1, 0, 0, 0);
-  ASSERT_TRUE(bool(gemv));
+  npu::pim::Primitive clear; clear.accumulator = 0;
   auto linked = npu::linkProgram({{"npu0", wordsOf(a.value), {}},
-                                  {"pim0", {}, {gemv.value.first, gemv.value.second}},
+                                  {"pim0", {}, {clear}},
                                   {"npu1", wordsOf(b.value), {}}});
   ASSERT_TRUE(bool(linked)) << linked.error;
   const auto &w = linked.value.words;
@@ -214,15 +213,18 @@ TEST(Program, LinkedPhasesRunInOrder) {
   at += 6;
   EXPECT_EQ(slice(at, 2), npu::isa2::barrierRecord(2, {0, 1}));                        // phase 0 ends
   at += 2;
-  const uint32_t commands[] = {gemv.value.first, gemv.value.second};
-  EXPECT_EQ(slice(at, 4), npu::isa2::pimRecord(3, {2}, commands, 1));                  // after phase 0
-  at += 4;
+  const size_t pimWords = 4;
+  EXPECT_EQ(slice(at, pimWords), npu::isa2::pimRecord(3, {2}, &clear, 1).value);
+  at += pimWords;
   EXPECT_EQ(slice(at, 4), npu::isa2::gdmaRecord(true, 4, {3}, 0, 0, 64, 1, 64, 64));   // after the PIM phase
   at += 4;
   EXPECT_EQ(w[at + 1] >> 24, 1u);                                                      // the block keeps its load
   EXPECT_EQ(w[at + 2], 1u);
   EXPECT_TRUE(bool(npu::verifyProgramWords(w)));
-  EXPECT_FALSE(bool(npu::linkProgram({{"pim0", {}, {1}}})));                           // half a PIM_GEMV
+  npu::pim::Primitive missingAccumulator;
+  EXPECT_FALSE(bool(npu::linkProgram({{"pim0", {}, {missingAccumulator}}})));
+  auto old = w; old[13] = 0x27 | 1u << 6 | 1u << 14;
+  EXPECT_FALSE(bool(npu::verifyProgramWords(old))); // retired macro fails, never misdecoded
 }
 TEST(Program, RectangularHazardsMatchBytewiseOracle) {
   using M = npu::MemorySpace;
