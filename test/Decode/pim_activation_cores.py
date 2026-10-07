@@ -173,8 +173,9 @@ def main():
     assert previous["provenance_before"][str(library)] == sha(library), "baseline used another DRAM simulator"
     logs = out / "logs"; logs.mkdir()
     tracked = [args.compiler.resolve(), args.emulator.resolve(), library, args.settings.resolve(), Path(__file__).resolve(),
-               ROOT / "lib/Decode/Target/NPU/NpuCodegen.cpp", ROOT / "include/npu/Decode/Target/NpuCodegen.h",
-               ROOT / "lib/Decode/Driver.cpp", manifest, source, frontend, target,
+               ROOT / "lib/Decode/Target/NPU/NpuCodegen.cpp", ROOT / "lib/Decode/Target/NPU/CodegenImpl.h",
+               ROOT / "lib/Decode/Target/NPU/CodegenPim.cpp", ROOT / "include/npu/Decode/Target/NpuCodegen.h",
+               ROOT / "lib/Decode/Driver.cpp", ROOT / "lib/Decode/DriverProgram.cpp", manifest, source, frontend, target,
                old / "program.bin", old / "lp6.bin", baseline / "reference.npz"]
     before = {str(p): sha(p) for p in tracked}
     snapshots = out / "source_snapshot"; snapshots.mkdir()

@@ -123,7 +123,8 @@ def native(args):
         reference = EVIDENCE / "intraop_output_split_rank_v1/reference.npz"
     tracked = [args.compiler, args.emulator, args.library, args.settings, args.dram_config,
                Path(__file__), ROOT / "test/Decode/pim_activation_cores.py",
-               ROOT / "lib/Decode/Target/NPU/NpuCodegen.cpp", source, manifest, target, reference]
+               ROOT / "lib/Decode/Target/NPU/NpuCodegen.cpp", ROOT / "lib/Decode/Target/NPU/CodegenPim.cpp",
+               source, manifest, target, reference]
     model = Path(json.loads(manifest.read_text())["model"])
     tracked += sorted(model.glob("*.safetensors")) if model.is_dir() else [model]
     before_path = out / f"native_{args.case}_provenance_before.json"
