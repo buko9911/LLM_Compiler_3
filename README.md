@@ -1,7 +1,7 @@
 # LLM_Compiler_3
 
-코드 읽기·수정의 출발점은 [compiler 개발자 가이드](../lp6-pim-main/docs/developer/README.md#compiler-source-map)다.
-함수별 책임·실제 호출 경로·입출력 계약과 [리팩토링 계획](../lp6-pim-main/docs/developer/README.md#refactor-plan)을 설명한다.
+코드 읽기·수정의 출발점은 [개발자 가이드](../../docs/DEVELOPER_GUIDE.md#compiler-source-map)다.
+함수별 책임·실제 호출 경로·입출력 계약과 [리팩토링·검증 기준](../../docs/DEVELOPER_GUIDE.md#refactor-plan)을 설명한다.
 
 현재 LP6의 컴파일러 소스·빌드 진입점은 **이 저장소 하나**다. 별도 `hybrid-compiler` 저장소의
 Llama/Qwen decode 기능과 2026-10-01 L2/prefetch 수정은 이곳의 `lib/Decode`로 통합했다.
@@ -18,9 +18,10 @@ Llama/Qwen decode 기능과 2026-10-01 L2/prefetch 수정은 이곳의 `lib/Deco
 explicit KV/L1 collect 계약이 달라 상위 lowering은 구분한다. 기존 일반 matmul·attention 지원을
 삭제해서 하나처럼 만들지 않았다. 최신 Llama 성능 수치는 decode 경로에서 검증한 결과다.
 
-[decode 설계·최적화](docs/DECODE.md), [빌드와 재현](../lp6-pim-main/docs/simulator/BUILD_AND_RUN.md),
-[통합·삭제 내역](../lp6-pim-main/docs/history/20261001/CONSOLIDATION.md)을 따른다.
-실험 산출물은 `experiments/`, 현재 실행 바이너리는 `build/bin/`에 둔다.
+[compiler 구조·decode 설계](../../docs/architecture/COMPILER.md), [빌드와 재현](../../docs/BUILD_AND_RUN.md),
+[통합·정리 이력](../../docs/HISTORY.md)을 따른다. 문서는 LP6 workspace의 `docs/`에 모았다.
+실행 바이너리는 `build/bin/`, 과거 실험 산출물은 workspace의 `archive/experiments/`에 둔다.
+`runtime/workspace.py`가 형제 simulator(`../simulator/npu`, `../simulator/dram-pim`) 경로를 한 곳에서 정한다.
 
 NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main에 맞춘 판이다. 타깃은 PLENA ISA ver 2.0이다
 (2026-09-29부터, 그 전은 ver 1.0).
@@ -28,7 +29,7 @@ NPU용 MLIR 컴파일러. LLM_Compiler_2를 NPU_Simulator main에 맞춘 판이�
 > 원본: [Jh-Jang98/LLM_Compiler](https://github.com/Jh-Jang98/LLM_Compiler) (LLM_Compiler_2, Jh-Jang98 작성).
 > 이 저장소는 원작자의 허락을 받아 그 코드를 바탕으로 수정한 것이다.
 > 짝을 이루는 시뮬레이터: [buko9911/PLENA_Simulator](https://github.com/buko9911/PLENA_Simulator)
-전체 설계는 [docs/DESIGN.md](docs/DESIGN.md)에 있다(LLM_Compiler_2 기준 문서이며, LLM_Compiler_3에서 달라진 점은 아래 절에 적는다).
+전체 설계는 [compiler 구조 문서](../../docs/architecture/COMPILER.md)에 있다(LLM_Compiler_2 기준 설계와 LLM_Compiler_3에서 달라진 점을 구분한다).
 
 PyTorch 모델을 캡처한 정적 tensor/linalg 그래프, 또는 손으로 쓴 타깃 IR에서
 Unified Program (ISA ver 2.0) 패키지(`program.bin`, `system.json`, `hbm.bin`)를 만들고,
@@ -40,7 +41,7 @@ matmul·elementwise·리덕션·전치·ReLU와 캡처한 Llama 디코더 층을
 **브랜치 `jongjip/PIM-hybrid`**: Qwen3 디코드 스텝(`examples/qwen3`), W8A8 양자화(`--quantize=w8a8`,
 INT8 MMA·양자화·역양자화 lowering), 그리고 가중치 GEMV 묶음을 비용 모델로 NPU와 LPDDR6-PIM에
 나눠 싣는 `npu-compile --pipeline=graph-hybrid` 경로(NPU/PIM 레코드가 들어간 단일 프로그램)를 더했다.
-설계·사용법·결과는 [docs/HYBRID.md](docs/HYBRID.md)에 있다.
+설계·사용법·결과는 [compiler 구조 문서의 graph-hybrid 절](../../docs/architecture/COMPILER.md)에 있다.
 
 ## LLM_Compiler_2 에서 달라진 점
 
@@ -253,6 +254,7 @@ placed IR을 위에서부터 읽으며 명령을 만든다. 이 단계는 전부
 
 LLVM/MLIR은 torch-mlir의 llvm-project로 빌드한 것을 쓴다. CMake 3.24 이상, Ninja,
 Python 3, `llvm-lit`, `FileCheck`, GoogleTest가 필요하다.
+아래는 일반적인 형태다. LP6 서버의 toolchain 경로를 쓴 실제 명령은 [빌드·실행](../../docs/BUILD_AND_RUN.md)에 있다.
 
 ```sh
 cmake -S . -B build -G Ninja \
@@ -265,8 +267,8 @@ cmake -S . -B build -G Ninja \
 cmake --build build
 ```
 
-시뮬레이터(NPU_Simulator main)는 lp6-pim-simulator의 `libdramsim3.so`를 링크하므로
-빌드와 실행 모두 `export LP6_DRAMSIM3_ROOT=$HOME/lp6-pim-simulator`가 필요하다.
+시뮬레이터(NPU_Simulator main)는 DRAM/PIM backend의 `libdramsim3.so`를 링크한다. LP6 workspace에서는
+`core/simulator/dram-pim`이 기본 경로이고, 다른 위치를 쓰려면 `export LP6_DRAMSIM3_ROOT=<dram-pim 경로>`를 지정한다.
 
 ```sh
 cd $HOME/NPU_Simulator/transactional_emulator && cargo build --release
@@ -291,7 +293,7 @@ ctest --test-dir build --output-on-failure
 ## PyTorch 모델 → ISA → 시뮬레이터
 
 ```sh
-export LP6_DRAMSIM3_ROOT=$HOME/lp6-pim-simulator
+export LP6_DRAMSIM3_ROOT=/home/jongjip/LP6/core/simulator/dram-pim
 # Linear → ReLU → Linear
 $HOME/venvs/npu-capture/bin/python examples/pytorch/mlp.py --out /tmp/mlp
 # Llama-3.1-8B 디코더 층 하나(무작위 가중치)
