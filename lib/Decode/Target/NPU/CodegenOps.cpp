@@ -29,6 +29,11 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
       return scatterPimActParallel(*s0, *d0, err);
     return scatterPimAct(*s0, *d0, err);
   }
+  if (s0->layout != "dense" || d0->layout != "dense") {
+    err = "copy " + (s0->layout != "dense" ? "from a " + s0->layout : "to a " + d0->layout) +
+          " LP6 buffer: PIM layouts are only gathered from (pim_out) or scattered to (pim_act)";
+    return failure();
+  }
   View s = *s0, d = *d0;
   if (!perm.empty()) {    // linalg.transpose: dst dim i = src dim perm[i]
     View p = s;

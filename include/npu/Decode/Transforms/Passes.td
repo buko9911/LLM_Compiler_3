@@ -123,6 +123,19 @@ def HybNpuTile : Pass<"hyb-npu-tile", "ModuleOp"> {
   let dependentDialects = ["scf::SCFDialect", "tensor::TensorDialect", "affine::AffineDialect", "arith::ArithDialect"];
 }
 
+def HybPrivatePhaseResults : Pass<"hyb-private-phase-results", "ModuleOp"> {
+  let summary = "Give NPU phase results that a PIM phase reads a tensor.empty of their own";
+  let description = [{
+    CSE merges equal tensor.empty ops, so an NPU phase result and a value used only inside the
+    phase can share one destination; bufferization then puts both in the same buffer, the
+    phase's LP6 output. When a PIM phase reads that result, hyb-plan-lp6 lays the buffer out as
+    PIM activation packets while the NPU still reads the in-phase value as dense data. For such
+    results, follows the returned value back through destination operands, loop inits and
+    reshapes to its tensor.empty and gives it a private copy when the empty has other uses.
+    Results that stay dense are left alone. Runs right before one-shot-bufferize.
+  }];
+}
+
 def HybPlanLP6 : Pass<"hyb-plan-lp6", "ModuleOp"> {
   let summary = "Assign LP6 addresses and layouts to every buffer that crosses a phase";
   let description = [{

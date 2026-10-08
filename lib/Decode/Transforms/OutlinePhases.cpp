@@ -1,18 +1,24 @@
-//===- OutlinePhases.cpp - hyb-outline-phases ------------------------------===//
+//===- OutlinePhases.cpp - hyb-outline-phases, hyb-private-phase-results ----===//
 //
 // The decode step runs as a sequence of phases: a PIM phase is one group of qmatmuls with
 // target = pim (one PIM submission), an NPU phase a maximal run of the other ops. Every phase
 // is outlined into a private function tagged `hyb.phase`, and the step function becomes the
 // list of calls. Constants and tensor.empty are cloned into each phase that uses them.
+// Before bufferization, every NPU phase result read by a PIM phase gets a destination of its
+// own, so its PIM-layout LP6 buffer never also holds a value used only inside the phase.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/Passes.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/LoopLikeInterface.h"
 #include "llvm/ADT/SetVector.h"
 #include <functional>
 
 namespace mlir::hybrid {
 #define GEN_PASS_DEF_HYBOUTLINEPHASES
+#define GEN_PASS_DEF_HYBPRIVATEPHASERESULTS
 #include "npu/Decode/Transforms/Passes.h.inc"
 } // namespace mlir::hybrid
 
@@ -172,6 +178,58 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
       if (isFree(&op)) dead.push_back(&op);
     for (Operation *op : llvm::reverse(dead))
       if (op->use_empty()) op->erase();
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// hyb-private-phase-results
+//===----------------------------------------------------------------------===//
+
+/// The operand through which `v` is computed into a tensor.empty, following destination
+/// operands, loop inits and reshapes; null when the chain starts elsewhere.
+OpOperand *emptyDestination(Value v) {
+  while (auto r = dyn_cast<OpResult>(v)) {
+    Operation *op = r.getOwner();
+    OpOperand *tied = nullptr;
+    if (auto dps = dyn_cast<DestinationStyleOpInterface>(op)) tied = dps.getTiedOpOperand(r);
+    else if (auto forall = dyn_cast<scf::ForallOp>(op)) tied = forall.getTiedOpOperand(r);
+    else if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) tied = loop.getTiedLoopInit(r);
+    else if (isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp, tensor::CastOp>(op)) tied = &op->getOpOperand(0);
+    if (!tied) return nullptr;
+    if (tied->get().getDefiningOp<tensor::EmptyOp>()) return tied;
+    v = tied->get();
+  }
+  return nullptr;
+}
+
+bool isPhase(func::FuncOp fn, StringRef kind) {
+  auto k = fn ? fn->getAttrOfType<StringAttr>(kPhase) : StringAttr();
+  return k && k.getValue() == kind;
+}
+
+struct HybPrivatePhaseResultsPass
+    : mlir::hybrid::impl::HybPrivatePhaseResultsBase<HybPrivatePhaseResultsPass> {
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    SymbolTable symbols(module);
+    getStepFunction(module).walk([&](func::CallOp call) {
+      auto fn = symbols.lookup<func::FuncOp>(call.getCallee());
+      if (!isPhase(fn, "npu")) return;
+      auto ret = cast<func::ReturnOp>(fn.getBody().front().getTerminator());
+      for (OpResult r : call.getResults()) {
+        bool toPim = llvm::any_of(r.getUsers(), [&](Operation *user) {
+          auto use = dyn_cast<func::CallOp>(user);
+          return use && isPhase(symbols.lookup<func::FuncOp>(use.getCallee()), "pim");
+        });
+        OpOperand *dest = toPim ? emptyDestination(ret.getOperand(r.getResultNumber())) : nullptr;
+        if (!dest) continue;
+        auto empty = dest->get().getDefiningOp<tensor::EmptyOp>();
+        if (empty->hasOneUse()) continue;
+        OpBuilder b(empty);
+        b.setInsertionPointAfter(empty);
+        dest->set(b.clone(*empty.getOperation())->getResult(0));
+      }
+    });
   }
 };
 } // namespace

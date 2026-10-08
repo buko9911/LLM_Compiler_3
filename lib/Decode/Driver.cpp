@@ -180,6 +180,7 @@ int compileDecode(int argc, char **argv) {
       "canonicalize),hyb-storage-f16,func.func(hyb-group-linear),hyb-partition{spec=" + specFile + " report=" +
       outDir + "/partition.json" + (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "}," +
       "func.func(hyb-lower-npu-gemv),hyb-outline-phases,canonicalize,hyb-npu-tile{spec=" + specFile + "},cse,canonicalize,"
+      "hyb-private-phase-results,"
       "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
       "buffer-results-to-out-params{hoist-static-allocs},canonicalize,cse,hyb-plan-lp6{spec=" + specFile +
       " bankset-pingpong=" + std::to_string(banksetPingPong) + "},"
