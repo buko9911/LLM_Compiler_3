@@ -138,7 +138,8 @@ TEST(Program, RejectsCorruptedProgramAndTruncation) {
     words.push_back(w);
   }
   ASSERT_TRUE(bool(npu::verifyProgramWords(words)));
-  auto corrupt = words; corrupt[23] = 0x1; // core instruction after the L1 span
+  // Header (5 words) and CORE_BEGIN (2 words): word 7 is the first core instruction.
+  auto corrupt = words; corrupt[7] = 0x1;
   EXPECT_FALSE(bool(npu::verifyProgramWords(corrupt)));
   for (size_t size = 0; size < words.size(); ++size) {
     auto shortWords = std::vector<uint32_t>(words.begin(),words.begin()+size);

@@ -1,7 +1,8 @@
 //===----------------------------------------------------------------------===//
 // Passes.cpp — the compiler stages as MLIR passes
 //
-// Each stage function (legalizeGraph, tileGraph, placeGraph, lowerPlacedGraph)
+// Each stage function (legalizeGraph, tileGraph, placeGraph, lowerToHardwareOps,
+// emitTarget)
 // keeps its implementation; this file gives it a Pass so the driver and
 // npu-opt schedule it with mlir::PassManager.
 //===----------------------------------------------------------------------===//
@@ -81,6 +82,9 @@ public:
                                   llvm::cl::desc("lower a/b as a * (1/b)"), llvm::cl::init(false)};
   Option<bool> readback{*this, "readback", llvm::cl::desc("copy outputs back into L2 at the end"),
                         llvm::cl::init(false)};
+  Option<bool> dramIntermediates{*this, "dram-intermediates",
+                                 llvm::cl::desc("keep intermediate tensors in DRAM instead of L2"),
+                                 llvm::cl::init(false)};
   void runOnOperation() override {
     auto *hw = resolve();
     if (!hw) return signalPassFailure();
@@ -91,6 +95,7 @@ public:
     if (fp16) module->setAttr("npu.numerical", StringAttr::get(context, "fp16"));
     if (reciprocalDivision) module->setAttr("npu.division", StringAttr::get(context, "reciprocal"));
     if (readback) module->setAttr("npu.readback", UnitAttr::get(context));
+    if (dramIntermediates) module->setAttr("npu.dram_intermediates", UnitAttr::get(context));
   }
 };
 
@@ -130,7 +135,7 @@ public:
   StringRef getArgument() const final { return "npu-place"; }
   StringRef getName() const override { return "npu-place"; }
   StringRef getDescription() const final {
-    return "Bufferize, compute buffer liveness and assign addresses (Stage 3)";
+    return "Bufferize and decide each buffer's memory space; FlashAttention state in L2 (Stage 3)";
   }
   void runOnOperation() override {
     auto *hw = resolve();
@@ -138,17 +143,62 @@ public:
   }
 };
 
-class LowerPass : public PassWrapper<LowerPass, OperationPass<ModuleOp>> {
+class HardwareOpsPass : public PassWrapper<HardwareOpsPass, OperationPass<ModuleOp>> {
 public:
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(LowerPass)
-  StringRef getArgument() const final { return "npu-lower"; }
-  StringRef getName() const override { return "npu-lower"; }
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(HardwareOpsPass)
+  StringRef getArgument() const final { return "npu-hw-ops"; }
+  StringRef getName() const override { return "npu-hw-ops"; }
   StringRef getDescription() const final {
-    return "Lower a placed graph to npu.core_block and npu.dma target IR (Stage 4)";
+    return "Rewrite placed linalg ops as NPU hardware ops: npu.mma, npu.acc_writeout, "
+           "npu.local_copy/global_copy, scf.forall mapped to #npu.core (Stage 4)";
   }
   void getDependentDialects(DialectRegistry &registry) const override { dependOnPipeline(registry); }
   void runOnOperation() override {
-    if (failed(lowerPlacedGraph(getOperation()))) signalPassFailure();
+    if (failed(lowerToHardwareOps(getOperation()))) signalPassFailure();
+  }
+};
+
+class PipelineAttentionPass : public PassWrapper<PipelineAttentionPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PipelineAttentionPass)
+  StringRef getArgument() const final { return "npu-pipeline-attention"; }
+  StringRef getName() const override { return "npu-pipeline-attention"; }
+  StringRef getDescription() const final {
+    return "Software-pipeline FlashAttention KV loops: QK of block j+1 beside softmax of "
+           "block j, with per-block buffers (Stage 4b)";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override { dependOnPipeline(registry); }
+  void runOnOperation() override {
+    if (failed(pipelineFlashAttention(getOperation()))) signalPassFailure();
+  }
+};
+
+class AssignAddressesPass : public HardwarePass<AssignAddressesPass> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(AssignAddressesPass)
+  using HardwarePass::HardwarePass;
+  StringRef getArgument() const final { return "npu-assign-addresses"; }
+  StringRef getName() const override { return "npu-assign-addresses"; }
+  StringRef getDescription() const final {
+    return "Compute buffer liveness and assign physical L1/L2/DRAM addresses (Stage 4b)";
+  }
+  void runOnOperation() override {
+    auto *hw = resolve();
+    if (!hw || failed(assignAddresses(getOperation(), *hw))) signalPassFailure();
+  }
+};
+
+class EmitPass : public PassWrapper<EmitPass, OperationPass<ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EmitPass)
+  StringRef getArgument() const final { return "npu-emit"; }
+  StringRef getName() const override { return "npu-emit"; }
+  StringRef getDescription() const final {
+    return "Unroll the hardware-op IR into npu.core_block and npu.dma target IR (Stage 5)";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override { dependOnPipeline(registry); }
+  void runOnOperation() override {
+    if (failed(emitTarget(getOperation()))) signalPassFailure();
   }
 };
 
@@ -160,6 +210,9 @@ struct PipelineOptions : PassPipelineOptions<PipelineOptions> {
                                   llvm::cl::desc("lower a/b as a * (1/b)"), llvm::cl::init(false)};
   Option<bool> readback{*this, "readback", llvm::cl::desc("copy outputs back into L2 at the end"),
                         llvm::cl::init(false)};
+  Option<bool> dramIntermediates{*this, "dram-intermediates",
+                                 llvm::cl::desc("keep intermediate tensors in DRAM instead of L2"),
+                                 llvm::cl::init(false)};
 };
 
 template <typename P>
@@ -177,14 +230,22 @@ std::unique_ptr<Pass> createTilePass(HardwareConfig hardware) {
 std::unique_ptr<Pass> createPlacePass(HardwareConfig hardware) {
   return std::make_unique<PlacePass>(std::move(hardware));
 }
-std::unique_ptr<Pass> createLowerPass() { return std::make_unique<LowerPass>(); }
+std::unique_ptr<Pass> createHardwareOpsPass() { return std::make_unique<HardwareOpsPass>(); }
+std::unique_ptr<Pass> createPipelineAttentionPass() { return std::make_unique<PipelineAttentionPass>(); }
+std::unique_ptr<Pass> createAssignAddressesPass(HardwareConfig hardware) {
+  return std::make_unique<AssignAddressesPass>(std::move(hardware));
+}
+std::unique_ptr<Pass> createEmitPass() { return std::make_unique<EmitPass>(); }
 
 void registerPasses() {
   PassRegistration<AttachHardwarePass>();
   PassRegistration<LegalizePass>();
   PassRegistration<TilePass>();
   PassRegistration<PlacePass>();
-  PassRegistration<LowerPass>();
+  PassRegistration<HardwareOpsPass>();
+  PassRegistration<PipelineAttentionPass>();
+  PassRegistration<AssignAddressesPass>();
+  PassRegistration<EmitPass>();
   registerPass([] { return createEncodePass(); });
   // The whole of npu-compile --from=graph, minus writing the package files.
   PassPipelineRegistration<PipelineOptions>(
@@ -194,11 +255,15 @@ void registerPasses() {
         attach->fp16 = options.fp16;
         attach->reciprocalDivision = options.reciprocalDivision;
         attach->readback = options.readback;
+        attach->dramIntermediates = options.dramIntermediates;
         pm.addPass(std::move(attach));
         pm.addPass(createLegalizePass());
         pm.addPass(withSettings<TilePass>(options.settings));
         pm.addPass(withSettings<PlacePass>(options.settings));
-        pm.addPass(createLowerPass());
+        pm.addPass(createHardwareOpsPass());
+        pm.addPass(createPipelineAttentionPass());
+        pm.addPass(withSettings<AssignAddressesPass>(options.settings));
+        pm.addPass(createEmitPass());
         pm.addPass(createEncodePass());
       });
 }

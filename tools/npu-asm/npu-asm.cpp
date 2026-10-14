@@ -1,22 +1,26 @@
 #include "npu/Target/ISA.h"
+#include "npu/Target/ISAv2.h"
 #include <fstream>
 #include <iostream>
 #include <iterator>
 
 int main(int argc, char **argv) {
-  bool decode = false;
+  bool decode = false, isa2 = false;
   std::string input = "-", output = "-";
   bool haveInput = false;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
     if (arg == "--help") {
-      std::cout << "usage: npu-asm [--disassemble] [input|-] [-o output|-]\n"
-                   "Core ISA ver 1.0 only: numeric register indices; .mem contains one 32-bit word per line.\n"
+      std::cout << "usage: npu-asm [--disassemble | --isa2] [input|-] [-o output|-]\n"
+                   "Core builder stream in the ISA ver 1.0 encodings: numeric register indices;\n"
+                   ".mem contains one 32-bit word per line. --isa2 assembles one core block and\n"
+                   "prints the ISA ver 2.0 words the encoder emits for it (what the simulator runs).\n"
                    "Matrix loads/writeouts are four-word records (register, rows, columns, stride_bytes);\n"
                    "M_MMA_* takes INIT or ACC.\n";
       return 0;
     }
     if (arg == "--disassemble") decode = true;
+    else if (arg == "--isa2") isa2 = true;
     else if (arg == "-o" && i + 1 < argc) output = argv[++i];
     else if (!haveInput && !arg.empty() && (arg == "-" || arg.front() != '-')) { input = arg; haveInput = true; }
     else { std::cerr << "invalid argument: " << arg << '\n'; return 2; }
@@ -32,6 +36,11 @@ int main(int argc, char **argv) {
     auto records = npu::splitRecords(words.value);
     if (!records) { std::cerr << records.error << '\n'; return 1; }
     for (const auto &r : records.value) result += npu::disassembleRecord(r.data(), r.size()).value + "\n";
+  }
+  else if (isa2) {
+    auto lowered = npu::isa2::lowerCoreBlock(words.value);
+    if (!lowered) { std::cerr << lowered.error << '\n'; return 1; }
+    result = npu::formatMem(lowered.value);
   }
   else result = npu::formatMem(words.value);
   if (output == "-") { std::cout << result; return std::cout ? 0 : 1; }

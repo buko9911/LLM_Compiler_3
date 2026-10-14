@@ -49,7 +49,7 @@ def pack(manifest, arguments, tensors):
 
 def main():
     parser = argparse.ArgumentParser()
-    for name in ("compiler", "emulator", "settings", "source", "graph", "softmax", "loop", "attention", "carry", "flash", "divide", "constant", "transpose", "layer", "out"):
+    for name in ("compiler", "emulator", "settings", "source", "graph", "softmax", "loop", "attention", "carry", "flash", "flash8", "flash_d64", "divide", "constant", "transpose", "layer", "out"):
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
     out = args.out.resolve()
@@ -165,30 +165,36 @@ def main():
                                   err_msg="loop-carried accumulation is not bit-exact")
 
     # The same FlashAttention, written as ordinary linalg and scf.for with no
-    # dedicated operation, lowered by the general paths.
-    flash = out / "flash"
-    subprocess.run([str(args.compiler), "--from=graph", "--fp16", "--readback", str(args.flash),
-                    "--settings", str(args.settings), "-o", str(flash)], check=True)
-    manifest = json.loads((flash / "metadata.json").read_text())
-    arguments = sorted(manifest["arguments"], key=lambda d: d["index"])
-    result = manifest["outputs"][0]
-    br, kv = 32, 64
-    queries = grid(br * br, 7, br, br)
-    keys = grid(br * kv, 3, br, kv)
-    values = grid(kv * br, 5, kv, br)
-    # m starts at a finite floor, not -inf: the rescale derives its zero as m - m.
-    initial = [queries, keys, values, torch.full((br,), -65504.0),
-               torch.zeros(br), torch.zeros(br, br).half()]
-    image = bytearray(manifest["dram_bytes"])
-    for descriptor, tensor in zip(arguments, initial):
-        kind = "<f4" if descriptor["dtype"] == "float32" else "<f2"
-        raw = tensor.numpy().astype(kind).tobytes()
-        image[descriptor["address"]:descriptor["address"] + len(raw)] = raw
-    (flash / "hbm.bin").write_bytes(bytes(image))
-    actual = simulate(flash, emulator, settings, result["address"], br, br).astype("f4")
-    reference = (torch.softmax(queries.float() @ keys.float(), dim=1) @ values.float()).numpy().astype("f4")
-    flash_error = float(np.abs(actual - reference).max())
-    assert flash_error < 5e-3, f"lowered FlashAttention differs from dense attention by {flash_error}"
+    # dedicated operation, lowered by the general paths. Two KV lengths: the
+    # eight-block one runs the software-pipelined steady state several times.
+    flash_errors = []
+    for name, source, kv, head in (("flash", args.flash, 64, 32), ("flash8", args.flash8, 256, 32),
+                                   ("flash_d64", args.flash_d64, 128, 64)):
+        flash = out / name
+        subprocess.run([str(args.compiler), "--from=graph", "--fp16", "--readback", str(source),
+                        "--settings", str(args.settings), "-o", str(flash)], check=True)
+        manifest = json.loads((flash / "metadata.json").read_text())
+        arguments = sorted(manifest["arguments"], key=lambda d: d["index"])
+        result = manifest["outputs"][0]
+        br = 32
+        queries = grid(br * head, 7, br, head)
+        keys = grid(head * kv, 3, head, kv)
+        values = grid(kv * head, 5, kv, head)
+        # m starts at a finite floor, not -inf: the rescale derives its zero as m - m.
+        initial = [queries, keys, values, torch.full((br,), -65504.0),
+                   torch.zeros(br), torch.zeros(br, head).half()]
+        image = bytearray(manifest["dram_bytes"])
+        for descriptor, tensor in zip(arguments, initial):
+            kind = "<f4" if descriptor["dtype"] == "float32" else "<f2"
+            raw = tensor.numpy().astype(kind).tobytes()
+            image[descriptor["address"]:descriptor["address"] + len(raw)] = raw
+        (flash / "hbm.bin").write_bytes(bytes(image))
+        actual = simulate(flash, emulator, settings, result["address"], br, head).astype("f4")
+        reference = (torch.softmax(queries.float() @ keys.float(), dim=1) @ values.float()).numpy().astype("f4")
+        case_error = float(np.abs(actual - reference).max())
+        assert case_error < 5e-3, f"lowered FlashAttention ({kv} keys) differs from dense attention by {case_error}"
+        flash_errors.append(case_error)
+    flash_error = max(flash_errors)
 
     # a/b as a reciprocal and a product, behind its own opt-in.
     divide = out / "divide"

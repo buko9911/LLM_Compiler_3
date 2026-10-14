@@ -672,17 +672,23 @@ LogicalResult pretransposeWeights(OpBuilder &b, ModuleOp m) {
   SmallVector<int64_t> indices;
   for (auto arg : function.getArguments()) {
     auto type = dyn_cast<RankedTensorType>(arg.getType());
-    if (!type || type.getRank() != 2 || !type.hasStaticShape() || arg.use_empty()) continue;
+    if (!type || type.getRank() < 2 || !type.hasStaticShape() || arg.use_empty()) continue;
+    // 마지막 두 축만 바꾸는 순열이다. rank 2 면 [1,0], 어텐션 키 [h,n,d] 면 [0,2,1].
+    const int64_t rank = type.getRank();
+    SmallVector<int64_t> swapped;
+    for (int64_t i = 0; i < rank; ++i) swapped.push_back(i);
+    std::swap(swapped[rank - 1], swapped[rank - 2]);
     SmallVector<linalg::TransposeOp> users;
     for (auto *user : arg.getUsers()) {
       auto t = dyn_cast<linalg::TransposeOp>(user);
       // 다른 독자가 하나라도 있으면 전치 안 된 바이트가 여전히 필요하다는 뜻이다.
-      if (!t || t.getPermutation() != ArrayRef<int64_t>{1, 0}) { users.clear(); break; }
+      if (!t || t.getPermutation() != ArrayRef<int64_t>(swapped)) { users.clear(); break; }
       users.push_back(t);
     }
     if (users.empty()) continue;
-    arg.setType(RankedTensorType::get({type.getDimSize(1), type.getDimSize(0)},
-                                      type.getElementType()));
+    SmallVector<int64_t> shape(type.getShape());
+    std::swap(shape[rank - 1], shape[rank - 2]);
+    arg.setType(RankedTensorType::get(shape, type.getElementType()));
     for (auto t : users) { t->getResult(0).replaceAllUsesWith(arg); t.erase(); }
     indices.push_back(arg.getArgNumber());
   }
@@ -987,6 +993,12 @@ LogicalResult markOverwrittenFills(OpBuilder &b, ModuleOp m) {
 /// `NPU_DUMP_NORMALIZED=1` 을 쓴다(맨 아래).
 LogicalResult normalizeGraph(ModuleOp m) {
   OpBuilder batched(m.getContext());
+
+  // ── ⓪' 어텐션 ─────────────────────────────────────────────────────
+  // 프론트엔드가 풀어 쓴 GQA 반복(broadcast generic)과 causal mask 를 속성으로
+  // 거둔다. 다른 재작성이 그 generic 들을 원소별 연산으로 다루기 전에 해야 한다.
+  // 키 전치는 여기서 만들어 두고, 아래 ③의 pretransposeWeights 가 접는다.
+  if (failed(canonicalizeAttention(m))) return failure();
 
   // ── ⓪ FP32 로 넓혀 곱한 행렬곱을 FP16 피연산자로 ──────────────────
   // ①의 누적·반올림 접기는 FP16 피연산자를 요구하므로 그보다 먼저 한다.

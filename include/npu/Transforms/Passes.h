@@ -10,16 +10,24 @@ namespace npu {
 //
 //   npu-legalize   Stage 1  normalize the captured graph, reject what cannot lower
 //   npu-tile       Stage 2  tile loops and core split          (needs hardware)
-//   npu-place      Stage 3  bufferize, liveness, address plan  (needs hardware)
-//   npu-lower      Stage 4  npu.core_block / npu.dma target IR
-//   encode-npu     Stage 5  Unified Program (ISA ver 1.0) words
+//   npu-place      Stage 3  bufferize, memory spaces            (needs hardware)
+//   npu-hw-ops     Stage 4  hardware ops: npu.mma, npu.acc_writeout, copies, cores
+//   npu-pipeline-attention
+//                  Stage 4b software-pipeline FlashAttention KV loops
+//   npu-assign-addresses
+//                  Stage 4b liveness and address plan          (needs hardware)
+//   npu-emit       Stage 5  npu.core_block / npu.dma target IR
+//   encode-npu     Stage 6  Unified Program (ISA ver 1.0) words
 //
 // The hardware stages take the parsed configuration from the driver, or read
 // the TOML named by their `settings` option when built from a pipeline string.
 std::unique_ptr<mlir::Pass> createLegalizePass();
 std::unique_ptr<mlir::Pass> createTilePass(HardwareConfig hardware);
 std::unique_ptr<mlir::Pass> createPlacePass(HardwareConfig hardware);
-std::unique_ptr<mlir::Pass> createLowerPass();
+std::unique_ptr<mlir::Pass> createHardwareOpsPass();
+std::unique_ptr<mlir::Pass> createPipelineAttentionPass();
+std::unique_ptr<mlir::Pass> createAssignAddressesPass(HardwareConfig hardware);
+std::unique_ptr<mlir::Pass> createEmitPass();
 std::unique_ptr<mlir::Pass> createEncodePass();
 // Registers every pass above and the `npu-pipeline{settings=...}` pipeline.
 void registerPasses();

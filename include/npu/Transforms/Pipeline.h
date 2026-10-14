@@ -10,8 +10,17 @@ void registerPipelineDialects(mlir::DialectRegistry &registry);
 void attachHardware(mlir::ModuleOp module, const HardwareConfig &hardware);
 mlir::LogicalResult legalizeGraph(mlir::ModuleOp module);
 mlir::LogicalResult tileGraph(mlir::ModuleOp module, const HardwareConfig &hardware);
+// Stage 3: bufferize and decide each buffer's memory space (no addresses).
 mlir::LogicalResult placeGraph(mlir::ModuleOp module, const HardwareConfig &hardware);
-mlir::LogicalResult lowerPlacedGraph(mlir::ModuleOp module);
+// Stage 4: linalg ops on placed buffers -> npu hardware ops (npu.mma, ...).
+mlir::LogicalResult lowerToHardwareOps(mlir::ModuleOp module);
+// Stage 4b: software-pipeline the KV loops Stage 1 marked npu.flash_attention.
+mlir::LogicalResult pipelineFlashAttention(mlir::ModuleOp module);
+// Stage 4b: liveness and physical addresses for every buffer, after the order
+// of operations is final.
+mlir::LogicalResult assignAddresses(mlir::ModuleOp module, const HardwareConfig &hardware);
+// Stage 5: hardware ops -> npu.core_block / npu.dma target program.
+mlir::LogicalResult emitTarget(mlir::ModuleOp module);
 mlir::LogicalResult cleanIR(mlir::ModuleOp module);
 // One table serves the legality check and ISA selection, so no scalar operation
 // is ever admitted without a matching VPU instruction. Null means unsupported.

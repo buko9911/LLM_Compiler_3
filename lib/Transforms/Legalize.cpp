@@ -86,7 +86,9 @@ LogicalResult hoistConstants(ModuleOp m) {
   });
   if (work.empty()) return success();
   OpBuilder b(m.getContext());
+  // Constants hoisted by an earlier stage stay first: they are already arguments.
   SmallVector<Attribute> values;
+  if (auto held = m->getAttrOfType<ArrayAttr>("npu.constants")) values.assign(held.begin(), held.end());
   for (auto constant : work) {
     auto type = cast<RankedTensorType>(constant.getType());
     auto dense = dyn_cast<DenseElementsAttr>(constant.getValue());
@@ -158,6 +160,36 @@ LogicalResult legalizeGraph(ModuleOp m) {
       }
     }
 
+    // ── 어텐션: 정규화가 키를 전치하고 mask 를 causal 로 거둔 모양 ────────
+    if (auto attention = dyn_cast<mlir::npu::AttentionOp>(op)) {
+      ++matmuls;
+      if (!attention.hasPureTensorSemantics() || !attention.getKeyTransposed() ||
+          attention.getInputs().size() != 3) {
+        attention.emitError("attention must arrive as query, key and value with the key transposed");
+        return WalkResult::interrupt();
+      }
+      for (Value v : attention->getOperands()) {
+        auto t = cast<RankedTensorType>(v.getType());
+        if (!t.getElementType().isF16() || t.getRank() != 3) {
+          attention.emitError("attention lowering requires rank-3 FP16 tensors, got ") << v.getType();
+          return WalkResult::interrupt();
+        }
+      }
+      // 블록 크기는 32 의 배수에서 고르고, 행렬 타일과 VPU 레지스터가 32 단위다.
+      auto q = cast<RankedTensorType>(attention.getQuery().getType());
+      auto k = cast<RankedTensorType>(attention.getKey().getType());
+      auto v = cast<RankedTensorType>(attention.getValue().getType());
+      if (q.getDimSize(1) % 32 || k.getDimSize(2) % 32 || q.getDimSize(2) % 32 || v.getDimSize(2) % 32 ||
+          v.getDimSize(2) > 128 * 4) {
+        attention.emitError("attention needs query rows, keys and head sizes that are multiples of 32 (not yet padded)");
+        return WalkResult::interrupt();
+      }
+      if (attention.getCausal() && q.getDimSize(1) > k.getDimSize(2)) {
+        attention.emitError("causal attention with more queries than keys is not yet lowered");
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    }
     // ── 전치: rank-2 정적 FP16 의 [1,0] 뿐 ──────────────────────────
     // op이 전치라면 → 그 입력 타입을 꺼낸다 → 모양 있는 타입이 아니거나,
     // 2차원이 아니거나, 크기가 미정이거나, FP16이 아니거나, 순열이 [1,0]이 아니면 → 이유를 그 위치에 찍고 순회를 멈춤
@@ -272,7 +304,7 @@ LogicalResult legalizeGraph(ModuleOp m) {
     }
     if (op->getParentOfType<linalg::LinalgOp>()) return WalkResult::advance();
     if (!isa<ModuleOp,func::FuncOp,func::ReturnOp,linalg::MatmulOp,linalg::GenericOp,linalg::FillOp,
-             linalg::CopyOp,linalg::TransposeOp,tensor::EmptyOp,
+             linalg::CopyOp,linalg::TransposeOp,tensor::EmptyOp,mlir::npu::AttentionOp,
              tensor::CollapseShapeOp,tensor::ExpandShapeOp,tensor::ExtractSliceOp,tensor::InsertSliceOp,
              scf::ForOp,scf::YieldOp,arith::ConstantOp,arith::MulIOp,arith::AddIOp>(op)) {
       op->emitError("current graph lowering does not implement '") << op->getName() << "'"; return WalkResult::interrupt();
@@ -286,6 +318,8 @@ LogicalResult legalizeGraph(ModuleOp m) {
   if (functions != 1 || (!matmuls && !generics))
     return m.emitError("requires one entry function containing a matmul or elementwise generic");
   if (failed(hoistConstants(m))) return failure();
+  // Stage 3 가 칩 안에 둘 루프 상태를 여기서 정한다. 검사를 통과한 그래프에만.
+  markFlashAttentionLoops(m);
   m->setAttr("npu.stage",StringAttr::get(m.getContext(),"legal"));
   return success();
 }

@@ -1,15 +1,17 @@
 #ifndef NPU_TARGET_PROGRAM_H
 #define NPU_TARGET_PROGRAM_H
+#include "npu/Target/ISAv2.h"
 #include "npu/Target/Result.h"
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace npu {
-// Unified program container of NPU_Simulator main, "ISA ver 1.0".
+// Unified program container of NPU_Simulator main, "ISA ver 2.0". Core blocks
+// are built in the ISA ver 1.0 builder stream (ISA.h) and lowered on encoding.
 inline constexpr uint32_t kProgramMagic = 0x414e4c50;   // little-endian "PLNA"
-inline constexpr uint32_t kProgramVersion = 0x00010000; // major << 16 | minor
-inline constexpr const char *kProgramSchema = "plena.v2.unified_program.isa_v1.0";
+inline constexpr uint32_t kProgramVersion = isa2::kProgramVersion;
+inline constexpr const char *kProgramSchema = isa2::kProgramSchema;
 enum class MemorySpace : unsigned { DRAM = 0, L2 = 1, L1 = 2, Accumulator = 3 };
 struct Access {
   MemorySpace space;
@@ -40,10 +42,17 @@ struct Program {
 // Adds per-core order and overlapping RAW/WAR/WAW edges. Disjoint DMA is free
 // to overlap computation. Dependencies reference command indices.
 Result<Program> schedule(Program program);
+struct EncodedProgram {
+  std::vector<uint32_t> words;
+  uint32_t commands = 0;   // system records, including joining BARRIERs
+  uint64_t coreWords = 0;  // ISA ver 2.0 core instruction words
+};
+Result<EncodedProgram> encodeProgramWords(const Program &program);
 Result<std::vector<uint8_t>> encodeProgram(const Program &program);
 Result<std::string> systemManifest(const Program &program);
 // Build metadata for an already successfully encoded program, without scheduling again.
-std::string systemManifestForEncoded(const Program &program, uint64_t wordCount);
+std::string systemManifestForEncoded(const Program &program, const EncodedProgram &encoded);
+// Checks one core block in the builder stream (operand buffer, accumulator, loops).
 Result<bool> verifyCore(const std::vector<uint32_t> &words);
 Result<bool> verifyProgramWords(const std::vector<uint32_t> &words);
 } // namespace npu

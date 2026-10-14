@@ -39,10 +39,18 @@ if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
     --attention "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn32.mlir"
     --carry "${CMAKE_CURRENT_SOURCE_DIR}/Integration/carry-graph.mlir"
     --flash "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn-graph.mlir"
+    --flash8 "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn8-graph.mlir"
+    --flash_d64 "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn-d64-graph.mlir"
     --divide "${CMAKE_CURRENT_SOURCE_DIR}/Integration/divide-graph.mlir"
     --constant "${CMAKE_CURRENT_SOURCE_DIR}/Integration/constant-graph.mlir"
     --transpose "${CMAKE_CURRENT_SOURCE_DIR}/Integration/transpose-graph.mlir"
     --layer "${CMAKE_CURRENT_SOURCE_DIR}/Integration/decoder-layer.mlir"
     --out "${CMAKE_CURRENT_BINARY_DIR}/vpu32")
   set_tests_properties(npu-vpu32 PROPERTIES TIMEOUT 600 LABELS integration)
+  add_test(NAME npu-attention COMMAND "${NPU_TEST_PYTHON}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/attention.py"
+    --compiler $<TARGET_FILE:npu-compile>
+    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
+    --out "${CMAKE_CURRENT_BINARY_DIR}/attention")
+  set_tests_properties(npu-attention PROPERTIES TIMEOUT 900 LABELS integration)
 endif()

@@ -28,7 +28,7 @@ def main():
         base = [args.compiler, "--from=target", source, "--settings", settings]
         call([*base, "-o", root / "plain"])
         call([*base, "-o", root / "debug", "--reparse-stages"])
-        restart = root / "debug/03-target.mlir"
+        restart = root / "debug/05-target.mlir"
         call([args.compiler, "--from=target", restart, "--settings", settings, "-o", root / "restart"])
         for name in ("program.bin", "system.json"):
             for mode in ("debug", "restart"):
@@ -138,7 +138,7 @@ func.func @main() {
 """)
         call([args.compiler, "--from=placed", hazards, "--settings", changed,
               "--save-stages", "-o", root / "hazards"])
-        target = (root / "hazards/03-target.mlir").read_text()
+        target = (root / "hazards/05-target.mlir").read_text()
         assert target.count("C_WAIT_LDMA") == 2
         assert "L2_LOAD_STRIDED_ASYNC" in target and "L2_STORE_STRIDED_ASYNC" in target
         # Residency follows contents, not reused L2 addresses. A DRAM write
