@@ -10,9 +10,13 @@
 //        입력 파싱 + 하드웨어 속성 부착        이 파일 (attachHardware)
 //   Stage 1  legalizeGraph     표현 가능성 검사   lib/Transforms/Legalize.cpp
 //   Stage 2  tileGraph         타일 루프 생성     lib/Transforms/Tile.cpp
-//   Stage 3  placeGraph        버퍼화 + 주소 배정 lib/Transforms/Place.cpp
-//   Stage 4  lowerPlacedGraph  명령 생성          lib/Transforms/Lower.cpp
-//   Stage 5  EncodePass        ISA 인코딩         lib/Transforms/Encode.cpp
+//   Stage 3  placeGraph        버퍼화 + 메모리 공간 lib/Transforms/Place.cpp
+//   Stage 4  npu-hw-ops        하드웨어 op 로     lib/Transforms/HardwareOps.cpp
+//   Stage 4b npu-pipeline-attention + npu-assign-addresses
+//                              FA 소프트웨어 파이프라이닝, 주소 배정
+//                                                  lib/Transforms/FlashAttention.cpp, Place.cpp
+//   Stage 5  npu-emit          명령 생성          lib/Transforms/Emit.cpp
+//   Stage 6  encode-npu        ISA 인코딩         lib/Transforms/Encode.cpp
 //
 // 받는 .mlir 은 Stage 0이 낸 것이거나 test/Integration 의 손으로 쓴 것이다.
 // 어느 쪽이든 npu.* 속성이 없는 순수 linalg 이며, 그 속성은 아래
@@ -79,7 +83,7 @@ struct Options {
   /// --settings : 하드웨어 설정 .toml 경로. 시뮬레이터가 읽는 그 파일이다.
   std::string settings;
 
-  /// --from : 어느 단계부터 시작할지. graph|legal|tiled|placed|target 중 하나.
+  /// --from : 어느 단계부터 시작할지. graph|legal|tiled|placed|hw|target 중 하나.
   std::string fromStage;
 
   /// --inputs : arg0.bin, arg1.bin ... 이 들어 있는 디렉터리. 주면 실행용
@@ -105,6 +109,9 @@ struct Options {
   /// FP32 스케일, 활성값은 행별 INT8 이 된다(lib/Transforms/Quantize.cpp).
   /// 원본 FP16 가중치를 INT8 로 바꾸는 일은 --inputs 로 이미지를 만들 때 한다.
   std::string quantize;
+  /// --dram-intermediates : 중간 텐서를 L2 대신 DRAM에 둔다(이전 동작). 기본은
+  /// 함수 결과가 아닌 중간 텐서를 L2에 두고, L2가 모자라면 DRAM으로 돌아간다.
+  bool dramIntermediates = false;
 
   /// --save-stages : 단계마다 .mlir 을 출력 디렉터리에 남긴다.
   bool saveStages = false;
@@ -127,12 +134,13 @@ int compileGraph(int argc, char **argv) {
     std::string arg = argv[i];
 
     if (arg == "--help") {
-      std::cout << "usage: npu-compile --from=graph|legal|tiled|placed|target input.mlir --settings hardware.toml -o directory\n"
+      std::cout << "usage: npu-compile --from=graph|legal|tiled|placed|hw|scheduled|target input.mlir --settings hardware.toml -o directory\n"
                    "  --fp16              allow intermediate FP16 rounding (required for graph input)\n"
                    "  --reciprocal-division  lower a/b as a * (1/b); the hardware has no divide\n"
                    "  --inputs directory  pack contiguous FP16 arg0.bin, arg1.bin, ... into hbm.bin\n"
                    "  --readback          copy outputs back into L2 at the end (read from l2_sram_dump.bin)\n"
                    "  --quantize=w8a8     INT8 weights per output channel, INT8 activations per row\n"
+                   "  --dram-intermediates  keep intermediate tensors in DRAM instead of L2\n"
                    "  --time-stages        report pass wall times\n"
                    "  --save-stages | --reparse-stages\n";
       return 0;
@@ -155,6 +163,8 @@ int compileGraph(int argc, char **argv) {
         std::cerr << "unsupported quantization: " << options.quantize << '\n';
         return 2;
       }
+    } else if (arg == "--dram-intermediates") {
+      options.dramIntermediates = true;
     } else if (arg == "--save-stages") {
       options.saveStages = true;
     } else if (arg == "--reparse-stages") {
@@ -183,11 +193,11 @@ int compileGraph(int argc, char **argv) {
   // 단계 이름이 여기 한 번만 나열되고, 아래 계단식 진입 판정이 이 순서에서
   // 나온다. --from 값이 목록에 없으면 start 가 end() 라 곧바로 걸린다.
   //===--------------------------------------------------------------------===//
-  const std::vector<std::string> stageNames{"graph", "legal", "tiled", "placed", "target"};
+  const std::vector<std::string> stageNames{"graph", "legal", "tiled", "placed", "hw", "scheduled", "target"};
   auto start = std::find(stageNames.begin(), stageNames.end(), options.fromStage);
 
   if (start == stageNames.end() || options.input.empty() || options.output.empty() || options.settings.empty()) {
-    std::cerr << "requires --from=target or --from=graph|legal|tiled|placed, input.mlir --settings hardware.toml -o directory\n";
+    std::cerr << "requires --from=target or --from=graph|legal|tiled|placed|hw|scheduled, input.mlir --settings hardware.toml -o directory\n";
     return 2;
   }
 
@@ -273,6 +283,8 @@ int compileGraph(int argc, char **argv) {
 
     if (!options.quantize.empty())
       (*module)->setAttr("npu.quantize", mlir::StringAttr::get(&context, options.quantize));
+    if (options.dramIntermediates)
+      (*module)->setAttr("npu.dram_intermediates", mlir::UnitAttr::get(&context));
   }
 
   //===--------------------------------------------------------------------===//
@@ -353,7 +365,7 @@ int compileGraph(int argc, char **argv) {
   // 파이프라인
   //
   // firstStage 가 시작 단계의 인덱스다: graph=0, legal=1, tiled=2, placed=3,
-  // target=4. 각 구역의 조건이 누적이라 --from 이 가리키는 지점부터 들어간다.
+  // hw=4, scheduled=5, target=6. 각 구역의 조건이 누적이라 --from 이 가리키는 지점부터 들어간다.
   //===--------------------------------------------------------------------===//
   auto timed = [&](const char *name, auto action) {
     auto begin = std::chrono::steady_clock::now();
@@ -396,8 +408,8 @@ int compileGraph(int argc, char **argv) {
       return 1;
   }
 
-  // Stage 3 — 버퍼화(tensor → memref), 생존 구간 분석(mlir::Liveness +
-  // BufferViewFlowAnalysis), 주소 배정. 여기서 텐서가 사라진다.
+  // Stage 3 — 버퍼화(tensor → memref)와 버퍼마다 메모리 공간(L1/L2/DRAM) 결정.
+  // 여기서 텐서가 사라진다. 주소는 아직 없다(Stage 4b).
   if (firstStage <= 2) {
     if (mlir::failed(timed("place", [&] { return runPass(::npu::createPlacePass(hw)); })))
       return 1;
@@ -405,32 +417,53 @@ int compileGraph(int argc, char **argv) {
       return 1;
   }
 
-  // Stage 4 — 명령 생성. 모듈 본문을 비우고 npu.dma / npu.core_block 으로
-  // 다시 쓴다(치환이 아니다).
+  // Stage 4 — linalg.matmul 을 npu.mma / npu.acc_writeout 으로, 복사를
+  // npu.local_copy / npu.global_copy 로, 코어 분할 루프를 scf.forall 로 바꾼다.
+  // 루프와 주소는 그대로이고, 하드웨어가 하는 일이 op 로 드러난다.
   if (firstStage <= 3) {
-    if (mlir::failed(timed("lower", [&] { return runPass(::npu::createLowerPass()); })))
+    if (mlir::failed(timed("hw-ops", [&] { return runPass(::npu::createHardwareOpsPass()); })))
+      return 1;
+    if (!checkpoint("04-hw.mlir"))
       return 1;
   }
 
-  // 여기만 checkpoint 를 쓰지 않는다. 파일 이름이 03-target.mlir 인데, 이는
-  // --from=target 의 진입점이며 Stage 3 결과인 03-placed.mlir 과는 별개다.
-  // 손으로 쓴 타깃 IR 로 S1 만 돌리는 경로가 이 이름을 쓴다.
-  if (options.saveStages && !save(*module, outputDir / "03-target.mlir"))
+  // Stage 4b — FlashAttention KV 루프를 소프트웨어 파이프라이닝한 뒤(블록 j+1 의
+  // QK 를 블록 j 의 softmax 옆으로), 순서가 정해진 IR 위에서 생존 구간
+  // (mlir::Liveness + BufferViewFlowAnalysis)을 구하고 주소를 배정한다.
+  if (firstStage <= 4) {
+    if (mlir::failed(timed("pipeline-attention", [&] { return runPass(::npu::createPipelineAttentionPass()); })))
+      return 1;
+    if (mlir::failed(timed("assign-addresses", [&] { return runPass(::npu::createAssignAddressesPass(hw)); })))
+      return 1;
+    if (!checkpoint("04b-scheduled.mlir"))
+      return 1;
+  }
+
+  // Stage 5 — 명령 생성. 루프를 풀고 모듈 본문을 npu.dma / npu.core_block 으로
+  // 다시 쓴다(치환이 아니다).
+  if (firstStage <= 5) {
+    if (mlir::failed(timed("emit", [&] { return runPass(::npu::createEmitPass()); })))
+      return 1;
+  }
+
+  // 여기만 checkpoint 를 쓰지 않는다. 05-target.mlir 은 --from=target 의
+  // 진입점이기도 해서, 손으로 쓴 타깃 IR 은 검증 없이 이 지점으로 들어온다.
+  if (options.saveStages && !save(*module, outputDir / "05-target.mlir"))
     return 1;
   if (options.reparseStages) {
-    module = mlir::parseSourceFile<mlir::ModuleOp>((outputDir / "03-target.mlir").string(), &context);
+    module = mlir::parseSourceFile<mlir::ModuleOp>((outputDir / "05-target.mlir").string(), &context);
     if (!module || mlir::failed(mlir::verify(*module)))
       return 1;
   }
 
-  // Stage 5 — 타깃 op 들을 32비트 워드로 인코딩한다.
+  // Stage 6 — 타깃 op 들을 32비트 워드로 인코딩한다.
   if (mlir::failed(timed("encode", [&] { return runPass(::npu::createEncodePass()); })))
     return 1;
 
-  if (options.saveStages && !save(*module, outputDir / "04-isa.mlir"))
+  if (options.saveStages && !save(*module, outputDir / "06-isa.mlir"))
     return 1;
   if (options.reparseStages) {
-    module = mlir::parseSourceFile<mlir::ModuleOp>((outputDir / "04-isa.mlir").string(), &context);
+    module = mlir::parseSourceFile<mlir::ModuleOp>((outputDir / "06-isa.mlir").string(), &context);
     if (!module || mlir::failed(mlir::verify(*module)))
       return 1;
   }
@@ -642,12 +675,19 @@ int compileGraph(int argc, char **argv) {
       } else {
         const int64_t rowCount = *rows;
         const int64_t columnCount = *cols;
+        // 축이 둘보다 많으면 평면마다 따로 전치되어 있다(어텐션 키 [h, d, n]).
+        const int64_t planeRows = argument->getInteger("plane_rows").value_or(rowCount);
+        if (planeRows <= 0 || rowCount % planeRows) {
+          std::cerr << "transposed planes do not divide the argument: " << path << '\n';
+          return 1;
+        }
 
         // 파일에는 모델이 들고 있는 대로 들어 있다. 전치를 접어 넣은 가중치는
-        // rows 개짜리 행이 cols 줄이므로 반대로 읽는다.
+        // 평면마다 planeRows 개짜리 행이 cols 줄이므로 반대로 읽는다.
         auto source = [&](int64_t row, int64_t column) {
-          return transposed ? size_t(column * rowCount + row)
-                            : size_t(row * columnCount + column);
+          return transposed
+                     ? size_t((row / planeRows) * planeRows * columnCount + column * planeRows + row % planeRows)
+                     : size_t(row * columnCount + column);
         };
 
         std::vector<char> laid(raw.size());

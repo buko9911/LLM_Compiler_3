@@ -22,8 +22,8 @@ int main(int argc, char **argv) {
         if (++i == argc) { std::cerr << "--pipeline needs a value\n"; return 2; }
         pipeline = argv[i];
       } else pipeline = arg.substr(11);
-      if (pipeline != "graph" && pipeline != "graph-hybrid" && pipeline != "decode") {
-        std::cerr << "--pipeline must be graph, graph-hybrid or decode\n";
+      if (pipeline != "graph" && pipeline != "prefill" && pipeline != "graph-hybrid" && pipeline != "decode") {
+        std::cerr << "--pipeline must be prefill, graph, graph-hybrid or decode\n";
         return 2;
       }
     } else {
@@ -35,6 +35,7 @@ int main(int argc, char **argv) {
   if (pipeline.empty() && help && !manifest) {
     std::cout << "LLM_Compiler_3: npu-compile\n"
                  "  --pipeline=decode        Qwen3/Llama explicit-state graph + --manifest + --spec\n"
+                 "  --pipeline=prefill       NPU-only graph with the optimized Attention pipeline\n"
                  "  --pipeline=graph         general tensor/linalg graph + --from + --settings\n"
                  "  --pipeline=graph-hybrid  captured W8A8 graph + --settings + --config\n"
                  "With --manifest, decode is selected automatically; otherwise graph.\n"

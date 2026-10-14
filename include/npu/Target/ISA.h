@@ -7,9 +7,9 @@
 #include <vector>
 
 namespace npu {
-// Builder-stream core encoding: the "ISA ver 1.0" encodings of NPU_Simulator
-// main. The code generator writes and checks core blocks in it; the encoder
-// lowers every block to ISA ver 2.0, which the simulator runs (IsaV2.h).
+// Core builder stream in the ISA ver 1.0 encodings. Stage 5 writes core blocks in
+// this form; encoding lowers each block to ISA ver 2.0 (ISAv2.h), which the
+// simulator executes.
 //
 // Most instructions are one 32-bit word. Matrix operand loads and accumulator
 // writeouts are four-word records: a header word followed by three u32

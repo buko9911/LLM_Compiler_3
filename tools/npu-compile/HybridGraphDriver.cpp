@@ -432,6 +432,11 @@ int compileHybridGraph(int argc, char **argv) {
     if (options.saveStages && !save(m, dir / "02-tiled.mlir")) return 1;
     if (!runPass(m, ::npu::createPlacePass(hw))) { std::cerr << "phase " << p << ": placement failed\n"; return 1; }
     if (options.saveStages && !save(m, dir / "03-placed.mlir")) return 1;
+    if (!runPass(m, ::npu::createHardwareOpsPass()) ||
+        !runPass(m, ::npu::createPipelineAttentionPass()) ||
+        !runPass(m, ::npu::createAssignAddressesPass(hw))) {
+      std::cerr << "phase " << p << ": NPU hardware scheduling/placement failed\n"; return 1;
+    }
     dramEnd = std::max<uint64_t>(dramEnd, uint64_t(m->getAttrOfType<IntegerAttr>("npu.dram_bytes").getInt()));
     // 이 페이즈의 행렬곱이 가중치를 패널 단위로 모아 달라고 했으면 이미지가 알아야 한다.
     f = *m.getOps<func::FuncOp>().begin();
@@ -525,7 +530,7 @@ int compileHybridGraph(int argc, char **argv) {
     fs::path dir = out / ("phase" + std::to_string(p));
     uint64_t staging = 0, stagingBytes = ::npu::kDRAMStagingBytes;
     if (!empty[size_t(p)]) {
-      if (!runPass(m, ::npu::createLowerPass())) { std::cerr << "phase " << p << ": lowering failed\n"; return 1; }
+      if (!runPass(m, ::npu::createEmitPass())) { std::cerr << "phase " << p << ": lowering failed\n"; return 1; }
       staging = uint64_t(m->getAttrOfType<IntegerAttr>("npu.l2_staging").getInt());
       stagingBytes = uint64_t(m->getAttrOfType<IntegerAttr>("npu.l2_staging_bytes").getInt());
       if (auto metadata = m->getAttrOfType<StringAttr>("npu.metadata"); metadata && options.saveStages) {

@@ -12,7 +12,7 @@ public:
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(EncodePass)
   llvm::StringRef getArgument() const final { return "encode-npu"; }
   llvm::StringRef getName() const override { return "encode-npu"; }
-  llvm::StringRef getDescription() const final { return "Verify and encode NPU target blocks into a Unified Program (ISA ver 2.0)"; }
+  llvm::StringRef getDescription() const final { return "Verify NPU target blocks and encode them into a Unified Program (ISA ver 2.0)"; }
   void getDependentDialects(mlir::DialectRegistry &r) const override { r.insert<mlir::npu::NPUDialect>(); }
   void runOnOperation() override {
     auto module = getOperation();
@@ -58,15 +58,10 @@ public:
       } else { op.emitError("target encoding only accepts npu.core_block and npu.dma"); return signalPassFailure(); }
       p.commands.push_back(std::move(c));
     }
-    auto encoded = encodeProgram(p);
+    auto encoded = encodeProgramWords(p);
     if (!encoded) { module.emitError(encoded.error); return signalPassFailure(); }
     auto manifest = systemManifestForEncoded(p, encoded.value);
-    std::vector<int32_t> words;
-    for (size_t i = 0; i < encoded.value.size(); i += 4) {
-      uint32_t w = 0;
-      for (unsigned b = 0; b < 4; ++b) w |= uint32_t(encoded.value[i + b]) << (b * 8);
-      words.push_back(static_cast<int32_t>(w));
-    }
+    std::vector<int32_t> words(encoded.value.words.begin(), encoded.value.words.end());
     module.getBody()->clear();
     mlir::OpBuilder builder(module.getContext());
     builder.setInsertionPointToStart(module.getBody());

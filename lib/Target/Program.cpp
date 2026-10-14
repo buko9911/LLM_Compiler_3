@@ -1,6 +1,6 @@
 #include "npu/Target/Program.h"
 #include "npu/Target/ISA.h"
-#include "npu/Target/IsaV2.h"
+#include "npu/Target/ISAv2.h"
 #include <algorithm>
 #include <limits>
 #include <map>
@@ -343,6 +343,7 @@ Result<bool> verifyProgramWords(const std::vector<uint32_t> &words) {
     case 0x26: { // CORE_BEGIN
       if (words.size() - at < 2) return R::failure("truncated CORE_BEGIN");
       if (head >> 6 & 1) return R::failure("unsupported CORE_BEGIN extension");
+      if ((head >> 7 & 31) == isa2::kCoreAny) return R::failure("CORE_BEGIN without a logical core");
       const uint32_t count = words[at + 1] & 0xffffff;
       at += 2;
       deps = readDependencies(words, at, id, words[at - 1] >> 24);
@@ -496,7 +497,8 @@ Result<LinkedProgram> linkProgram(const std::vector<Segment> &segments) {
         std::vector<uint32_t> group(last.begin() + i, last.begin() + std::min(last.size(), i + isa2::kMaxDependencies));
         if (!near(group)) return tooFar(s.name);
         auto barrier = isa2::barrierRecord(next, group);
-        out.insert(out.end(), barrier.begin(), barrier.end());
+        if (!barrier) return R::failure(barrier.error);
+        out.insert(out.end(), barrier.value.begin(), barrier.value.end());
         linked.symbols.push_back(s.name + ".barrier_" + std::to_string(next));
         joined.push_back(next++);
       }
@@ -512,8 +514,8 @@ Result<LinkedProgram> linkProgram(const std::vector<Segment> &segments) {
   return R::success(std::move(linked));
 }
 
-Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
-  using R = Result<std::vector<uint8_t>>;
+Result<EncodedProgram> encodeProgramWords(const Program &program) {
+  using R = Result<EncodedProgram>;
   auto checked = schedule(program);
   if (!checked) return R::failure(checked.error);
   const auto &p = checked.value;
@@ -541,7 +543,8 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
                                     deps.begin() + std::min(deps.size(), i + isa2::kMaxDependencies));
         if (!near(group)) return fail(id, "dependency more than 65535 records back");
         auto barrier = isa2::barrierRecord(next, group);
-        out.insert(out.end(), barrier.begin(), barrier.end());
+        if (!barrier) return R::failure(barrier.error);
+        out.insert(out.end(), barrier.value.begin(), barrier.value.end());
         joined.push_back(next++);
       }
       deps = std::move(joined);
@@ -552,7 +555,8 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
       if (body.value.size() >= isa2::kCoreWords) return fail(id, "core block exceeds 2^24 words");
       if (!near(deps)) return fail(id, "dependency more than 65535 records back");
       auto begin = isa2::coreBeginRecord(next, deps, uint32_t(body.value.size()), c.core, p.l1Bytes);
-      out.insert(out.end(), begin.begin(), begin.end());
+      if (!begin) return fail(id, begin.error);
+      out.insert(out.end(), begin.value.begin(), begin.value.end());
       out.insert(out.end(), body.value.begin(), body.value.end());
       coreWords += body.value.size();
       records[id].push_back(next++);
@@ -564,7 +568,8 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
       if (!near(deps)) return fail(id, "dependency more than 65535 records back");
       auto record = isa2::gdmaRecord(c.kind == Command::Kind::Load, next, deps, t.lp6, t.l2, uint32_t(t.rowBytes),
                                      uint32_t(t.rows), uint32_t(t.lp6Stride), uint32_t(t.l2Stride));
-      out.insert(out.end(), record.begin(), record.end());
+      if (!record) return fail(id, record.error);
+      out.insert(out.end(), record.value.begin(), record.value.end());
       records[id].push_back(next++);
     }
   }
@@ -574,30 +579,43 @@ Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
   out[3] = next; out[4] = uint32_t(coreWords);
   auto verified = verifyProgramWords(out);
   if (!verified) return R::failure(verified.error);
+  return R::success({std::move(out), next, coreWords});
+}
+Result<std::vector<uint8_t>> encodeProgram(const Program &program) {
+  auto encoded = encodeProgramWords(program);
+  if (!encoded) return Result<std::vector<uint8_t>>::failure(encoded.error);
   std::vector<uint8_t> bytes;
-  bytes.reserve(out.size() * 4);
-  for (auto w : out) for (unsigned b = 0; b < 4; ++b) bytes.push_back(uint8_t(w >> (8*b)));
-  return R::success(std::move(bytes));
+  bytes.reserve(encoded.value.words.size() * sizeof(uint32_t));
+  for (auto w : encoded.value.words) for (unsigned b = 0; b < 4; ++b) bytes.push_back(uint8_t(w >> (8*b)));
+  return Result<std::vector<uint8_t>>::success(std::move(bytes));
 }
 Result<std::string> systemManifest(const Program &p) {
-  auto bytes = encodeProgram(p);
-  if (!bytes) return Result<std::string>::failure(bytes.error);
-  return Result<std::string>::success(systemManifestForEncoded(p, bytes.value));
+  auto encoded = encodeProgramWords(p);
+  if (!encoded) return Result<std::string>::failure(encoded.error);
+  return Result<std::string>::success(systemManifestForEncoded(p, encoded.value));
 }
-std::string systemManifestForEncoded(const Program &p, const std::vector<uint8_t> &encoded) {
-  // Header words 2..4: program words, records, core words.
-  auto header = [&](size_t i) {
-    uint32_t w = 0;
-    for (unsigned b = 0; b < 4; ++b) w |= uint32_t(encoded[4 * i + b]) << (8 * b);
-    return std::to_string(w);
-  };
+namespace {
+std::string manifest(const Program &p, uint64_t words, uint32_t commands, uint64_t coreWords) {
   std::string s = std::string("{\n  \"schema\": \"") + kProgramSchema + "\",\n  \"program\": \"program.bin\",\n  \"scheduling_policy\": \"compiler_static\",\n  \"logical_to_physical\": [";
   for (unsigned i = 0; i < p.cores; ++i) s += (i ? ", " : "") + std::to_string(i);
-  return s + "],\n  \"program_word_count\": " + header(2) +
-    ",\n  \"command_count\": " + header(3) +
-    ",\n  \"core_instruction_count\": " + header(4) +
+  return s + "],\n  \"program_word_count\": " + std::to_string(words) +
+    ",\n  \"command_count\": " + std::to_string(commands) +
+    ",\n  \"core_instruction_count\": " + std::to_string(coreWords) +
     ",\n  \"l2_bytes_required\": " + std::to_string(p.l2Bytes) +
     ",\n  \"l2_regions\": [{\"name\": \"l2\", \"offset\": 0, \"size\": " +
     std::to_string(p.l2Bytes) + ", \"alignment\": 64}]\n}\n";
+}
+} // namespace
+std::string systemManifestForEncoded(const Program &p, const std::vector<uint8_t> &encoded) {
+  // Successfully encoded program: header words 2..4 are words/records/core words.
+  auto header = [&](size_t i) {
+    uint32_t w = 0;
+    for (unsigned b = 0; b < 4; ++b) w |= uint32_t(encoded[4 * i + b]) << (8 * b);
+    return w;
+  };
+  return manifest(p, header(2), header(3), header(4));
+}
+std::string systemManifestForEncoded(const Program &p, const EncodedProgram &encoded) {
+  return manifest(p, encoded.words.size(), encoded.commands, encoded.coreWords);
 }
 } // namespace npu

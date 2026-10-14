@@ -13,8 +13,11 @@ from __future__ import annotations
 from pathlib import Path
 
 COMPILER = Path(__file__).resolve().parents[1]
-CORE = COMPILER.parent
-WORKSPACE = CORE.parent
+# Worktrees may live in workspace/reviews rather than workspace/core.
+WORKSPACE = next((p for p in COMPILER.parents if (p / "core/simulator/npu").is_dir()), None)
+if WORKSPACE is None:
+    raise RuntimeError("cannot locate the LP6 workspace containing core/simulator/npu")
+CORE = WORKSPACE / "core"
 
 NPU = CORE / "simulator/npu"
 EMULATOR = NPU / "transactional_emulator/target/release/transactional_emulator"

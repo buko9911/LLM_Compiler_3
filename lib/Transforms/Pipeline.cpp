@@ -26,6 +26,7 @@ void registerPipelineDialects(DialectRegistry &r) {
   linalg::registerBufferizableOpInterfaceExternalModels(r);
   scf::registerBufferizableOpInterfaceExternalModels(r);
   tensor::registerBufferizableOpInterfaceExternalModels(r);
+  registerAttentionInterfaces(r);
 
   // 제자리 쓰기를 증명하려고 "이 쓰기가 저 버퍼의 일부인가"를 묻는다.
   linalg::registerSubsetOpInterfaceExternalModels(r);

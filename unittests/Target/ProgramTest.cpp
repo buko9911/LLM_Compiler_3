@@ -6,6 +6,10 @@
 #include <set>
 
 namespace {
+std::vector<uint32_t> checkedWords(npu::Result<std::vector<uint32_t>> result) {
+  EXPECT_TRUE(bool(result)) << result.error;
+  return std::move(result.value);
+}
 npu::Command core(std::vector<npu::Access> accesses = {}) {
   npu::Command c; c.words = npu::assemble("C_FENCE_ALL").value; c.accesses = std::move(accesses); return c;
 }
@@ -143,6 +147,8 @@ TEST(Program, RejectsCorruptedProgramAndTruncation) {
   ASSERT_EQ(words, (std::vector<uint32_t>{0x414e4c50, 0x00020000, 9, 1, 1, 0x26 | 8u << 12, 1, 0xff, 0x2f}));
   auto corrupt = words; corrupt[7] = 0x1; // invalid ver 2.0 opcode in the core block
   EXPECT_FALSE(bool(npu::verifyProgramWords(corrupt)));
+  corrupt = words; corrupt[5] |= npu::isa2::kCoreAny << 7;
+  EXPECT_FALSE(bool(npu::verifyProgramWords(corrupt)));
   for (size_t size = 0; size < words.size(); ++size) {
     auto shortWords = std::vector<uint32_t>(words.begin(),words.begin()+size);
     if (size > 2) shortWords[2] = uint32_t(size);
@@ -167,12 +173,29 @@ TEST(Program, ContiguousRowOverOneMebibyteBecomesEqualRows) {
   auto words = wordsOf(encoded.value);
   ASSERT_EQ(words[3], 1u);
   EXPECT_EQ(std::vector<uint32_t>(words.begin() + 5, words.begin() + 10),
-            npu::isa2::gdmaRecord(true, 0, {}, 0, 0, 622592, 2, 622592, 622592));
+            checkedWords(npu::isa2::gdmaRecord(true, 0, {}, 0, 0, 622592, 2, 622592, 622592)));
   // A strided transfer with such rows is split into column pieces.
   dma.bytes = 3 << 19; dma.rows = 2; dma.dramStride = 2 << 20; dma.l2Stride = 3 << 19;
   p.l2Bytes = 4 << 20; p.commands = {dma};
   encoded = npu::encodeProgram(p); ASSERT_TRUE(bool(encoded)) << encoded.error;
   EXPECT_EQ(wordsOf(encoded.value)[3], 3u);
+}
+TEST(Program, WordAndBytePackagesShareTheEncodedManifest) {
+  // The graph driver consumes words; decode and linked phases consume bytes.
+  // A split GDMA makes the record count differ from the input command count.
+  auto dma = load(0);
+  dma.bytes = 3 << 19; dma.rows = 2;
+  dma.dramStride = 2 << 20; dma.l2Stride = 3 << 19;
+  npu::Program p{1, 64, 4 << 20, 4 << 20, {dma, core()}};
+  auto bytes = npu::encodeProgram(p);
+  auto words = npu::encodeProgramWords(p);
+  ASSERT_TRUE(bool(bytes)) << bytes.error;
+  ASSERT_TRUE(bool(words)) << words.error;
+  EXPECT_EQ(wordsOf(bytes.value), words.value.words);
+  EXPECT_EQ(words.value.commands, 4u);
+  EXPECT_EQ(words.value.coreWords, 1u);
+  EXPECT_EQ(npu::systemManifestForEncoded(p, bytes.value),
+            npu::systemManifestForEncoded(p, words.value));
 }
 TEST(Program, BarriersJoinMoreThan255Dependencies) {
   using M = npu::MemorySpace;
@@ -209,14 +232,14 @@ TEST(Program, LinkedPhasesRunInOrder) {
                                                             "npu1.gdma_4", "npu1.core_block_5", "npu1.barrier_6"}));
   auto slice = [&](size_t at, size_t n) { return std::vector<uint32_t>(w.begin() + at, w.begin() + at + n); };
   size_t at = 5;
-  EXPECT_EQ(slice(at, 3), npu::isa2::gdmaRecord(true, 0, {}, 0, 0, 64, 1, 64, 64));   // no entry: first phase
+  EXPECT_EQ(slice(at, 3), checkedWords(npu::isa2::gdmaRecord(true, 0, {}, 0, 0, 64, 1, 64, 64)));   // no entry: first phase
   at += 6;
-  EXPECT_EQ(slice(at, 2), npu::isa2::barrierRecord(2, {0, 1}));                        // phase 0 ends
+  EXPECT_EQ(slice(at, 2), checkedWords(npu::isa2::barrierRecord(2, {0, 1})));                        // phase 0 ends
   at += 2;
   const size_t pimWords = 4;
   EXPECT_EQ(slice(at, pimWords), npu::isa2::pimRecord(3, {2}, &clear, 1).value);
   at += pimWords;
-  EXPECT_EQ(slice(at, 4), npu::isa2::gdmaRecord(true, 4, {3}, 0, 0, 64, 1, 64, 64));   // after the PIM phase
+  EXPECT_EQ(slice(at, 4), checkedWords(npu::isa2::gdmaRecord(true, 4, {3}, 0, 0, 64, 1, 64, 64)));   // after the PIM phase
   at += 4;
   EXPECT_EQ(w[at + 1] >> 24, 1u);                                                      // the block keeps its load
   EXPECT_EQ(w[at + 2], 1u);

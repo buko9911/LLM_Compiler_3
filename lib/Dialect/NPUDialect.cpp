@@ -2,18 +2,138 @@
 #include "npu/Target/ISA.h"
 #include "npu/Target/Program.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/DialectImplementation.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include <optional>
 #include "npu/Dialect/NPUDialect.cpp.inc"
 
+#define GET_TYPEDEF_CLASSES
+#include "npu/Dialect/NPUTypes.cpp.inc"
+#define GET_ATTRDEF_CLASSES
+#include "npu/Dialect/NPUAttrs.cpp.inc"
 #define GET_OP_CLASSES
 #include "npu/Dialect/NPUOps.cpp.inc"
 
 void mlir::npu::NPUDialect::initialize() {
+  addTypes<
+#define GET_TYPEDEF_LIST
+#include "npu/Dialect/NPUTypes.cpp.inc"
+  >();
+  addAttributes<
+#define GET_ATTRDEF_LIST
+#include "npu/Dialect/NPUAttrs.cpp.inc"
+  >();
   addOperations<
 #define GET_OP_LIST
 #include "npu/Dialect/NPUOps.cpp.inc"
   >();
 }
+
+// ── Hardware level ───────────────────────────────────────────────────────────
+
+mlir::LogicalResult mlir::npu::AccType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                               int64_t rows, int64_t columns) {
+  // The array is 32x32; a tile may use fewer rows or columns, never more.
+  if (rows < 1 || rows > 32 || columns < 1 || columns > 32)
+    return emitError() << "accumulator tile must be between 1x1 and 32x32, got "
+                       << rows << "x" << columns;
+  return success();
+}
+
+// scf.forall asks every mapping attribute for an id; cores are the only NPU
+// processing unit, so there is one id and it is not a linearised mapping.
+int64_t mlir::npu::CoreMappingAttr::getMappingId() const { return 0; }
+bool mlir::npu::CoreMappingAttr::isLinearMapping() const { return false; }
+int64_t mlir::npu::CoreMappingAttr::getRelativeIndex() const { return 0; }
+
+namespace {
+// Matrix input tiles are FP16 or INT8; writeout tiles are FP16 or INT32.
+mlir::LogicalResult checkL1Tile(mlir::Operation *op, mlir::Value value, llvm::StringRef role) {
+  auto type = mlir::dyn_cast<mlir::MemRefType>(value.getType());
+  bool typed = type && (type.getElementType().isF16() ||
+      type.getElementType().isInteger(role == "target" ? 32 : 8));
+  if (!type || type.getRank() != 2 || !type.hasStaticShape() || !typed)
+    return op->emitOpError() << role << " must be a static rank-2 FP16 or "
+                            << (role == "target" ? "INT32" : "INT8") << " memref";
+  if (mlir::npu::memorySpace(type) != 2)
+    return op->emitOpError() << role << " must be in L1 (memory space 2)";
+  return mlir::success();
+}
+mlir::LogicalResult checkCopyShape(mlir::Operation *op, mlir::Value source, mlir::Value target) {
+  auto s = mlir::cast<mlir::MemRefType>(source.getType());
+  auto t = mlir::cast<mlir::MemRefType>(target.getType());
+  if (s.getShape() != t.getShape() || s.getElementType() != t.getElementType())
+    return op->emitOpError("source and target must have the same shape and element type");
+  return mlir::success();
+}
+} // namespace
+
+// ── Graph level ──────────────────────────────────────────────────────────────
+
+mlir::LogicalResult mlir::npu::AttentionOp::verify() {
+  auto inputs = getInputs();
+  if (inputs.size() < 3 || inputs.size() > 5)
+    return emitOpError("takes query, key, value and up to two more inputs");
+  auto shape = [](Value v) { return cast<ShapedType>(v.getType()); };
+  auto q = shape(getQuery()), k = shape(getKey()), v = shape(getValue()), out = shape(getInit());
+  if (q.getRank() != 3 || k.getRank() != 3 || v.getRank() != 3 || out.getRank() != 3)
+    return emitOpError("query, key, value and init must be rank 3");
+  if (!q.hasStaticShape() || !k.hasStaticShape() || !v.hasStaticShape() || !out.hasStaticShape())
+    return emitOpError("requires static shapes");
+  const int64_t heads = q.getDimSize(0), rows = q.getDimSize(1), depth = q.getDimSize(2);
+  const int64_t keys = getKeyTransposed() ? k.getDimSize(2) : k.getDimSize(1);
+  const int64_t keyDepth = getKeyTransposed() ? k.getDimSize(1) : k.getDimSize(2);
+  if (getGroup() < 1 || k.getDimSize(0) * getGroup() != heads || v.getDimSize(0) != k.getDimSize(0))
+    return emitOpError("query heads must be group times the key/value heads");
+  if (keyDepth != depth || v.getDimSize(1) != keys)
+    return emitOpError("key and value shapes disagree with the query");
+  if (out.getDimSize(0) != heads || out.getDimSize(1) != rows || out.getDimSize(2) != v.getDimSize(2))
+    return emitOpError("init must be [heads, query rows, value depth]");
+  if (hasPureTensorSemantics() ? getNumResults() != 1 : getNumResults() != 0)
+    return emitOpError("has one result on tensors and none on buffers");
+  return success();
+}
+
+mlir::LogicalResult mlir::npu::MmaOp::verify() {
+  if (failed(checkL1Tile(*this, getActivation(), "activation")) ||
+      failed(checkL1Tile(*this, getWeight(), "weight")))
+    return failure();
+  auto acc = getAcc().getType();
+  auto a = cast<MemRefType>(getActivation().getType()), w = cast<MemRefType>(getWeight().getType());
+  if (a.getElementType() != w.getElementType())
+    return emitOpError("activation and weight element types must match");
+  if (a.getDimSize(0) != acc.getRows() || w.getDimSize(1) != acc.getColumns())
+    return emitOpError("activation rows and weight columns must match the accumulator tile");
+  if (a.getDimSize(1) != w.getDimSize(0))
+    return emitOpError("activation columns and weight rows (K) differ");
+  return success();
+}
+
+mlir::LogicalResult mlir::npu::AccWriteoutOp::verify() {
+  if (failed(checkL1Tile(*this, getTarget(), "target"))) return failure();
+  auto t = cast<MemRefType>(getTarget().getType());
+  auto acc = getAcc().getType();
+  if (t.getDimSize(0) != acc.getRows() || t.getDimSize(1) != acc.getColumns())
+    return emitOpError("target shape must match the accumulator tile");
+  return success();
+}
+
+mlir::LogicalResult mlir::npu::GlobalCopyOp::verify() {
+  if (failed(checkCopyShape(*this, getSource(), getTarget()))) return failure();
+  unsigned s = memorySpace(getSource().getType()), t = memorySpace(getTarget().getType());
+  if (s != 0 && t != 0) return emitOpError("a global copy has a side in DRAM (memory space 0)");
+  if (s == 2 || t == 2) return emitOpError("the GDMA reaches DRAM and L2, not L1");
+  return success();
+}
+
+mlir::LogicalResult mlir::npu::LocalCopyOp::verify() {
+  if (failed(checkCopyShape(*this, getSource(), getTarget()))) return failure();
+  if (memorySpace(getSource().getType()) == 0 || memorySpace(getTarget().getType()) == 0)
+    return emitOpError("a core cannot reach DRAM; use npu.global_copy");
+  return success();
+}
+
+// ── Target level ─────────────────────────────────────────────────────────────
 
 namespace {
 using ::npu::MatrixOperand; using ::npu::MatrixType; using ::npu::WriteoutType;

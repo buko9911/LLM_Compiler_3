@@ -214,7 +214,9 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
     if (!depsFit(id, c.deps)) return bad("dependencies do not fit the ISA ver 2.0 record", id);
     const std::vector<uint32_t> deps(c.deps.begin(), c.deps.end());
     if (c.kind == Kind::Barrier) {
-      for (uint32_t w : isa2::barrierRecord(uint32_t(id), deps)) out.push_back(w);
+      auto record = isa2::barrierRecord(uint32_t(id), deps);
+      if (!record) return bad(record.error, id);
+      out.insert(out.end(), record.value.begin(), record.value.end());
       continue;
     }
     if (c.kind == Kind::Pim) {
@@ -239,8 +241,9 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
       if (!fits(body.size(), 24) || c.logicalCore < 0 || c.logicalCore >= int(isa2::kCoreAny))
         return bad("core block does not fit CORE_BEGIN", id);
       uint64_t l1 = 4 * 1024 * 1024;
-      for (uint32_t w : isa2::coreBeginRecord(uint32_t(id), deps, uint32_t(body.size()), uint32_t(c.logicalCore), l1))
-        out.push_back(w);
+      auto record = isa2::coreBeginRecord(uint32_t(id), deps, uint32_t(body.size()), uint32_t(c.logicalCore), l1);
+      if (!record) return bad(record.error, id);
+      out.insert(out.end(), record.value.begin(), record.value.end());
       out.insert(out.end(), body.begin(), body.end());
       coreCount += int64_t(body.size());
       continue;
@@ -248,9 +251,10 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
     if (!fits(c.rowBytes, 20) || !fits(c.lp6, 36) || !fits(c.l2, 24) || c.rows == 0 || !fits(c.rows - 1, 16) ||
         !fits(c.lp6Stride, 24) || !fits(c.l2Stride, 24))
       return bad("GDMA fields do not fit the ISA ver 2.0 record", id);
-    for (uint32_t w : isa2::gdmaRecord(c.kind == Kind::GdmaLoad, uint32_t(id), deps, c.lp6, c.l2, c.rowBytes, c.rows,
-                                       c.lp6Stride, c.l2Stride))
-      out.push_back(w);
+    auto record = isa2::gdmaRecord(c.kind == Kind::GdmaLoad, uint32_t(id), deps, c.lp6, c.l2, c.rowBytes, c.rows,
+                                   c.lp6Stride, c.l2Stride);
+    if (!record) return bad(record.error, id);
+    out.insert(out.end(), record.value.begin(), record.value.end());
   }
   out.push_back(isa2::OP_PROGRAM_END);
   out[0] = isa2::kMagic;

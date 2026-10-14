@@ -25,10 +25,20 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
+        # Prefill selects the same NPU-only stages as graph, including the
+        # Attention schedule. It must not route a graph through PIM partitioning.
+        prefill = args.root / "Integration/sdpa-gqa-causal-graph.mlir"
+        for pipeline in ("graph", "prefill"):
+            call([args.compiler, f"--pipeline={pipeline}", "--from=graph", prefill,
+                  "--settings", settings, "--fp16", "--readback", "--save-stages",
+                  "-o", root / pipeline])
+            assert "npu.online_softmax" in (root / pipeline / "04b-scheduled.mlir").read_text()
+        for name in ("program.bin", "system.json", "metadata.json", "04b-scheduled.mlir"):
+            assert (root / "prefill" / name).read_bytes() == (root / "graph" / name).read_bytes(), name
         base = [args.compiler, "--from=target", source, "--settings", settings]
         call([*base, "-o", root / "plain"])
         call([*base, "-o", root / "debug", "--reparse-stages"])
-        restart = root / "debug/03-target.mlir"
+        restart = root / "debug/05-target.mlir"
         call([args.compiler, "--from=target", restart, "--settings", settings, "-o", root / "restart"])
         for name in ("program.bin", "system.json"):
             for mode in ("debug", "restart"):
@@ -138,7 +148,7 @@ func.func @main() {
 """)
         call([args.compiler, "--from=placed", hazards, "--settings", changed,
               "--save-stages", "-o", root / "hazards"])
-        target = (root / "hazards/03-target.mlir").read_text()
+        target = (root / "hazards/05-target.mlir").read_text()
         assert target.count("C_WAIT_LDMA") == 2
         # One-row copies are RAW transfers (LDMA.I in ISA ver 2.0); the tile
         # written into two column halves of %out stays strided.

@@ -4,6 +4,11 @@
 #include <gtest/gtest.h>
 
 namespace {
+std::vector<uint32_t> checkedWords(npu::Result<std::vector<uint32_t>> r) {
+  EXPECT_TRUE(bool(r)) << r.error;
+  return std::move(r.value);
+}
+
 // Builder stream covering GP constants, both LDMA forms, vector memory with a
 // shared base, the M_MMA run, a strided writeout and a hardware loop.
 constexpr const char *kBlock =
@@ -58,16 +63,16 @@ TEST(IsaV2, RejectsWhatVer20CannotHold) {
 
 TEST(IsaV2, SystemRecordsMatchTheSimulatorDecoder) {
   // runner.rs unified_binary_decodes_gdma_events_and_core_begin.
-  EXPECT_EQ(npu::isa2::gdmaRecord(true, 0, {}, 0x1000, 0x2000, 64, 1, 64, 64),
+  EXPECT_EQ(checkedWords(npu::isa2::gdmaRecord(true, 0, {}, 0x1000, 0x2000, 64, 1, 64, 64)),
             (std::vector<uint32_t>{0x2b | 64u << 15, 0x1000u << 3, 0x2000u << 7}));
-  EXPECT_EQ(npu::isa2::coreBeginRecord(1, {0}, 1, 0, 64),
+  EXPECT_EQ(checkedWords(npu::isa2::coreBeginRecord(1, {0}, 1, 0, 64)),
             (std::vector<uint32_t>{0x26 | 8u << 12, 1 | 1u << 24, 1}));
   // 2-D: rows - 1, then both strides; dependencies 3, 7, 9 of record 10 at
   // distances 7, 3, 1, two per word.
-  EXPECT_EQ(npu::isa2::gdmaRecord(false, 10, {3, 7, 9}, 0, 64, 32, 4, 256, 128),
+  EXPECT_EQ(checkedWords(npu::isa2::gdmaRecord(false, 10, {3, 7, 9}, 0, 64, 32, 4, 256, 128)),
             (std::vector<uint32_t>{0x2c | 1u << 6 | 3u << 7 | 32u << 15, 0, 64u << 7, 3 | 256u << 16,
                                    128u << 8, 7 | 3u << 16, 1}));
-  EXPECT_EQ(npu::isa2::barrierRecord(5, {1, 2}), (std::vector<uint32_t>{0x2d | 2u << 6, 4 | 3u << 16}));
+  EXPECT_EQ(checkedWords(npu::isa2::barrierRecord(5, {1, 2})), (std::vector<uint32_t>{0x2d | 2u << 6, 4 | 3u << 16}));
 }
 
 TEST(IsaV2, PimPrimitiveRecordFields) {

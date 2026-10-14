@@ -38,7 +38,9 @@ TEST(ISA, RejectsReservedFields) {
     EXPECT_FALSE(bool(npu::disassemble(w))) << w;
     EXPECT_FALSE(npu::isValidInstruction(w)) << w;
   }
-  for (unsigned fn = 6; fn <= 15; ++fn) EXPECT_FALSE(bool(npu::disassemble(r(0x30,1,2,3,0,fn))));
+  // Functions 9..13 are the FP32 forms of 1..5 (ISA ver 2.0 V_OP dtype F32).
+  for (unsigned fn : {6u, 7u, 8u, 14u, 15u}) EXPECT_FALSE(bool(npu::disassemble(r(0x30,1,2,3,0,fn))));
+  for (unsigned fn = 9; fn <= 13; ++fn) EXPECT_TRUE(bool(npu::disassemble(r(0x30,1,2,3,0,fn))));
 }
 TEST(ISA, EveryInstructionRoundTripsAtRegisterBoundary) {
   for (const auto &info : npu::instructionSet()) {

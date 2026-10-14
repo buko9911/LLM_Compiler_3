@@ -72,5 +72,22 @@ bool isExactReciprocal(mlir::Operation *op);
 /// 행 리덕션이면 그 V_REDUCE 명령 이름, 아니면 nullptr.
 const char *reductionOf(mlir::linalg::GenericOp gen);
 
+/// Stage 1 끝. online softmax 를 하는 KV 루프(FlashAttention)에
+/// npu.flash_attention 을 붙이고 그 개수를 돌려준다(FlashAttention.cpp).
+unsigned markFlashAttentionLoops(mlir::ModuleOp m);
+
+/// 상수 텐서를 진입 인자로 올린다. 이미 올린 것(npu.constants) 뒤에 덧붙인다
+/// (Legalize.cpp). Stage 2 가 만드는 상수(어텐션의 scale, mask)도 이것을 쓴다.
+mlir::LogicalResult hoistConstants(mlir::ModuleOp m);
+
+/// npu.attention (Attention.cpp). Stage 1 은 프론트엔드가 풀어 쓴 GQA 반복과
+/// causal mask 를 속성으로 바꾸고, Stage 2 는 블록 크기를 정하고, Stage 4 는
+/// 하드웨어 op 로 펼친다. 버퍼화 모델은 registerPipelineDialects 가 붙인다.
+mlir::LogicalResult canonicalizeAttention(mlir::ModuleOp m);
+mlir::LogicalResult planAttention(mlir::ModuleOp m, const HardwareConfig &hw,
+                                  llvm::SmallVectorImpl<mlir::Attribute> &explanations);
+mlir::LogicalResult expandAttention(mlir::ModuleOp m);
+void registerAttentionInterfaces(mlir::DialectRegistry &registry);
+
 } // namespace npu
 #endif

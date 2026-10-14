@@ -1,7 +1,11 @@
 """torch.export -> torch-mlir -> linalg, with the parameters lifted out.
 
 Decomposition is ON: the pipeline lowers general kernels rather than recognising
-patterns, so linalg is the right thing to receive.
+patterns, so linalg is the right thing to receive. The one exception is
+scaled_dot_product_attention. Decomposed, it is a [query, key] score matrix and
+a softmax over it; kept whole, the compiler chooses the blocking itself and the
+scores never leave the chip (FlashAttention). torch-mlir keeps it as
+tm_tensor.attention, which arrives here as npu.attention.
 """
 from __future__ import annotations
 
@@ -44,15 +48,52 @@ def _strip_non_persistent(module: torch.nn.Module) -> None:
             buffers.clear()
 
 
+_ATTENTION = "aten.scaled_dot_product_attention"
+
+
+def _import(exported, name: str) -> str:
+    """torch-mlir linalg-on-tensors, with SDPA kept as one npu.attention op."""
+    from torch_mlir import fx, ir
+    from torch_mlir.extras.fx_decomp_util import get_decomposition_table
+
+    table = get_decomposition_table()
+    for op in [op for op in table if "scaled_dot_product" in str(op)]:
+        table.pop(op)
+    module = fx.export_and_import(exported, output_type="linalg-on-tensors",
+                                  func_name=name, allow_non_finites=True,
+                                  decomposition_table=table, backend_legal_ops=[_ATTENTION])
+    # The compiler does not link the TMTensor dialect; its own npu.attention has
+    # the same operands (query, key, value[, mask], init) and the scale.
+    module.context.allow_unregistered_dialects = True
+    found = []
+
+    def walk(op):
+        for region in op.regions:
+            for block in region.blocks:
+                for nested in block.operations:
+                    if nested.operation.name == "tm_tensor.attention":
+                        found.append(nested.operation)
+                    walk(nested.operation)
+
+    walk(module.operation)
+    for attention in found:
+        attributes = {}
+        if "scale" in attention.attributes:
+            attributes["scale"] = attention.attributes["scale"]
+        with ir.InsertionPoint(attention), attention.location:
+            replacement = ir.Operation.create(
+                "npu.attention", results=[attention.results[0].type],
+                operands=list(attention.operands), attributes=attributes)
+        attention.results[0].replace_all_uses_with(replacement.results[0])
+        attention.erase()
+    return str(module)
+
+
 def capture_callable(function: Callable[..., Any], example: Sequence[torch.Tensor],
                      *, name: str = "main") -> str:
     """Import one plain callable as linalg IR."""
-    from torch_mlir import fx
-
     exported = torch.export.export(_Wrapped(function), tuple(example), strict=False)
-    module = fx.export_and_import(exported, output_type="linalg-on-tensors",
-                                  func_name=name, allow_non_finites=True)
-    return str(module)
+    return _import(exported, name)
 
 
 class _Wrapped(torch.nn.Module):
@@ -87,9 +128,7 @@ def capture(model: torch.nn.Module, example: Sequence[torch.Tensor],
     inputs = tuple(list(example) + weights)
     exported = torch.export.export(Functional(), inputs, strict=False)
 
-    from torch_mlir import fx
-    module = fx.export_and_import(exported, output_type="linalg-on-tensors",
-                                  func_name=name, allow_non_finites=True)
+    mlir = _import(exported, name)
 
     arguments: list[tuple[str, tuple[int, ...], str]] = []
     for index, tensor in enumerate(example):
@@ -97,4 +136,4 @@ def capture(model: torch.nn.Module, example: Sequence[torch.Tensor],
     for key, tensor in zip(order, weights):
         arguments.append((key, tuple(tensor.shape), str(tensor.dtype).removeprefix("torch.")))
     contents = {len(example) + i: tensor for i, tensor in enumerate(weights)}
-    return CaptureResult(mlir=str(module), arguments=arguments, contents=contents)
+    return CaptureResult(mlir=mlir, arguments=arguments, contents=contents)

@@ -9,7 +9,7 @@
 namespace npu {
 // Unified program container of the PLENA simulator, "ISA ver 2.0". Core
 // blocks are built and checked as builder-stream words (ISA.h) and lowered to
-// ver 2.0 one block at a time when the program is encoded (IsaV2.h).
+// ver 2.0 one block at a time when the program is encoded (ISAv2.h).
 inline constexpr uint32_t kProgramMagic = 0x414e4c50;   // little-endian "PLNA"
 inline constexpr uint32_t kProgramVersion = 0x00020000; // major << 16 | minor
 inline constexpr const char *kProgramSchema = "plena.v2.unified_program.isa_v2.0";
@@ -47,6 +47,13 @@ Result<Program> schedule(Program program);
 // waits for at most 255 events, so BARRIER records join longer dependency
 // lists, and a DMA whose rows do not fit a GDMA record becomes several
 // records; the header command count includes both.
+struct EncodedProgram {
+  std::vector<uint32_t> words;
+  uint32_t commands = 0;
+  uint64_t coreWords = 0;
+};
+Result<EncodedProgram> encodeProgramWords(const Program &program);
+std::string systemManifestForEncoded(const Program &program, const EncodedProgram &encoded);
 Result<std::vector<uint8_t>> encodeProgram(const Program &program);
 Result<std::string> systemManifest(const Program &program);
 // Build metadata for an already successfully encoded program, without scheduling again.

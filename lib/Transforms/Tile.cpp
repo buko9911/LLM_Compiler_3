@@ -249,13 +249,23 @@ LogicalResult tileElementwiseGraph(ModuleOp m, const HardwareConfig &hw, IRRewri
     }
     auto lane = cast<RankedTensorType>(gen.getDpsInitOperand(0)->get().getType());
     if (isRowShape(lane)) {
-      // 스칼라 슬롯 하나가 레인 하나를 담으므로 타일은 원소 하나다. 남아 있는
-      // 단위 차원이 있어도 마찬가지다.
-      explanations.push_back(r.getStringAttr("Scalar lane elements=" + std::to_string(lane.getDimSize(0))));
+      // 스칼라 유닛은 원소를 하나씩 계산하지만, L1 에는 레인을 한 번에 올린다.
+      // 원소마다 L2↔L1 전송을 따로 하면 4바이트 전송의 설정과 지연이 계산보다
+      // 훨씬 크다. Stage 5 가 하드웨어 루프로 L1 타일의 원소를 훑는다.
+      const int64_t elements = lane.getDimSize(0);
+      uint64_t perElement = 0;
+      for (Value operand : gen->getOperands()) {
+        auto t = cast<RankedTensorType>(operand.getType());
+        perElement += uint64_t(t.getNumElements() / elements) * (t.getElementTypeBitWidth() / 8);
+      }
+      const int64_t tileElements = elementwiseRows(elements, perElement, hw.l1Bytes/2);
+      if (!tileElements) return gen.emitError("one scalar lane element does not fit the configured L1 capacity");
+      explanations.push_back(r.getStringAttr("Scalar lane elements=" + std::to_string(elements) +
+                                             " L1=" + std::to_string(tileElements)));
       gen->setAttr("npu.fusion_group",r.getI64IntegerAttr(explanations.size()-1));
-      auto outer = tileElementwise(r,gen,lane.getDimSize(0));
+      auto outer = tileElementwise(r,gen,elements);
       if (failed(outer) || failed(promoteElementwise(r,*outer,1))) return failure();
-      auto inner = tileElementwise(r,*outer,1);
+      auto inner = tileElementwise(r,*outer,tileElements);
       if (failed(inner) || failed(promoteElementwise(r,*inner,2))) return failure();
       continue;
     }
@@ -447,6 +457,12 @@ std::optional<int64_t> spaceOf(Value v) {
 // 패널이 오래 살아 L2 를 더 차지하므로 작은 패널만 넘긴다.
 constexpr int64_t kForwardedPanelBytes = 256 * 1024;
 void forwardPanels(ModuleOp m) {
+  // FlashAttention's carried state is coalesced as a whole by Place.cpp.
+  // Forwarding individual copies first hides those boundary copies from its
+  // alias/lifetime analysis and can strand a loop-carried scalar in DRAM.
+  bool attention = false;
+  m.walk([&](scf::ForOp loop) { attention |= loop->hasAttr("npu.flash_attention"); });
+  if (attention || m->hasAttr("npu.dram_intermediates")) return;
   SmallVector<std::pair<linalg::CopyOp, Value>> work;
   m.walk([&](linalg::CopyOp load) {
     auto fresh = load.getOutputs()[0].getDefiningOp<bufferization::AllocTensorOp>();
@@ -610,6 +626,9 @@ LogicalResult tileGraph(ModuleOp m, const HardwareConfig &hw) {
   // generic 은 행렬곱 타일링이 끝난 뒤에 모은다. 그래야 그 피연산자가 교체되어
   // 사라진 값이 아니라 잘린 결과를 가리킨다.
   if (failed(tileElementwiseGraph(m,hw,r,explanations))) return failure();
+  // 어텐션은 루프를 여기서 세우지 않는다. 블록 크기만 정해 op 에 적고,
+  // Stage 4 가 버퍼 위에서 하드웨어 op 로 펼친다(Attention.cpp).
+  if (failed(planAttention(m,hw,explanations))) return failure();
   m->setAttr("npu.plans",r.getArrayAttr(explanations));
   m->setAttr("npu.stage",r.getStringAttr("tiled"));
   // 한 번 도는 루프가 접힌 뒤라야 저장과 다시 읽기가 나란히 보인다.

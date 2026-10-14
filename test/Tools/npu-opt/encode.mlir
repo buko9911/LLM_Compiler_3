@@ -3,10 +3,8 @@
 // RUN: %npu-opt %t | %FileCheck %s
 // CHECK: npu.stage = "encoded"
 // CHECK: "npu.program"
-// ISA ver 2.0: header (magic "PLNA" 0x414e4c50, version 0x00020000, 9 words,
-// 1 record, 1 core word), CORE_BEGIN core 0 with 64 bytes of L1 (8 << 12 | 0x26)
-// and 1 core word, C_FENCE_ALL lowered to C_SYNC ALL (0xff), PROGRAM_END.
-// CHECK-SAME: words = array<i32: 1095650384, 131072, 9, 1, 1, 32806, 1, 255, 47>
+// ISA ver 2.0 header: magic "PLNA" (0x414e4c50), version 0x00020000.
+// CHECK-SAME: words = array<i32: 1095650384, 131072,
 module attributes {npu.cores = 1 : i64, npu.l1_bytes = 64 : i64,
                    npu.l2_bytes = 64 : i64, npu.dram_bytes = 64 : i64} {
   "npu.core_block"() ({

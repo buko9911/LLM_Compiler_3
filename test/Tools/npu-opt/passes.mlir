@@ -1,14 +1,19 @@
 // The compiler stages as MLIR passes, run one at a time and as a pipeline.
 // RUN: %npu-opt %s --npu-attach-hardware="settings=%S/../../Inputs/hardware.toml fp16=true" --npu-legalize --npu-tile="settings=%S/../../Inputs/hardware.toml" --npu-place="settings=%S/../../Inputs/hardware.toml" | %FileCheck %s --check-prefix=PLACED
+// RUN: %npu-opt %s --npu-attach-hardware="settings=%S/../../Inputs/hardware.toml fp16=true" --npu-legalize --npu-tile="settings=%S/../../Inputs/hardware.toml" --npu-place="settings=%S/../../Inputs/hardware.toml" --npu-hw-ops --npu-pipeline-attention --npu-assign-addresses="settings=%S/../../Inputs/hardware.toml" | %FileCheck %s --check-prefix=SCHEDULED
 // RUN: %npu-opt %s --pass-pipeline="builtin.module(npu-pipeline{settings=%S/../../Inputs/hardware.toml fp16=true})" | %FileCheck %s --check-prefix=ENCODED
 // RUN: not %npu-opt %s --npu-tile 2>&1 | %FileCheck %s --check-prefix=NOSETTINGS
 
 // torch-mlir's relu, select(cmpf ugt x, +0.0), x, +0.0), becomes maximumf in
 // Stage 1, so the VPU runs it as V_MAX_SCALAR_F16.
+// Stage 3 decides memory spaces only; addresses and lifetimes come after
+// Stage 4 (npu-assign-addresses).
 // PLACED: npu.stage = "placed"
 // PLACED-NOT: arith.select
-// PLACED: npu.live = array<i64:
+// PLACED-NOT: npu.address
 // PLACED: arith.maximumf
+// SCHEDULED: npu.stage = "scheduled"
+// SCHEDULED: npu.live = array<i64:
 
 // ENCODED: words = array<i32: 1095650384, 131072,
 
