@@ -48,6 +48,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     if (auto v = n->getBoolean("weight_prefetch_cross_batch")) s.npu.weightPrefetchCrossBatch = *v;
   num(n, "gemv_tile_bytes", s.npu.gemvTileBytes); num(n, "completion_event_slots", s.npu.completionEventSlots); num(n, "distribute_min_elements", s.npu.distributeMinElements);
   num(n, "dequant_min_elements", s.npu.dequantMinElements);
+  num(n, "staging_misc_bytes", s.npu.stagingMiscBytes);
   auto booleanOption = [&](llvm::StringRef key, bool &dst) {
     if (!n || !n->get(key)) return true;
     auto value = n->getBoolean(key);
@@ -69,10 +70,15 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("staging_early_release", s.npu.stagingEarlyRelease) ||
       !booleanOption("memory_dependency_schedule", s.npu.memoryDependencySchedule) ||
       !booleanOption("command_schedule", s.npu.commandSchedule) ||
+      !booleanOption("gdma_lookahead_streams_only", s.npu.gdmaLookaheadStreamsOnly) ||
+      !booleanOption("cross_phase_prefetch", s.npu.crossPhasePrefetch) ||
+      !booleanOption("staging_misc_fit_rings", s.npu.stagingMiscFitRings) ||
       !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
       !booleanOption("row_distribution", s.npu.rowDistribution) ||
       !booleanOption("vector_scalar_reuse", s.npu.vectorScalarReuse) ||
       !booleanOption("vector_chunk_pipeline", s.npu.vectorChunkPipeline) ||
+      !booleanOption("quant_fused_max", s.npu.quantFusedMax) ||
+      !booleanOption("vector_loops", s.npu.vectorLoops) ||
       !booleanOption("input_tile_pipeline", s.npu.inputTilePipeline) ||
       !booleanOption("gemv_epilogue_pipeline", s.npu.gemvEpiloguePipeline) ||
       !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
@@ -117,6 +123,10 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.npu.flashKvSlicing && !s.npu.flashAttention) {
     error = "npu.flash_kv_slicing requires flash_attention";
+    return failure();
+  }
+  if (s.npu.stagingMiscBytes < 0 || s.npu.stagingMiscBytes % 64) {
+    error = "npu.staging_misc_bytes must be a nonnegative multiple of 64";
     return failure();
   }
   if (s.npu.dequantMinElements < 0) {

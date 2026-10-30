@@ -427,7 +427,12 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
     if (auto ba = dyn_cast<BlockArgument>(v)) {
       auto r = take();
       if (failed(r)) return failure();
-      sload(*r, base[ba.getArgNumber()]);
+      if (rowPointers && rowPointers->count(ba.getArgNumber())) {
+        noteOutputStoreVectorWork();
+        w.append(rform(OP_V_MEM, *r, rowPointers->lookup(ba.getArgNumber()), 0, 0, 9));
+      } else {
+        sload(*r, base[ba.getArgNumber()]);
+      }
       return rowReg[v] = *r;
     }
     Operation *d = v.getDefiningOp();
@@ -501,8 +506,50 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   SmallVector<int64_t> outer(ranges.begin(), ranges.begin() + inner);
   int64_t n = ranges[inner];
   LogicalResult status = success();
-  forEachOuter(outer, 0, [&](ArrayRef<int64_t> idx) {
+  // npu.vector_loops, short rows: one hardware loop over the rows of the trailing outer dims in
+  // which every operand advances by a fixed stride (row r of the loop sits at r * stride). The body
+  // is one whole row; operands are addressed as their row pointer plus the offset in the row, and
+  // each pointer advances by its stride (zero for a broadcast operand) per iteration.
+  SmallVector<unsigned> rowOperands;
+  for (unsigned i = 0; i < nIn; ++i)
+    if (!body.getArgument(i).use_empty()) rowOperands.push_back(i);
+  rowOperands.push_back(nIn);
+  auto dimStride = [&](unsigned i, unsigned d) {
+    int64_t elements = 0;
+    for (unsigned r = 0; r < maps[i].getNumResults(); ++r)
+      if (auto de = dyn_cast<AffineDimExpr>(maps[i].getResult(r)); de && de.getPosition() == d)
+        elements += views[i].strides[r];
+    return elements;
+  };
+  unsigned loopFrom = inner;            // outer dims [loopFrom, inner) form the row loop
+  int64_t loopRows = 1;
+  SmallVector<int64_t> rowBytes(views.size(), 0);
+  if (in.spec->npu.vectorLoops && inner > 0 && n <= 512 && rowOperands.size() <= std::size(kLoopPointers)) {
+    bool fits = true;
+    for (unsigned i : rowOperands) {
+      int64_t stride = dimStride(i, inner - 1);
+      rowBytes[i] = stride * views[i].eb;
+      fits &= stride >= 0 && rowBytes[i] < (int64_t(1) << 18);
+    }
+    if (fits) {
+      loopFrom = inner - 1;
+      loopRows = ranges[inner - 1];
+      while (loopFrom > 0 && llvm::all_of(rowOperands, [&](unsigned i) {
+               return dimStride(i, loopFrom - 1) * views[i].eb == rowBytes[i] * loopRows;
+             })) {
+        --loopFrom;
+        loopRows *= ranges[loopFrom];
+      }
+      if (loopRows < 2) loopFrom = inner;
+    }
+  }
+  DenseMap<unsigned, uint32_t> pointers;
+  const bool tail = n % 32 != 0;
+  SmallVector<int64_t> loopOuter(outer.begin(), outer.begin() + loopFrom);
+  forEachOuter(loopOuter, 0, [&](ArrayRef<int64_t> prefix) {
     if (failed(status)) return;
+    SmallVector<int64_t> idx(prefix.begin(), prefix.end());
+    idx.resize(inner, 0);
     for (size_t i = 0; i < views.size(); ++i) {
       int64_t off = 0;
       for (unsigned r = 0; r < maps[i].getNumResults(); ++r) {
@@ -513,6 +560,20 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
         off += at * views[i].strides[r];
       }
       base[i] = addr(views[i], off);
+    }
+    const bool rowLoop = loopFrom < inner;
+    if (rowLoop) {
+      for (auto [k, i] : llvm::enumerate(rowOperands)) {
+        pointers[i] = kLoopPointers[k];
+        const bool vector = (i < nIn && vec[i]) || (i == nIn && !reduction);
+        const uint64_t last = uint64_t(rowBytes[i]) * uint64_t(loopRows - 1) + (vector ? uint64_t(n) * 2 : 4);
+        guardLoopRange(base[i], base[i] + last, i == nIn);
+      }
+      for (unsigned i : rowOperands) load(pointers[i], uint32_t(base[i]));
+      setVL(uint32_t(std::min<int64_t>(32, n)));
+      if (tail) cfg.erase(3);   // the body sets VL per chunk in every iteration
+      loopBegin(uint32_t(loopRows));
+      rowPointers = &pointers;
     }
     rowReg.clear();
     nextPool = constMark;
@@ -547,14 +608,36 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
         vectorScalarReuses += uses.lookup(divisor) * ((n + 31) / 32) - 1;
       }
     }
-    if (reduction) sload(accReg, base[nIn]);
+    if (reduction) {
+      if (rowLoop) {
+        noteOutputStoreVectorWork();
+        w.append(rform(OP_V_MEM, accReg, pointers[nIn], 0, 0, 9));
+      } else {
+        sload(accReg, base[nIn]);
+      }
+    }
     if (failed(emitTiles(body, nIn, vec, kind, vops, aliasOf, lastUse, base, n, reduction, pre, dotA, dotB,
                          redFunct, combFunct, result, constReg, rowReg, reciprocals, pipelineSafe,
                          accReg, tmpReg, err))) {
       status = failure();
+      rowPointers = nullptr;
       return;
     }
-    if (reduction) sstore(base[nIn], accReg);
+    if (reduction) {
+      if (rowLoop) {
+        noteOutputStoreVectorWork();
+        w.append(rform(OP_V_MEM, pointers[nIn], accReg, 0, 0, 10));
+      } else {
+        sstore(base[nIn], accReg);
+      }
+    }
+    if (rowLoop) {
+      rowPointers = nullptr;
+      for (unsigned i : rowOperands)
+        if (rowBytes[i]) advance(pointers[i], uint32_t(rowBytes[i]));
+      loopEnd();
+      if (tail) cfg.erase(3);
+    }
   });
   return status;
 }
@@ -603,7 +686,37 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
     uint32_t lanes;
     SmallVector<std::function<void()>> instructions;
   };
+  // npu.vector_loops: the full groups of `batch` 32-lane chunks become one hardware loop whose
+  // body addresses every operand through its own pointer register (offset = chunk * 64 bytes).
+  SmallVector<unsigned> addressed;
+  for (unsigned i = 0; i < nArgs; ++i)
+    if (!(i < nIn && !vec[i]) && lastUse.count(body.getArgument(i))) addressed.push_back(i);
+  if (!reduction) addressed.push_back(nIn);
+  // Four chunks per iteration spread the pointer updates and the loop end over more work.
+  const int64_t perIteration = std::max<int64_t>(batch, 4) * 32;
+  int64_t iterations = in.spec->npu.vectorLoops && !rowPointers ? n / perIteration : 0;
+  if (iterations < 2 || addressed.size() > std::size(kLoopPointers)) iterations = 0;
+  DenseMap<unsigned, uint32_t> pointer;
+  bool looped = false;
+  if (iterations) {
+    const uint64_t span = uint64_t(iterations * perIteration) * 2;
+    for (auto [k, i] : llvm::enumerate(addressed)) {
+      pointer[i] = kLoopPointers[k];
+      guardLoopRange(base[i], base[i] + span, i == nIn && !reduction);
+    }
+    for (unsigned i : addressed) load(pointer[i], uint32_t(base[i]));
+    setVL(32);
+    loopBegin(uint32_t(iterations));
+    looped = true;
+  }
   for (int64_t first = 0; first < n; first += batch * 32) {
+    if (looped && first == perIteration) {
+      for (unsigned i : addressed) advance(pointer[i], uint32_t(perIteration * 2));
+      loopEnd();
+      looped = false;
+      first = iterations * perIteration;
+      if (first >= n) break;
+    }
     SmallVector<Chunk, 2> chunks;
     const int64_t count = std::min<int64_t>(batch, (n - first + 31) / 32);
     for (int64_t chunk = 0; chunk < count; ++chunk) {
@@ -632,8 +745,14 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
           err = "out of vector registers";
           return failure();
         }
-        const uint64_t address = base[i] + uint64_t(s) * 2;
-        instructions.push_back([this, r, address] { vload(uint32_t(r), address, 1); });
+        if (looped || rowPointers) {
+          const uint32_t gp = rowPointers ? rowPointers->lookup(i) : pointer.lookup(i);
+          const uint64_t offset = uint64_t(s) * 2;
+          instructions.push_back([this, r, gp, offset] { vloadAt(uint32_t(r), gp, offset, 1); });
+        } else {
+          const uint64_t address = base[i] + uint64_t(s) * 2;
+          instructions.push_back([this, r, address] { vload(uint32_t(r), address, 1); });
+        }
         vreg[a] = uint32_t(r);
       }
       auto release = [&](int index) {
@@ -699,6 +818,10 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
         if (dotA) word(rform(OP_V_RED, tmpReg, regOf(dotA), regOf(dotB), 0, 3));
         else word(rform(OP_V_RED, tmpReg, regOf(pre), 0, 0, redFunct));
         word(rform(OP_S_ALU, accReg, accReg, tmpReg, 0, combFunct));
+      } else if (looped || rowPointers) {
+        const uint32_t gp = rowPointers ? rowPointers->lookup(nIn) : pointer.lookup(nIn), value = regOf(result);
+        const uint64_t offset = uint64_t(s) * 2;
+        instructions.push_back([this, gp, offset, value] { vstoreAt(gp, offset, value, 2); });
       } else {
         const uint64_t address = base[nIn] + uint64_t(s) * 2;
         const uint32_t value = regOf(result);

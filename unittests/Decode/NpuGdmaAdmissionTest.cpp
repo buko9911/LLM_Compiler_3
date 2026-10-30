@@ -160,6 +160,24 @@ TEST(NpuGdmaAdmission, IndependentCoreStartsWithoutWaitingForOtherCoreTail) {
     EXPECT_EQ(p.commands[b[i]].deps,(std::vector<int>{b[i-4]}));
 }
 
+TEST(NpuGdmaAdmission, UnadmittedLoadsNeitherWaitNorHoldTheChain) {
+  // npu.gdma_lookahead_streams_only: small staged loads are appended with admitted = false. The
+  // weight loads keep their N-deep chain among themselves; the small loads stay out of it.
+  ProgramBuilder builder;
+  builder.gdmaLookahead=2;
+  builder.beginPhase("streams",{});
+  std::vector<int> weights,small;
+  for (int i=0;i<6;++i) {
+    weights.push_back(builder.appendGdma(ProgramBuilder::Kind::GdmaLoad,{},4096+i*64,i*64,64,1,64,64));
+    small.push_back(builder.appendGdma(ProgramBuilder::Kind::GdmaLoad,{},65536+i*64,8192+i*64,64,1,64,64,false));
+  }
+  builder.endPhase();
+  Program p;finishProgram(builder,p);
+  for (int i=0;i<2;++i) EXPECT_TRUE(p.commands[weights[i]].deps.empty());
+  for (int i=2;i<6;++i) EXPECT_EQ(p.commands[weights[i]].deps,(std::vector<int>{weights[i-2]}));
+  for (int id:small) EXPECT_TRUE(p.commands[id].deps.empty());
+}
+
 std::vector<std::set<int>> ancestry(const Program &p) {
   std::vector<std::set<int>> result(p.commands.size());
   for (size_t i=0;i<p.commands.size();++i)

@@ -51,6 +51,39 @@ TEST(ISAv2, HardwareLoopKeepsRegisterWritesInside) {
                                    0x00000024u, 0x000000bfu, 0x000000ffu}));
 }
 
+TEST(ISAv2, VectorMemoryOffsetFromLoopRegister) {
+  // A builder V_MEM may carry a byte offset (vectorMemoryOffsetBits). Inside a hardware loop the
+  // address register is known only to the core: the offset goes to the V_LD/V_ST offset field.
+  // Outside a loop the offset is folded into the known address like any other access.
+  auto words = npu::assemble("C_LUI_U32 15, 0\nC_ADDI_U32 15, 15, 32\nC_SET_VECTOR_ELEMENTS 15\n"
+                             "C_LUI_U32 11, 1\nC_LUI_U32 3, 0\nC_ADDI_U32 3, 3, 4\n"
+                             "C_LOOP_BEGIN 3\nV_LOAD_F16 1, 11\nV_LOAD_F16 2, 11\nV_ADD_F16 3, 1, 2\n"
+                             "V_STORE_F16 11, 3\nC_ADDI_U32 11, 11, 128\nC_LOOP_END\n"
+                             "C_LUI_U32 4, 2\nV_LOAD_F16 5, 4\nC_WAIT_VPU\nC_FENCE_ALL");
+  ASSERT_TRUE(bool(words)) << words.error;
+  std::vector<size_t> memory;
+  for (size_t i = 0; i < words.value.size(); ++i)
+    if ((words.value[i] & 0x3f) == 0x35) memory.push_back(i);
+  ASSERT_EQ(memory.size(), 4u);
+  words.value[memory[1]] |= npu::isa2::vectorMemoryOffsetBits(64);
+  words.value[memory[2]] |= npu::isa2::vectorMemoryOffsetBits(96);
+  words.value[memory[3]] |= npu::isa2::vectorMemoryOffsetBits(48);
+  EXPECT_EQ(npu::isa2::vectorMemoryOffset(npu::isa2::vectorMemoryOffsetBits(0x3fff0)), 0x3fff0u);
+  auto lowered = npu::isa2::lowerCoreBlock(words.value);
+  ASSERT_TRUE(bool(lowered)) << lowered.error;
+  std::vector<std::pair<unsigned, unsigned>> accesses;   // (base register, offset / 16)
+  for (uint32_t w : lowered.value)
+    if ((w & 0x3f) == 0x32 || (w & 0x3f) == 0x33) accesses.push_back({w >> 12 & 15, w >> 16});
+  ASSERT_EQ(accesses.size(), 4u);
+  EXPECT_EQ(accesses[0], std::make_pair(11u, 0u));
+  EXPECT_EQ(accesses[1], std::make_pair(11u, 4u));
+  EXPECT_EQ(accesses[2], std::make_pair(11u, 6u));
+  // After the loop the builder value of GP4 (0x2000) plus 48 bytes is folded: GP4 holds the
+  // 1 MiB-aligned base 0 and the offset field holds 0x2030 / 16.
+  EXPECT_EQ(accesses[3], std::make_pair(4u, 0x203u));
+  EXPECT_TRUE(bool(npu::isa2::verifyCoreWords(lowered.value)));
+}
+
 TEST(ISAv2, TypedFp32GuardsAndCastsMatchSimulatorLowering) {
   // EXP.F32, CMP_EQ.F32 -> I8, SELECT.F32, F32->F16, a seven-lane
   // F16->F32 tail, and BCAST.F32. Golden words were independently obtained

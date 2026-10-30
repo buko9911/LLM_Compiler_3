@@ -72,6 +72,7 @@ void ProgramBuilder::schedulePhase() {
         return;
       }
     }
+  lastRemap = remap;
   std::vector<Command> sorted;
   sorted.reserve(count);
   for (size_t i = 0; i < count; ++i) {

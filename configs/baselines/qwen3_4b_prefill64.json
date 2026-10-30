@@ -1,5 +1,5 @@
 {
-  "_comment": "Qwen3-4B prefill step (export.py --capacity 0 --tokens 64): no KV cache input, logits of the last position only. Same NPU switches as qwen3_4b_m8_c512.json (row distribution, GEMV epilogue pipeline); four LPDDR6 channels, NPU-only. The pim and lp6_read_gbps values are the cost model of hyb-partition and are not used with --force=npu.",
+  "_comment": "Qwen3-4B prefill step (export.py --capacity 0 --tokens 64): no KV cache input, logits of the last position only. Four LPDDR6 channels, NPU-only. The pim and lp6_read_gbps values are the cost model of hyb-partition and are not used with --force=npu. The npu switches are the same in the three Qwen3-4B presets (decode qwen3_4b_m1_c512, verify qwen3_4b_m8_c512, prefill qwen3_4b_prefill64) since 2026-10-31; the measurements that chose them are in the workspace docs/research/NPU_ONLY_BASELINE.md.",
   "npu": {
     "clock_mhz": 800,
     "cores": 4,
@@ -45,7 +45,12 @@
     "elementwise_distribution": true,
     "row_distribution": true,
     "dequant_min_elements": 16384,
-    "command_schedule": true
+    "command_schedule": true,
+    "staging_misc_bytes": 65536,
+    "gdma_lookahead_streams_only": true,
+    "cross_phase_prefetch": true,
+    "quant_fused_max": true,
+    "vector_loops": true
   },
   "pim": {
     "clock_mhz": 2400,

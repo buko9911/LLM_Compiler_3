@@ -114,7 +114,14 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
         {"scalar_reciprocal_reuses", stats.vectorScalarReuses},
         {"pipeline_groups", stats.vectorPipelineGroups},
         {"pipelined_chunks", stats.vectorPipelinedChunks}};
-  if (spec.npu.gdmaLookahead) report["gdma_admission"] = json::Object{{"lookahead", spec.npu.gdmaLookahead}};
+  if (spec.npu.gdmaLookahead)
+    report["gdma_admission"] = json::Object{{"lookahead", spec.npu.gdmaLookahead},
+                                            {"streams_only", spec.npu.gdmaLookaheadStreamsOnly}};
+  if (spec.npu.stagingMiscBytes) report["staging_misc_bytes"] = stats.stagingMiscBytes;
+  if (spec.npu.crossPhasePrefetch) report["cross_phase_prefetch"] = true;
+  if (spec.npu.quantFusedMax || spec.npu.vectorLoops)
+    report["vector_code"] = json::Object{{"quant_fused_max", spec.npu.quantFusedMax},
+                                         {"vector_loops", spec.npu.vectorLoops}};
   if (spec.npu.commandSchedule)
     report["command_schedule"] = json::Object{
         {"commands", int64_t(program.lastSchedule.commands)},
@@ -164,6 +171,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
   program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
   program.commandSchedule = spec.npu.commandSchedule;
   int parallelActivationPhases = 0;
+  CarriedAccesses carried;   // npu.cross_phase_prefetch: the last NPU phase's L2 / LP6 accesses
   for (Operation &op : step.getBody().front()) {
     auto call = dyn_cast<func::CallOp>(op);
     if (!call) continue;
@@ -176,6 +184,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       std::vector<pim::Primitive> primitives(pimCommands.begin() + first, pimCommands.begin() + first + count);
       exit = {program.pimRecord(name, exit, primitives)};
       report.push_back(json::Object{{"phase", name}, {"kind", "pim"}, {"commands", count}});
+      carried = {};
       continue;
     }
     NpuPhaseInput in;
@@ -193,15 +202,19 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     in.program = &program;
     in.weightPrefetch = weightPrefetch;
     in.pimActivationCores = pimActivationCores;
+    const bool packet = callee->hasAttr("hyb.npu_kernel");
+    if (packet) carried = {};
+    else in.carried = &carried;
     program.beginPhase(name, exit);
     NpuPhaseStats stats;
-    LogicalResult emitted = callee->hasAttr("hyb.npu_kernel")
-        ? emitPimPacketNpuPhase(in, stats, err) : emitNpuPhase(in, extra, stats, err);
+    LogicalResult emitted = packet ? emitPimPacketNpuPhase(in, stats, err) : emitNpuPhase(in, extra, stats, err);
     if (failed(emitted)) {
       llvm::errs() << "NPU codegen failed in " << name << ": " << err << "\n";
       return false;
     }
     exit = program.endPhase();
+    for (auto &a : carried.l2) a.id = program.scheduledId(a.id);
+    for (auto &a : carried.lp6) a.id = program.scheduledId(a.id);
     logicalCores = std::max(logicalCores, int(stats.cores));
     if (extra.cursor > extra.limit) {
       llvm::errs() << "NPU constant pools overflow the reserved LP6 region\n";

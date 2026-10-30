@@ -20,8 +20,19 @@
 //   * consecutive M_MMA K slices of one rectangle become one M_MMA with a count;
 //   * aligned L2 <-> L1 transfers become LDMA.I (all immediates), others LDMA.R.
 // Inside a hardware loop every GP and control write is kept, so loop semantics
-// do not change.
+// do not change. A builder vector V_MEM may carry a byte offset from its address
+// register (vectorMemoryOffset); the decode compiler uses it only inside
+// hardware loops, where the register value is known to the core alone.
 namespace npu::isa2 {
+/// Builder-stream V_MEM offset field: bytes / 16 in bits [14, 22) and [26, 32) (14 bits).
+inline constexpr uint32_t vectorMemoryOffsetBits(uint64_t bytes) {
+  const uint64_t units = bytes / 16;
+  return uint32_t(units & 0xFF) << 14 | uint32_t(units >> 8 & 0x3F) << 26;
+}
+inline constexpr uint64_t vectorMemoryOffset(uint32_t word) {
+  return (uint64_t(word >> 14 & 0xFF) | uint64_t(word >> 26 & 0x3F) << 8) * 16;
+}
+inline constexpr uint64_t kVectorMemoryOffsetLimit = uint64_t(1) << 18;   // exclusive
 inline constexpr uint32_t kProgramVersion = 0x00020000;
 inline constexpr const char *kProgramSchema = "plena.v2.unified_program.isa_v2.0";
 inline constexpr uint32_t kCoreBegin = 0x26, kGdmaLoad = 0x2b, kGdmaStore = 0x2c,

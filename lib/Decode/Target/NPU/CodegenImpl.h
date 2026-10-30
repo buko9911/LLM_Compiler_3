@@ -16,6 +16,7 @@
 #include "npu/Decode/Target/NpuCodegen.h"
 #include "npu/Decode/Dialect/Hyb/HybDialect.h"
 #include "npu/Decode/Target/PlenaProgram.h"
+#include "npu/Target/ISAv2.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -121,6 +122,20 @@ private:
     return in.spec->npu.l2StagingPerCore;
   }
   uint64_t windowBase(int c) const { return uint64_t(c) * uint64_t(window()); }
+  /// The small-transfer ring at the end of each window (npu.staging_misc_bytes; zero when the
+  /// window is too small to give up that much) and the part of the window left to weight rings.
+  int64_t miscBytes() const { return stagingMisc; }
+  int64_t ringWindow() const { return window() - miscBytes(); }
+  // npu.staging_misc_bytes (at most half the window); with npu.staging_misc_fit_rings only the
+  // window space no weight ring of the phase can use (the smallest remainder after whole slots).
+  int64_t stagingMisc = 0;
+  void planMiscStaging(func::FuncOp fn);
+  std::vector<uint64_t> miscCursor;                // per core: next free byte of the small-transfer ring
+  uint64_t stagingFor(uint64_t bytes);
+  // npu.cross_phase_prefetch: the first command of this phase. GDMAs keep their hazards on
+  // earlier phases; core blocks drop them (they follow the phase entry).
+  int phaseFirstCommand = 0;
+  void reachableDependencies(std::vector<int> &deps) const;
 
   // ---- instruction helpers -------------------------------------------------------------
   void emit(uint32_t word);
@@ -156,6 +171,33 @@ private:
     load(4, uint32_t(addr));
     noteOutputStoreVectorWork();
     w.append(rform(OP_V_MEM, 4, v, 0, 0, funct));
+  }
+  // ---- hardware loops (npu.vector_loops) ------------------------------------------------------
+  // The trip count goes through GP3; loop bodies address memory through pointer registers that
+  // only loop code uses and that every other user reloads (GP 11-14, then 6-9). Pending async DMA
+  // that touches an operand is retired before the loop (guardLoopRange), so nothing in the body
+  // waits for it.
+  static constexpr uint32_t kLoopCount = 3;
+  static constexpr uint32_t kLoopPointers[8] = {11, 12, 13, 14, 6, 7, 8, 9};
+  void loopBegin(uint32_t count) {
+    load(kLoopCount, count);
+    w.append(rform(OP_LOOP_BEGIN, kLoopCount));
+  }
+  void loopEnd() { w.append(OP_LOOP_END); }
+  void advance(uint32_t gp, uint32_t bytes) { w.append(OP_ADDI | gp << 6 | gp << 10 | bytes << 14); }
+  void vloadAt(uint32_t v, uint32_t gp, uint64_t offset, uint32_t funct) {
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, v, gp, 0, 0, funct) | ::npu::isa2::vectorMemoryOffsetBits(offset));
+  }
+  void vstoreAt(uint32_t gp, uint64_t offset, uint32_t v, uint32_t funct) {
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, gp, v, 0, 0, funct) | ::npu::isa2::vectorMemoryOffsetBits(offset));
+  }
+  void guardLoopRange(uint64_t s, uint64_t e, bool write) {
+    guardInputLoad(s, e - s);
+    if (write && pendingOutputStore &&
+        llvm::any_of(pendingOutputStore->sourceRanges, [&](auto r) { return overlaps(s, e, r.first, r.second); }))
+      waitOutputStore();
   }
   void sload(uint32_t s, uint64_t addr) {
     guardInputLoad(addr,4);
@@ -209,7 +251,8 @@ private:
   static constexpr uint64_t kMaxL2AccessRanges = 1024;
 
   static SmallVector<L2Range> rowRanges(uint64_t base, uint64_t rowBytes, uint64_t rows, uint64_t stride);
-  int gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t rows, uint32_t lp6Stride, uint32_t l2Stride);
+  int gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t rows, uint32_t lp6Stride, uint32_t l2Stride,
+               bool stream = false);
   int gdmaStore(uint64_t l2, uint64_t lp6, uint32_t rowBytes, uint32_t rows, uint32_t l2Stride, uint32_t lp6Stride);
   void coreDependencies(uint64_t s, uint64_t e, bool write, std::vector<int> &need);
   void coreAccess(ArrayRef<L2Range> ranges, bool write);
@@ -318,6 +361,9 @@ private:
   // ---- generic vectorizer (CodegenGeneric.cpp) ----------------------------------------------
   // Kind of a body value: folded constant, row-invariant scalar, or FP16 vector.
   enum class K { Const, Scalar, Vector };
+  // npu.vector_loops row loop: while its body is emitted, operand i (generic operand number) is
+  // addressed as pointer register rowPointers[i] plus the offset inside the row.
+  const DenseMap<unsigned, uint32_t> *rowPointers = nullptr;
   LogicalResult lowerGeneric(linalg::GenericOp g, std::string &err);
   LogicalResult lowerTypedGeneric(linalg::GenericOp g, std::string &err);
   LogicalResult emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, DenseMap<Value, K> &kind,

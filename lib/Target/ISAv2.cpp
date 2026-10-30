@@ -167,10 +167,14 @@ public:
   int use(unsigned reg, std::initializer_list<int> keep = {}) {
     return value[reg] ? materialize(*value[reg], reg, keep) : int(reg);
   }
-  // (base register, byte offset) for a scaled-offset memory access.
-  std::pair<int, uint64_t> base(unsigned reg, uint64_t unit, uint64_t window) {
-    if (!value[reg]) return {int(reg), 0};
-    const uint64_t address = *value[reg], limit = window / unit;
+  // (base register, byte offset) for a scaled-offset memory access at the register's value plus
+  // `extra` bytes. A register that only a hardware loop knows keeps `extra` as the offset.
+  std::pair<int, uint64_t> base(unsigned reg, uint64_t unit, uint64_t window, uint64_t extra = 0) {
+    if (!value[reg]) {
+      if (extra % unit || extra / unit >= window / unit) fail("memory offset outside the addressing window");
+      return {int(reg), extra};
+    }
+    const uint64_t address = *value[reg] + extra, limit = window / unit;
     auto usable = [&](int candidate) {
       auto b = physical[candidate];
       return b && *b <= address && (address - *b) % unit == 0 && (address - *b) / unit < limit;
@@ -279,7 +283,7 @@ public:
       mWb(out, dtype, gp, m, n, (m == 1 || stride == n * element) ? 0 : stride);
       return;
     }
-    case 0x35: memory(funct, rd, rs1); return;
+    case 0x35: memory(funct, rd, rs1, vectorMemoryOffset(word)); return;
     case 0x36: typed(record); return;
     case 0x30: {
       int op = f16Binary(funct); unsigned type = F16;
@@ -390,16 +394,19 @@ public:
     mLd(out, unsigned(kind), gp, mn, k, contiguous ? std::nullopt : std::optional<uint64_t>(stride));
   }
 
-  void memory(unsigned funct, unsigned rd, unsigned rs1) {
+  // `extra`: the builder V_MEM byte offset from the address register (nonzero only for vector
+  // accesses inside hardware loops, see vectorMemoryOffset).
+  void memory(unsigned funct, unsigned rd, unsigned rs1, uint64_t extra = 0) {
     const bool store = funct % 2 == 0;
     const unsigned address = store ? rd : rs1, data = store ? rs1 : rd;
     if (funct >= 9) {
+      if (extra) { fail("scalar memory has no builder offset"); return; }
       auto [b, offset] = base(address, 4, SCALAR_WINDOW);
       out.push_back(sMem(store, data, unsigned(b), offset));
       return;
     }
     need(SET_VL);
-    auto [b, offset] = base(address, 16, VECTOR_WINDOW);
+    auto [b, offset] = base(address, 16, VECTOR_WINDOW, extra);
     out.push_back(vMem(store, (funct - 1) / 2, data, unsigned(b), offset));
   }
 

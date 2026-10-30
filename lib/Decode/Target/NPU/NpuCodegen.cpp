@@ -180,8 +180,15 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   const int commands0 = w.numCommands();
   poolLoaded.assign(size_t(cores), false);
   satisfied.assign(size_t(cores), {});
+  miscCursor.assign(size_t(cores), 0);
+  phaseFirstCommand = commands0;
+  if (in.carried && in.spec->npu.crossPhasePrefetch) {
+    for (const auto &a : in.carried->l2) l2acc.push_back({a.s, a.e, a.id, a.core, AccKind(a.kind)});
+    for (const auto &a : in.carried->lp6) lp6acc.push_back({a.s, a.e, a.id, a.store});
+  }
   scratchBase = uint64_t(kL1Base + kPoolMax);
   collectConstants(fn);
+  planMiscStaging(fn);
   if (poolBytes > kPoolMax || kPoolMax >= in.spec->npu.l1ReservedBytes) {
     err = "constant pool larger than its reserve";
     return failure();
@@ -191,11 +198,21 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   if (failed(emitBlock(fn.getBody().front(), err))) return failure();
   endCore();
   w.flushBlock(false);
+  if (in.carried) {
+    in.carried->l2.clear();
+    in.carried->lp6.clear();
+    if (in.spec->npu.crossPhasePrefetch) {
+      for (const Acc &a : l2acc)
+        if (a.id >= 0) in.carried->l2.push_back({a.s, a.e, a.id, a.core, int(a.k)});
+      for (const LAcc &a : lp6acc) in.carried->lp6.push_back({a.s, a.e, a.id, a.store});
+    }
+  }
   stats.coreWords = w.coreWords() - words0;
   stats.commands = w.numCommands() - commands0;
   if (auto p = fn->getAttrOfType<IntegerAttr>("hyb.l1_peak")) stats.l1Peak = p.getInt();
   stats.cores = cores;
   stats.l2StagingPerCore = window();
+  stats.stagingMiscBytes = stagingMisc;
   stats.weightStreams = std::move(weightStreams);
   stats.asyncOutputStores = asyncOutputStores;
   stats.outputStoresWithVectorWork = outputStoresWithVectorWork;
@@ -210,6 +227,32 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
     fn->setAttr("hyb.pim_activation_plan", StringAttr::get(fn.getContext(), stats.pimActivationPlanJson));
   }
   return success();
+}
+
+void Codegen::planMiscStaging(func::FuncOp fn) {
+  int64_t misc = in.spec->npu.stagingMiscBytes;
+  if (!misc) return;
+  misc = std::min(misc, window() / 2);
+  // The weight copy of every streamed loop: its L1 tile size is the ring slot (64-byte aligned).
+  fn.walk([&](scf::ForOp f) {
+    if (!in.spec->npu.stagingMiscFitRings || !f->hasAttr("hyb.stream")) return;
+    for (Operation &op : f.getBody()->without_terminator())
+      if (auto c = dyn_cast<memref::CopyOp>(op)) {
+        auto type = cast<MemRefType>(c.getTarget().getType());
+        Value root = c.getSource();
+        while (Operation *d = root.getDefiningOp()) {
+          if (!isViewOp(d)) break;
+          root = d->getOperand(0);
+        }
+        if (!root.getDefiningOp<hyb::WeightOp>() || spaceOf(type) != kL1 || !type.hasStaticShape()) continue;
+        const int64_t slot = (type.getNumElements() * type.getElementTypeBitWidth() / 8 + 63) / 64 * 64;
+        int64_t slots = window() / std::max<int64_t>(1, slot);
+        if (in.spec->npu.weightStreamMaxSlots) slots = std::min(slots, in.spec->npu.weightStreamMaxSlots);
+        misc = std::min(misc, window() - slots * slot);
+        break;
+      }
+  });
+  stagingMisc = misc / 64 * 64;
 }
 
 } // namespace mlir::hybrid::codegen

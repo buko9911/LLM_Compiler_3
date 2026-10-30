@@ -81,8 +81,25 @@ struct TargetSpec {
     bool memoryDependencySchedule = false;
     // Reuse a row-invariant scalar reciprocal across vector chunks; interleave independent chunks.
     bool vectorScalarReuse = false, vectorChunkPipeline = false;
+    // hyb.quant: keep max|x| of a row in a vector register (one V_MAX per chunk) instead of storing
+    // |x| to L1 and reducing it again. Max is exact in any order, so the scales are the same.
+    bool quantFusedMax = false;
+    // Emit the repeated 32-lane chunks of a row (linalg.generic, hyb.quant) as one hardware loop
+    // (C_LOOP) instead of unrolling them: the same instructions run, far fewer are fetched.
+    bool vectorLoops = false;
     // Per-core GDMA commands issued ahead within a phase; zero is unlimited.
     int64_t gdmaLookahead = 0;
+    // Count only weight-stream GDMAs against gdmaLookahead; small staged loads are not held back.
+    bool gdmaLookaheadStreamsOnly = false;
+    // Bytes at the end of each staging window for small LP6 <-> L1 transfers, used as a byte
+    // ring; the weight ring stays below them. Zero stages every transfer at the window start.
+    int64_t stagingMiscBytes = 0;
+    // Shrink that area to the window space no weight ring of the phase can use, so no ring loses a
+    // slot (transfers that no longer fit go to the window start).
+    bool stagingMiscFitRings = false;
+    // GDMA loads of an NPU phase wait for the earlier phase's accesses to the same L2 / LP6
+    // bytes instead of its exit barrier, so the next layer's weights stream in during its tail.
+    bool crossPhasePrefetch = false;
     // Reorder system commands by their first consumer, keeping every dependency.
     bool commandSchedule = false;
   } npu;

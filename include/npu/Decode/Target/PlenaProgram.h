@@ -79,9 +79,10 @@ public:
                uint32_t l2Stride = 0, bool overlapWithCurrentBlock = false);
   int gdmaStore(uint64_t lp6, uint64_t l2, uint32_t bytes, uint32_t rows = 1, uint32_t lp6Stride = 0,
                 uint32_t l2Stride = 0, bool allowFollowingOverlap = false);
-  /// Raw GDMA with explicit dependencies (frontier untouched).
+  /// Raw GDMA with explicit dependencies (frontier untouched). `admitted` GDMAs count against
+  /// gdmaLookahead; the others are neither held back nor hold later ones back.
   int appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, uint64_t l2, uint32_t bytes, uint32_t rows,
-                 uint32_t lp6Stride, uint32_t l2Stride);
+                 uint32_t lp6Stride, uint32_t l2Stride, bool admitted = true);
   void reserveL2(uint64_t addr, uint64_t size) { l2HighWater = std::max(l2HighWater, addr + size); }
   /// Writes <dir>/program.bin and <dir>/system.json (with pim_kernel when there are PIM records);
   /// returns false on I/O error or a record that does not fit ISA ver 2.0.
@@ -89,6 +90,13 @@ public:
 
   int64_t coreWords() const { return int64_t(isa.size() + cur.size()); }
   int numCommands() const { return int(cmds.size()); }
+  /// The records every record of the current phase follows (the previous phase's exit).
+  const std::vector<int> &phaseEntry() const { return base; }
+  /// A command index of the phase that endPhase just closed, after its command_schedule reorder.
+  int scheduledId(int id) const {
+    return id >= int(lastPhaseStart) && size_t(id) - lastPhaseStart < lastRemap.size()
+        ? lastRemap[size_t(id) - lastPhaseStart] : id;
+  }
   uint32_t gpValue(unsigned reg) const { return gp.at(reg); }
 
 private:
@@ -111,6 +119,8 @@ private:
   size_t phaseStart = 0;
   std::map<int, std::vector<int>> phaseGdmas; // logical core -> DMA admission history
   std::vector<int> base;                  // the current phase's entry
+  size_t lastPhaseStart = 0;              // the closed phase's first command and its reorder
+  std::vector<int> lastRemap;             // (old index - lastPhaseStart) -> new index
 };
 
 // ---- builder-stream encodings (lowered to ISA ver 2.0 by ISAv2.h) ------------------------------------------------------

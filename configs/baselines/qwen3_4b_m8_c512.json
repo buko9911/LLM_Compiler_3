@@ -1,5 +1,5 @@
 {
-  "_comment": "Target description read by hyb-partition, hyb-npu-tile, hyb-npu-memplan and the NPU backend. LP6: four LPDDR6 channels (8 subchannels x 2 ranks, dram-pim configs/LPDDR6_PIM_Mobile_4CH.ini), run with IESLAB_NPU_Simulator/plena_settings.toml (runtime/decode.py default). configs/target_1ch.json is one channel (the LP6 of the Part 3 results). npu.lp6_read_gbps is the 36-layer NPU-only W8A8 step on four channels (4.02 GB in 71.6 ms, 2026-09-30); pim.efficiency is still the one-channel fit (runtime/calibrate.py, 2026-09-26); the boundary costs (act_write_*, readback_*) and gemv_fixed_us are estimates from the former hybrid_bench (workspace docs/PERFORMANCE.md, 2026-09-21 hybrid bench results \u00a719.1), not fitted. None of these values is from the LPDDR6-PIM PDF. pim.concurrent_ranks remains false to preserve the existing calibration and baseline; it is not required by an absence of cross-rank PIM timing. Draft 13.6 maps PIMX to base Meta commands, whose cross-rank 2 CK in the supported WCK-always-on/ODT-off profile is enforced by the shared CA scheduler. true permits both ranks to compute while sharing external DQ. See the workspace docs/research/PIM_RANK_REFRESH_FEED.md (rank-overlap spec and two-rank baseline sections) for validation and remaining protocol/input-feed limits.",
+  "_comment": "Target description read by hyb-partition, hyb-npu-tile, hyb-npu-memplan and the NPU backend. LP6: four LPDDR6 channels (8 subchannels x 2 ranks, dram-pim configs/LPDDR6_PIM_Mobile_4CH.ini), run with IESLAB_NPU_Simulator/plena_settings.toml (runtime/decode.py default). configs/target_1ch.json is one channel (the LP6 of the Part 3 results). npu.lp6_read_gbps is the 36-layer NPU-only W8A8 step on four channels (4.02 GB in 71.6 ms, 2026-09-30); pim.efficiency is still the one-channel fit (runtime/calibrate.py, 2026-09-26); the boundary costs (act_write_*, readback_*) and gemv_fixed_us are estimates from the former hybrid_bench (workspace docs/PERFORMANCE.md, 2026-09-21 hybrid bench results \u00a719.1), not fitted. None of these values is from the LPDDR6-PIM PDF. pim.concurrent_ranks remains false to preserve the existing calibration and baseline; it is not required by an absence of cross-rank PIM timing. Draft 13.6 maps PIMX to base Meta commands, whose cross-rank 2 CK in the supported WCK-always-on/ODT-off profile is enforced by the shared CA scheduler. true permits both ranks to compute while sharing external DQ. See the workspace docs/research/PIM_RANK_REFRESH_FEED.md (rank-overlap spec and two-rank baseline sections) for validation and remaining protocol/input-feed limits. The npu switches are the same in the three Qwen3-4B presets (decode qwen3_4b_m1_c512, verify qwen3_4b_m8_c512, prefill qwen3_4b_prefill64) since 2026-10-31; the measurements that chose them are in the workspace docs/research/NPU_ONLY_BASELINE.md.",
   "npu": {
     "clock_mhz": 800,
     "cores": 4,
@@ -45,7 +45,12 @@
     "elementwise_distribution": true,
     "row_distribution": true,
     "dequant_min_elements": 16384,
-    "command_schedule": true
+    "command_schedule": true,
+    "staging_misc_bytes": 65536,
+    "gdma_lookahead_streams_only": true,
+    "cross_phase_prefetch": true,
+    "quant_fused_max": true,
+    "vector_loops": true
   },
   "pim": {
     "clock_mhz": 2400,

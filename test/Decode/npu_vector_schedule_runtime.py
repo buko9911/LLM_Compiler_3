@@ -67,7 +67,7 @@ def source(rows, columns, body, inputs, reduction=False):
 def fixtures():
     cases = []
     rng = np.random.default_rng(41)
-    for rows, columns in [(1, 32), (3, 33), (2, 97), (3, 257)]:
+    for rows, columns in [(1, 32), (3, 33), (2, 97), (3, 257), (2, 1100)]:
         x = (rng.integers(-16, 17, size=(rows, columns)) / 8).astype(np.float16)
         u = (rng.integers(-8, 9, size=x.shape) / 4).astype(np.float16)
         x.flat[:4] = [-12., -1., -0., 0.]
@@ -104,13 +104,13 @@ def fixtures():
         cases.append(dict(name=f"row_divisor_n{columns}",
             source=source(rows, columns, body, [("x", "vector"), ("d", "scalar")]),
             inputs=dict(x=x, d=stored_d), reference=reference, pipeline=True, scalar_reuse=True))
-    rows, columns = 3, 65
-    x = rng.integers(-8, 9, size=(rows, columns)).astype(np.float16)
-    body = '''%wide = arith.extf %x_arg : f16 to f32
-      %sum = arith.addf %wide,%out : f32
-      linalg.yield %sum : f32'''
-    cases.append(dict(name="reduction_excluded", source=source(rows, columns, body, [("x", "vector")], True),
-        inputs=dict(x=x), reference=x.astype(np.float32).sum(axis=1), pipeline=False, scalar_reuse=False))
+    for name, rows, columns in [("reduction_excluded", 3, 65), ("reduction_long", 2, 1100)]:
+        x = rng.integers(-8, 9, size=(rows, columns)).astype(np.float16)
+        body = '''%wide = arith.extf %x_arg : f16 to f32
+          %sum = arith.addf %wide,%out : f32
+          linalg.yield %sum : f32'''
+        cases.append(dict(name=name, source=source(rows, columns, body, [("x", "vector")], True),
+            inputs=dict(x=x), reference=x.astype(np.float32).sum(axis=1), pipeline=False, scalar_reuse=False))
     inputs = {f"x{i}": (rng.integers(-4, 5, size=(2, 97))/4).astype(np.float16) for i in range(9)}
     lines = ["%v1 = arith.addf %x0_arg,%x1_arg : f16"]
     value = rounded(inputs["x0"] + inputs["x1"])
@@ -160,10 +160,11 @@ def main():
         np.save(case/"legacy_reference.npy", fixture["reference"])
         control = None
         records = {}
-        for mode in ["off", "reuse", "pipeline", "both"]:
+        # loops: "both" with the repeated chunks / short rows as hardware loops (npu.vector_loops).
+        for mode in ["off", "reuse", "pipeline", "both", "loops"]:
             spec = json.loads((root/"configs/target.json").read_text())
-            reuse, pipeline = mode in ("reuse","both"), mode in ("pipeline","both")
-            spec["npu"].update(vector_scalar_reuse=reuse, vector_chunk_pipeline=pipeline,
+            reuse, pipeline = mode in ("reuse","both","loops"), mode in ("pipeline","both","loops")
+            spec["npu"].update(vector_scalar_reuse=reuse, vector_chunk_pipeline=pipeline, vector_loops=mode == "loops",
                 elementwise_distribution=False, staging_early_release=False,
                 memory_dependency_schedule=False, attention_fusion=False, projection_fusion=False,
                 activation_residency=True,

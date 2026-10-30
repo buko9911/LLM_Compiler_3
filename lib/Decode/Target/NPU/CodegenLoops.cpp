@@ -181,7 +181,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
           FailureOr<View> v = viewOf(c.getSource(), err);
           if (failed(v)) return failure();
           slotBytes = uint64_t(v->elements() * v->eb + 63) / 64 * 64;
-          nslots = uint64_t(window()) / std::max<uint64_t>(1, slotBytes);
+          nslots = uint64_t(ringWindow()) / std::max<uint64_t>(1, slotBytes);
           if (in.spec->npu.weightStreamMaxSlots)
             nslots = std::min(nslots, uint64_t(in.spec->npu.weightStreamMaxSlots));
           if (nslots >= 1) stream = c;
@@ -245,7 +245,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       env[iv] = *lb + tile * *step;
       auto src = viewOf(stream.getSource(), err);
       if (failed(src)) return failure();
-      gdmaLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb), 1, 0, 0);
+      gdmaLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb), 1, 0, 0, true);
       return success();
     };
     for (int64_t j = 0; j < std::min<int64_t>(n,nslots); ++j)
@@ -307,7 +307,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
         env[iv] = *lb + issued * *step;
         FailureOr<View> v = viewOf(stream.getSource(), err);
         if (failed(v)) return failure();
-        gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0);
+        gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0, true);
       }
     }
     if (pipeline) {

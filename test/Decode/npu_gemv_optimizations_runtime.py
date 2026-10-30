@@ -46,7 +46,7 @@ def main():
                 'both': (True, True), 'rotated': (True, True), 'batch1': (True, True),
                 'async': (False, False), 'both_async': (True, True),
                 'async_immediate': (False, False), 'release': (False, False),
-                'pipeline': (True, True), 'pipeline_release': (True, True)}
+                'pipeline': (True, True), 'pipeline_release': (True, True), 'round2': (True, True)}
     parser.add_argument('--modes', nargs='+', choices=list(policies),
                         default=['off', 'init', 'epilogue', 'both', 'rotated', 'batch1'])
     args = parser.parse_args()
@@ -61,7 +61,8 @@ def main():
     results = {}
     for name,m,k,n,tile in [('m1',1,64,1152,4096),('m8',8,256,768,16384),
                            ('m33_rectangles',33,64,1152,6144),('single_tile',8,64,128,8192),
-                           ('one_core',8,64,384,4096),('two_slots',8,64,1152,2048)]:
+                           ('one_core',8,64,384,4096),('two_slots',8,64,1152,2048),
+                           ('m8_k1024',8,1024,256,32768)]:
         case = output/name
         case.mkdir(); (case/'model').mkdir()
         rng = np.random.default_rng(917)
@@ -85,6 +86,10 @@ def main():
                 spec['npu']['weight_stream_early_release'] = True
             if mode in ('pipeline', 'pipeline_release'):
                 spec['npu']['gemv_epilogue_pipeline'] = True
+            if mode == 'round2':   # the 2026-10-31 switches together with the pipelined epilogue
+                spec['npu'].update(weight_stream_early_release=True, gemv_epilogue_pipeline=True,
+                                   quant_fused_max=True, vector_loops=True, staging_misc_bytes=4096,
+                                   gdma_lookahead=2, gdma_lookahead_streams_only=True, cross_phase_prefetch=True)
             if mode in ('async', 'both_async', 'async_immediate'):
                 spec['npu']['async_output_stores'] = True
             if mode == 'async_immediate':

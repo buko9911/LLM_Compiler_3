@@ -116,26 +116,28 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 ## Target spec의 `npu.*` 선택 기능
 
-모두 기본 false(꺼짐)다. `configs/baselines/`의 세 설정은 Qwen3-4B에서 측정으로 골랐다(1토큰 decode:
-`qwen3_4b_m1_c512.json`, 8토큰 verify: `qwen3_4b_m8_c512.json`, 64토큰 prefill: `qwen3_4b_prefill64.json`;
-36층 전체는 `--npu-phase-split=layer`, 1층 fixture에서 1토큰은 `none`도 쓴다). 측정과 남은 차이는
+모두 기본 false(꺼짐)다. `configs/baselines/`의 세 설정(1토큰 decode `qwen3_4b_m1_c512.json`, 8토큰 verify
+`qwen3_4b_m8_c512.json`, 64토큰 prefill `qwen3_4b_prefill64.json`)은 Qwen3-4B에서 측정으로 골랐고, 2026-10-31부터
+`npu.*` 스위치가 셋 모두 같다(아래 표의 "켬"). 36층 전체는 `--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는
 `../../docs/research/NPU_ONLY_BASELINE.md`에 있다.
 
-| 키 | 담당 | 1토큰 | 8토큰·prefill |
-|---|---|:-:|:-:|
-| `projection_fusion` | pass | 켬 | 켬 |
-| `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | | |
-| `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | | 켬 |
-| `row_distribution`, `gemv_epilogue_pipeline` | pass: 행 사슬 분배, GEMV dequant 겹치기 | | 켬 |
-| `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 | 켬 |
-| `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 | 켬 |
-| `async_output_store_vector_overlap` (기본 true) | codegen: 비동기 저장 중 vector 작업 허용 | 켬 | 끔 |
-| `staging_early_release`, `weight_stream_early_release` | codegen: staging slot 조기 반환 | 켬 | 켬 |
-| `memory_dependency_schedule` | codegen: 행렬/출력 DMA 의존성을 실제 L1 범위로 | 켬 | |
-| `vector_scalar_reuse`, `vector_chunk_pipeline` | codegen: VPU 명령 배치 | chunk만 | 켬 |
-| `weight_stream_rotate_slots`, `weight_prefetch_cross_batch` | codegen: weight 링 | cross만 | 켬 |
-| `gdma_lookahead` (정수) | 코어별 선행 GDMA 수 | 8 | 2 |
-| `command_schedule` | system command 재배열 | | 켬 |
+| 키 | 담당 | 세 설정 |
+|---|---|:-:|
+| `projection_fusion`, `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | 켬 |
+| `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | |
+| `row_distribution`, `gemv_epilogue_pipeline` | pass: 행 사슬 분배, GEMV dequant 겹치기 | 켬 |
+| `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 |
+| `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 |
+| `async_output_store_vector_overlap` (기본 true) | codegen: 비동기 저장 중 vector 작업 허용 | 끔 |
+| `staging_early_release`, `weight_stream_early_release` | codegen: staging slot 조기 반환 | 켬 |
+| `memory_dependency_schedule` | codegen: 행렬/출력 DMA 의존성을 실제 L1 범위로 | |
+| `vector_scalar_reuse`, `vector_chunk_pipeline` | codegen: VPU 명령 배치 | 켬 |
+| `weight_stream_rotate_slots`, `weight_prefetch_cross_batch` | codegen: weight 링 | 켬 |
+| `gdma_lookahead` (정수), `gdma_lookahead_streams_only` | 코어별 선행 GDMA 수, weight ring 읽기만 셈 | 2, 켬 |
+| `staging_misc_bytes` (정수), `staging_misc_fit_rings` | 작은 LP6↔L1 전송용 staging 창 끝 영역, 그 크기를 ring 남는 공간으로 줄일지 | 65536, |
+| `cross_phase_prefetch` | 다음 phase GDMA load가 barrier 대신 같은 주소의 앞 접근만 기다림 | 켬 |
+| `quant_fused_max`, `vector_loops` | codegen: quant max를 register에서, 반복 VPU 묶음을 hardware loop로 | 켬 |
+| `command_schedule` | system command 재배열 | 켬 |
 
 정수 옵션(`gemv_tile_bytes`, `distribute_min_elements`, `dequant_min_elements`, `l2_staging_bytes_per_core`,
 `weight_stream_max_slots`, `weight_prefetch_batch_tiles`, `input_tile_columns`)과 하드웨어 값은
@@ -155,7 +157,10 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `decode-runtime-backend` | runtime의 DRAM backend 선택 |
 
 시뮬레이터까지 실행하는 회귀(`test/Decode/weight_prefetch.py`, `pim_*.py`, `npu_*_runtime.py`)는 ctest에
-등록하지 않았다. 실행 방법은 workspace의 `docs/BUILD_AND_RUN.md` §3을 따른다.
+등록하지 않았다. 실행 방법은 workspace의 `docs/BUILD_AND_RUN.md` §3을 따른다. 2026-10-31 스위치는
+`npu_vector_schedule_runtime.py`(`loops` 모드: 짧은 행·긴 행·reduction·행 scalar를 hardware loop로, 독립 oracle과
+byte 비교)와 `npu_gemv_optimizations_runtime.py`(`round2` 모드: 다섯 스위치 + GEMV dequant 겹치기, 정수 GEMM oracle과
+byte 비교, K=1024 사례 포함)로 확인한다.
 
 ## 문서
 

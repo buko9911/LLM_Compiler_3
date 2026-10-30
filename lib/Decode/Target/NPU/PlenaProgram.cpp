@@ -132,6 +132,8 @@ void ProgramBuilder::beginPhase(const std::string &name, std::vector<int> entry)
 std::vector<int> ProgramBuilder::endPhase() {
   flushBlock();
   lastSchedule = {};
+  lastPhaseStart = phaseStart;
+  lastRemap.clear();
   size_t end = cmds.size();
   if (end == phaseStart) return base;
   std::vector<bool> used(end - phaseStart, false);
@@ -182,7 +184,7 @@ int ProgramBuilder::pimRecord(const std::string &name, std::vector<int> deps, co
 }
 
 int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, uint64_t l2, uint32_t bytes,
-                               uint32_t rows, uint32_t lp6Stride, uint32_t l2Stride) {
+                               uint32_t rows, uint32_t lp6Stride, uint32_t l2Stride, bool admitted) {
   assert(bytes > 0 && rows > 0);
   Command c;
   c.kind = kind;
@@ -201,7 +203,7 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
   // otherwise independent cores. Aggregate admission is at most N * cores.
   // These resource edges supplement true memory hazards. The predecessor is
   // already appended, so an added edge cannot introduce a command DAG cycle.
-  if (gdmaLookahead) {
+  if (gdmaLookahead && admitted) {
     const auto &history = phaseGdmas[logicalCore];
     if (history.size() >= gdmaLookahead) {
       c.deps.push_back(history[history.size() - gdmaLookahead]);
@@ -210,7 +212,7 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
     }
   }
   int id = push(std::move(c));
-  if (gdmaLookahead) phaseGdmas[logicalCore].push_back(id);
+  if (gdmaLookahead && admitted) phaseGdmas[logicalCore].push_back(id);
   return id;
 }
 
