@@ -50,7 +50,7 @@ HF checkpoint ── frontend/export.py ──▶ step.mlir + manifest.json
 | | `hyb-npu-attention-fusion` | head 하나의 QK·mask·softmax·PV를 한 코어에(M>1의 reshape 통과) | `attention_fusion` |
 | | `hyb-npu-gemv-epilogue` | GEMV 출력 열을 코어별로 나눠 같은 코어에서 역양자화 | `gemv_epilogue_fusion` |
 | | `hyb-npu-tile` | 코어 분배(`scf.forall`)와 weight 타일 루프(`scf.for {hyb.stream}`) | |
-| | `hyb-npu-elementwise-distribute` | 큰 elementwise 연산을 코어에 분배 | `elementwise_distribution` |
+| | `hyb-npu-elementwise-distribute` | 큰 elementwise 연산을 코어에 분배. `row_distribution`이면 quant·행 reduction 사슬도 토큰 행으로 분배 | `elementwise_distribution`, `row_distribution` |
 | 4. buffer | `hyb-private-phase-results` | PIM이 읽는 NPU 결과에 전용 buffer | |
 | | `hyb-npu-activation-residency` | phase 출력과 phase 내부 activation의 buffer 분리 | `activation_residency` |
 | | `one-shot-bufferize`, `buffer-results-to-out-params` | tensor → memref | |
@@ -60,6 +60,7 @@ HF checkpoint ── frontend/export.py ──▶ step.mlir + manifest.json
 | | `hyb-npu-matrix-init` | 행렬 INIT가 덮어쓰는 0 채우기 생략 표시 | `matrix_init_elision` |
 | | `hyb-npu-matmul-layout` | transpose-B matmul이 SA 타일을 채우도록 배치 변경 | `matmul_rhs_packing`, `matmul_transpose_output` |
 | | `hyb-npu-input-pipeline` | L2→L1 입력 복사와 matmul을 타일로 나눠 겹침 | `input_tile_pipeline` |
+| | `hyb-npu-epilogue-pipeline` | GEMV 루프 뒤 dequant를 한 타일 늦게 다음 타일의 MMA 사이에 냄(VPU와 SA 겹침) | `gemv_epilogue_pipeline` |
 | | `hyb-npu-memplan` | 수명 기반 L1/L2 주소 배정, 루프 buffer 2칸, L2 staging 크기 | |
 
 ## Backend (MLIR pass 아님)
@@ -92,6 +93,7 @@ ctest --test-dir build -j6 --output-on-failure
 ```sh
 PY=$LP6/toolchain/pyenv-qpim/bin/python
 $PY frontend/export.py --model /home/jongjip/models/qwen-3-4b --tokens 1 --capacity 512 --out ir   # --layers N: 앞 N층만
+#   --tokens 8 --capacity 512: verify(8토큰, cache 있음)   --tokens 64 --capacity 0: prefill(cache 없음, 마지막 위치 logits)
 build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/target.json -o out              # NPU+PIM 자동 분할
 build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/baselines/qwen3_4b_m1_c512.json \
   --force=npu -o out-npu                                                                                     # NPU-only
@@ -114,14 +116,17 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 ## Target spec의 `npu.*` 선택 기능
 
-모두 기본 false(꺼짐)다. `configs/baselines/`의 두 설정은 Qwen3-4B 1층 + LM head에서 측정으로 골랐다
-(1토큰: `qwen3_4b_m1_c512.json` + `--npu-phase-split=none`, 8토큰: `qwen3_4b_m8_c512.json` + `layer`).
+모두 기본 false(꺼짐)다. `configs/baselines/`의 세 설정은 Qwen3-4B에서 측정으로 골랐다(1토큰 decode:
+`qwen3_4b_m1_c512.json`, 8토큰 verify: `qwen3_4b_m8_c512.json`, 64토큰 prefill: `qwen3_4b_prefill64.json`;
+36층 전체는 `--npu-phase-split=layer`, 1층 fixture에서 1토큰은 `none`도 쓴다). 측정과 남은 차이는
+`../../docs/research/NPU_ONLY_BASELINE.md`에 있다.
 
-| 키 | 담당 | 1토큰 | 8토큰 |
+| 키 | 담당 | 1토큰 | 8토큰·prefill |
 |---|---|:-:|:-:|
 | `projection_fusion` | pass | 켬 | 켬 |
 | `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | | |
 | `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | | 켬 |
+| `row_distribution`, `gemv_epilogue_pipeline` | pass: 행 사슬 분배, GEMV dequant 겹치기 | | 켬 |
 | `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 | 켬 |
 | `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 | 켬 |
 | `async_output_store_vector_overlap` (기본 true) | codegen: 비동기 저장 중 vector 작업 허용 | 켬 | 끔 |
@@ -145,7 +150,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `npu-lit` | `npu-opt` lit 테스트 |
 | `pim-layout` | PIM 배치 |
 | `decode-driver` | CLI 경로와 오류 |
-| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-flash-attention`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution` | pass별 IR 회귀 |
+| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-flash-attention`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution`, `decode-row-distribution` | pass별 IR 회귀 |
 | `decode-frontend` | export한 그래프를 HF 모델과 비교(simulator 설정 필요) |
 | `decode-runtime-backend` | runtime의 DRAM backend 선택 |
 
