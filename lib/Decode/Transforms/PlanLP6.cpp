@@ -12,16 +12,15 @@
 // `hyb.lp6 = {addr, bytes, layout, ...}`.
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
 #include "npu/Decode/PimMetadata.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/raw_ostream.h"
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
-#include "llvm/ADT/StringSet.h"
-#include <map>
-#include "llvm/Support/raw_ostream.h"
 
 namespace mlir::hybrid {
 #define GEN_PASS_DEF_HYBPLANLP6
@@ -46,12 +45,8 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     ModuleOp module = getOperation();
     MLIRContext *ctx = &getContext();
     Builder b(ctx);
-    std::string err;
-    auto specOr = TargetSpec::load(spec, err);
-    if (failed(specOr)) {
-      module.emitError(err);
-      return signalPassFailure();
-    }
+    auto specOr = loadTargetSpec(module, spec);
+    if (failed(specOr)) return signalPassFailure();
     func::FuncOp step = getStepFunction(module);
     SymbolTable symbols(module);
     pim::Program program;

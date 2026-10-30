@@ -1,4 +1,4 @@
-#include "npu/Target/ISA.h"
+#include "Support/Assembler.h"
 #include <gtest/gtest.h>
 #include <array>
 

@@ -1,5 +1,5 @@
 // Single-word core encoding table, checked against NPU_Simulator main (ISA ver 1.0)
-// src/op.rs. Matrix records (M_LOAD, M_MMA, M_WRITEOUT) are encoded in ISA.cpp.
+// src/op.rs. Matrix records (M_LOAD, M_MMA, M_WRITEOUT) are encoded in Assembler.cpp.
 {"V_ADD_F16", 0x30, 1, {Slot::Rd, Slot::Rs1, Slot::Rs2}},
 {"V_SUB_F16", 0x30, 2, {Slot::Rd, Slot::Rs1, Slot::Rs2}},
 {"V_MUL_F16", 0x30, 3, {Slot::Rd, Slot::Rs1, Slot::Rs2}},

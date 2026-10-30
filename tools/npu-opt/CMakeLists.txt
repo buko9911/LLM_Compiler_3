@@ -5,8 +5,6 @@ target_link_libraries(npu-opt PRIVATE
   MLIRRegisterAllDialects
   MLIRRegisterAllPasses
   MLIRRegisterAllExtensions
-  NPUDialect
-  NPUTransforms
   MLIRArithDialect
   MLIRFuncDialect
   MLIRLinalgDialect

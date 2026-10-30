@@ -1,19 +1,15 @@
-//===- NpuAttentionFusion.cpp - preserve head-local attention across views --===//
+//===- NpuAttentionFusion.cpp - hyb-npu-attention-fusion ------------------===//
 //
-// The exported GQA graph reshapes scores [H, G*M, S] to [H, G, M, S] for the
-// per-token mask/softmax, then collapses them before P*V. Those views used to
-// stop the ordinary linalg producer-fusion walk: QK and PV were distributed,
-// but softmax remained a full-tensor operation on core 0.
+// The exported GQA graph reshapes scores [H, G*M, S] to [H, G, M, S] for the per-token
+// mask/softmax, then collapses them before P*V. Those views stop the producer fusion of
+// hyb-npu-tile: QK and PV get distributed, but softmax stays a full-tensor op on core 0.
 //
-// Tile only the independent H dimension and bubble each head slice through
-// the intervening reshape operations. All of a head's QK, mask, softmax and
-// PV then execute in one core-local region. The key dimension, scalar bodies,
-// intermediate element types and reduction ordering are unchanged. This is
-// attention producer fusion, NOT online/FlashAttention or key-block tiling.
+// Tile only the independent H dimension and bubble each head slice through the reshapes, so a
+// head's QK, mask, softmax and PV run in one core-local region. The key dimension (the full
+// softmax row), scalar bodies, element types and reduction order are unchanged.
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Transforms/Transforms.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -36,12 +32,6 @@ using namespace mlir;
 using namespace mlir::hybrid;
 
 namespace {
-
-int64_t headCores(int64_t heads, int64_t limit) {
-  for (int64_t n = std::min(heads, limit); n > 1; --n)
-    if (heads % n == 0) return n;
-  return 1;
-}
 
 bool staticTensor(Value value) {
   auto type = dyn_cast<RankedTensorType>(value.getType());
@@ -153,21 +143,11 @@ struct HybNpuAttentionFusionPass
   using Base::Base;
 
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) {
-      getOperation().emitError(error);
-      return signalPassFailure();
-    }
-    if (!target->npu.attentionFusion) return;
-    // This policy is deliberately an NPU-only baseline option. A mixed
-    // NPU/PIM program can have different phase ownership and memory pressure;
-    // do not silently retune its NPU epilogues when the option is present.
-    for (func::FuncOp fn : getOperation().getOps<func::FuncOp>())
-      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() == "pim") return;
-    for (func::FuncOp fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
+    // An NPU-only option: mixed NPU/PIM programs have their own phase ownership and SRAM use.
+    if (!target->npu.attentionFusion || hasPimPhase(getOperation())) return;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t matched = 0, fused = 0, direct = 0, unsupported = 0, singleCore = 0;
       int64_t existing = 0;
       fn.walk([&](scf::ForallOp loop) { existing += loop->hasAttr("hyb.attention_fused"); });
@@ -183,7 +163,7 @@ struct HybNpuAttentionFusionPass
         if (!chain.match(mm)) { ++unsupported; continue; }
         ++matched;
         if (!chain.reshapes) { ++direct; continue; } // Existing tiler already handles this chain.
-        int64_t cores = headCores(chain.heads, target->npu.cores);
+        int64_t cores = largestDivisorAtMost(chain.heads, target->npu.cores);
         if (cores < 2) { ++singleCore; continue; }
         scf::SCFTileAndFuseOptions options;
         options.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);

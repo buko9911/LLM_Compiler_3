@@ -1,9 +1,13 @@
-// Fixed-hardware g4 lowering for an existing PIM weight image. This is an
-// explicitly selected, checked schedule, not a new storage format or a cost
-// model. Every physical weight address comes from WeightPacketLocation.
+//===- PacketMatmul.cpp - NPU GEMV over PIM weight packets (--pim-packet-npu=g4) -===//
+//
+// The NPU reads the INT8 weights of a projection directly from an imported PIM weight image
+// (packet layout) instead of a dense NPU copy. Every physical weight address comes from
+// WeightPacketLocation; the schedule is checked against the fixed hardware.
+//===----------------------------------------------------------------------===//
+
 #include "npu/Decode/Target/PacketMatmul.h"
 #include "npu/Decode/Dialect/Hyb/HybDialect.h"
-#include "npu/Target/IsaV2.h"
+#include "npu/Target/ISAv2.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/Support/FormatVariadic.h"

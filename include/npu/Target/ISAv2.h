@@ -9,7 +9,7 @@
 // PLENA ISA ver 2.0, the format NPU_Simulator main executes.
 //
 // The compiler keeps emitting core code as a *builder stream* in the ISA ver 1.0
-// encodings (npu.instruction / npu.matrix_* in 05-target.mlir; see ISA.h).
+// encodings (see Decode/Target/PlenaProgram.h).
 // lowerCoreBlock turns one core block of that stream into ver 2.0 words the way
 // NPU_Simulator's tools/isa_v2.py (lower_core_block) does, so the two produce
 // the same words for the same block:

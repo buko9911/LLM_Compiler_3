@@ -48,7 +48,6 @@ struct NpuPhaseStats {
     int64_t initialSlot = 0;
   };
   std::vector<WeightStream> weightStreams;
-  int64_t overlapPairs = 0, overlapChunks = 0;
   int64_t asyncOutputStores = 0, outputStoresWithVectorWork = 0;
   int64_t stagingReleaseCuts = 0;
   int64_t vectorScalarReciprocals = 0, vectorScalarReuses = 0;

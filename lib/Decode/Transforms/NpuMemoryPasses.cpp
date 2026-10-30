@@ -7,8 +7,7 @@
 // Compute ops read and write L1 only; memref.copy between spaces is the DMA the backend emits.
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SetVector.h"
@@ -28,21 +27,8 @@ namespace {
 
 constexpr int64_t kLP6 = 0, kL1 = 1, kL2 = 2;
 
-bool isView(Operation *op) {
-  return isa<memref::SubViewOp, memref::ExpandShapeOp, memref::CollapseShapeOp, memref::CastOp,
-             memref::ReinterpretCastOp>(op);
-}
-
 bool isCompute(Operation *op) {
   return isa<linalg::LinalgOp, hyb::QuantOp, hyb::DequantOp>(op) && !isa<linalg::CopyOp>(op);
-}
-
-Value rootOf(Value v) {
-  while (Operation *d = v.getDefiningOp()) {
-    if (!isView(d)) break;
-    v = d->getOperand(0);
-  }
-  return v;
 }
 
 int64_t spaceOf(Type t) {
@@ -61,13 +47,13 @@ MemRefType withSpace(MemRefType t, int64_t space) {
 void retype(Value v, int64_t space) {
   v.setType(withSpace(cast<MemRefType>(v.getType()), space));
   for (Operation *u : v.getUsers())
-    if (isView(u) && u->getOperand(0) == v) retype(u->getResult(0), space);
+    if (isViewOp(u) && u->getOperand(0) == v) retype(u->getResult(0), space);
 }
 
 /// Non-view users of `v` and its views.
 void forEachUser(Value v, llvm::function_ref<void(Operation *)> fn) {
   for (Operation *u : v.getUsers()) {
-    if (isView(u) && u->getOperand(0) == v) forEachUser(u->getResult(0), fn);
+    if (isViewOp(u) && u->getOperand(0) == v) forEachUser(u->getResult(0), fn);
     else fn(u);
   }
 }
@@ -80,22 +66,12 @@ int64_t forallCores(scf::ForallOp f) {
   return n;
 }
 
-template <typename Fn> void forEachNpuPhase(ModuleOp m, Fn fn) {
-  for (auto f : m.getOps<func::FuncOp>()) {
-    auto p = f->getAttrOfType<StringAttr>(kPhase);
-    // An isolated packet kernel has dense LP6 arguments and a separately
-    // checked whole-phase scratch plan. Generic promotion must not hide or
-    // duplicate its physical packet reads or allocate live L1 temporaries.
-    if (p && p.getValue() == "npu" && !f->hasAttr("hyb.npu_kernel")) fn(f);
-  }
-}
-
 //===----------------------------------------------------------------------===//
 // hyb-npu-place
 //===----------------------------------------------------------------------===//
 struct HybNpuPlacePass : mlir::hybrid::impl::HybNpuPlaceBase<HybNpuPlacePass> {
   void runOnOperation() override {
-    forEachNpuPhase(getOperation(), [&](func::FuncOp fn) {
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<memref::AllocOp> allocs;
       fn.walk([&](memref::AllocOp a) { allocs.push_back(a); });
       for (memref::AllocOp a : allocs) {
@@ -107,7 +83,7 @@ struct HybNpuPlacePass : mlir::hybrid::impl::HybNpuPlaceBase<HybNpuPlacePass> {
         });
         retype(a.getResult(), inForall || !multi ? kL1 : kL2);
       }
-    });
+    }
   }
 };
 
@@ -163,8 +139,8 @@ struct Promoter {
   void accessedRoots(Operation *op, llvm::SetVector<Value> &read, llvm::SetVector<Value> &written) {
     op->walk([&](Operation *inner) {
       for (OpOperand &o : inner->getOpOperands()) {
-        if (!isa<MemRefType>(o.get().getType()) || isView(inner)) continue;
-        Value r = rootOf(o.get());
+        if (!isa<MemRefType>(o.get().getType()) || isViewOp(inner)) continue;
+        Value r = viewRoot(o.get());
         if (spaceOf(r.getType()) == kL1) continue;
         if (Operation *d = r.getDefiningOp(); d && op->isProperAncestor(d)) continue;
         bool w = false, rd = true;
@@ -188,7 +164,7 @@ struct Promoter {
     for (OpOperand &o : op->getOpOperands()) {
       Value v = o.get();
       if (!isa<MemRefType>(v.getType())) continue;
-      Value root = rootOf(v);
+      Value root = viewRoot(v);
       if (spaceOf(root.getType()) == kL1) continue;
       bool rd = readsOperand(op, o), wr = writesOperand(op, o);
       int idx = -1;
@@ -267,7 +243,7 @@ struct Promoter {
         if (!isa<MemRefType>(v.getType())) continue;
         if (Operation *d = v.getDefiningOp(); d && loop->isProperAncestor(d)) continue;
         if (auto ba = dyn_cast<BlockArgument>(v); ba && loop->isAncestor(ba.getOwner()->getParentOp())) continue;
-        Value root = rootOf(v);
+        Value root = viewRoot(v);
         if (spaceOf(root.getType()) == kL1 || written.contains(root) || writesOperand(inner, o)) continue;
         uses.push_back({inner, o.getOperandNumber()});
       }
@@ -279,7 +255,7 @@ struct Promoter {
       for (auto [i, e] : llvm::enumerate(cache))
         if (e.outer == v) idx = int(i);
       if (idx < 0) {
-        Value root = rootOf(v);
+        Value root = viewRoot(v);
         for (Entry &e : cache)
           if (e.root == root && e.dirty) copyOut(b, loop.getLoc(), e);
         Value l1 = allocL1(b, loop.getLoc(), v);
@@ -296,8 +272,9 @@ struct Promoter {
     SmallVector<Operation *> ops;
     for (Operation &op : blk.without_terminator()) ops.push_back(&op);
     for (Operation *op : ops) {
-      if (isView(op) || isa<memref::AllocOp, memref::DeallocOp, hyb::WeightOp>(op) ||
-          op->getNumRegions() == 0 && llvm::none_of(op->getOperandTypes(), [](Type t) { return isa<MemRefType>(t); }))
+      if (isViewOp(op) || isa<memref::AllocOp, memref::DeallocOp, hyb::WeightOp>(op) ||
+          (op->getNumRegions() == 0 &&
+           llvm::none_of(op->getOperandTypes(), [](Type t) { return isa<MemRefType>(t); })))
         continue;
       if (isCompute(op)) {
         promote(op, cache);
@@ -322,10 +299,10 @@ struct Promoter {
 
 struct HybNpuPromotePass : mlir::hybrid::impl::HybNpuPromoteBase<HybNpuPromotePass> {
   void runOnOperation() override {
-    forEachNpuPhase(getOperation(), [&](func::FuncOp fn) {
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       Promoter p;
       p.processBlock(fn.getBody().front());
-    });
+    }
   }
 };
 
@@ -342,17 +319,11 @@ std::optional<int64_t> tripCount(scf::ForOp f) {
 struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string err;
-    auto specOr = TargetSpec::load(spec, err);
-    if (failed(specOr)) {
-      getOperation().emitError(err);
-      return signalPassFailure();
-    }
-    const TargetSpec &t = *specOr;
+    auto specOr = loadTargetSpec(getOperation(), spec);
+    if (failed(specOr)) return signalPassFailure();
     bool ok = true;
-    forEachNpuPhase(getOperation(), [&](func::FuncOp fn) {
-      if (failed(plan(fn, t))) ok = false;
-    });
+    for (func::FuncOp fn : getNpuPhases(getOperation()))
+      if (failed(plan(fn, *specOr))) ok = false;
     if (!ok) signalPassFailure();
   }
 
@@ -373,10 +344,6 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
       end[op] = e;
     });
     std::vector<Buf> bufs;
-    DenseMap<int64_t, Operation *> overlapLoops;
-    fn.walk([&](scf::ForallOp f) {
-      if (auto id = f->getAttrOfType<IntegerAttr>("hyb.overlap_id")) overlapLoops[id.getInt()] = f;
-    });
     fn.walk([&](memref::AllocOp a) {
       int64_t space = spaceOf(a.getType());
       if (space != kL1 && space != kL2) return;
@@ -395,15 +362,6 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
           if (isa<scf::ForOp, scf::ForallOp>(p) && !p->isAncestor(a)) anchor = p;
         b.first = std::min(b.first, pos[anchor]);
         b.last = std::max(b.last, end[anchor]);
-        // Deferred arithmetic executes in this forall's MMA windows, including
-        // its output's first write. Alloc position alone is not a live use.
-        if (auto id = u->getAttrOfType<IntegerAttr>("hyb.overlap_id"); id && isa<hyb::DequantOp>(u)) {
-          auto it = overlapLoops.find(id.getInt());
-          if (it != overlapLoops.end()) {
-            b.first = std::min(b.first, pos[it->second]);
-            b.last = std::max(b.last, end[it->second]);
-          }
-        }
       });
       if (b.last < 0) {
         b.first = b.last = pos[a];

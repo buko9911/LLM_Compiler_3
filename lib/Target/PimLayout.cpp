@@ -1,5 +1,5 @@
 #include "npu/Target/PimLayout.h"
-#include "npu/Target/IsaV2.h"
+#include "npu/Target/ISAv2.h"
 #include <algorithm>
 
 namespace npu::pim {

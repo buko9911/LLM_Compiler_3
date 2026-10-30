@@ -1,7 +1,11 @@
-// Tile a private input copy and its matrix consumer together. No op names,
-// attention assumptions, K splitting, extra SRAM, or new hardware events.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuInputPipeline.cpp - hyb-npu-input-pipeline ----------------------===//
+//
+// Split a private L2 -> L1 input copy and the FP16 matmul that consumes it into batch / N tiles
+// over disjoint slices of the same allocation (full K per tile), so the next tile's copy can
+// overlap the current tile's compute. No extra SRAM; the backend's events enforce readiness.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
 
@@ -13,16 +17,7 @@ using namespace mlir;
 using namespace mlir::hybrid;
 
 namespace {
-Value allocationRoot(Value value) {
-  while (Operation *op = value.getDefiningOp()) {
-    if (!isa<memref::SubViewOp, memref::ExpandShapeOp, memref::CollapseShapeOp,
-             memref::CastOp, memref::ReinterpretCastOp>(op)) break;
-    value = op->getOperand(0);
-  }
-  return value;
-}
-
-bool staticF16(Value value, unsigned rank, int space) {
+bool staticF16(Value value, unsigned rank, unsigned space) {
   auto type = dyn_cast<MemRefType>(value.getType());
   SmallVector<int64_t> strides;
   int64_t offset;
@@ -66,7 +61,7 @@ Value slice(OpBuilder &builder, Location loc, Value value, bool batched,
   }
   offsets.back() = builder.getIndexAttr(column);
   sizes.back() = builder.getIndexAttr(columns);
-  return builder.create<memref::SubViewOp>(loc, value, offsets, sizes, strides);
+  return memref::SubViewOp::create(builder, loc, value, offsets, sizes, strides);
 }
 
 // Preserve zero-initialization as one logical fill per output tile. The backend
@@ -108,7 +103,7 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
   if (llvm::any_of(b.getUsers(), [&](Operation *user) {
         return user != copy.getOperation() && user != matrix.getOperation();
       })) return 0;
-  Value ar = allocationRoot(a), cr = allocationRoot(c);
+  Value ar = viewRoot(a), cr = viewRoot(c);
   if (!ar.getDefiningOp<memref::AllocOp>() || !cr.getDefiningOp<memref::AllocOp>() ||
       ar == b || cr == b || ar == cr) return 0;
   // Column/batch tiles must be physically disjoint. Explicit overlapping or
@@ -136,7 +131,7 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
     }
   }
   auto emitCopy = [&](const Tile &tile) {
-    auto part = builder.create<memref::CopyOp>(copy.getLoc(), tile.source, tile.weight);
+    auto part = memref::CopyOp::create(builder, copy.getLoc(), tile.source, tile.weight);
     part->setAttr("hyb.input_pipeline_copy", builder.getUnitAttr());
   };
   emitCopy(tiles[0]);
@@ -144,7 +139,7 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
     // The common input event waits for copy i before issuing copy i+1.
     // Matrix i reads a disjoint part of B while that next copy is outstanding.
     if (i + 1 < tiles.size()) emitCopy(tiles[i + 1]);
-    builder.create<linalg::FillOp>(matrix.getLoc(), zeroInit.getInputs(), ValueRange{tiles[i].output});
+    linalg::FillOp::create(builder, matrix.getLoc(), zeroInit.getInputs(), ValueRange{tiles[i].output});
     IRMapping mapping;
     mapping.map(a, tiles[i].activation);
     mapping.map(b, tiles[i].weight);
@@ -163,13 +158,10 @@ struct HybNpuInputPipelinePass
     : mlir::hybrid::impl::HybNpuInputPipelineBase<HybNpuInputPipelinePass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.inputTilePipeline) return;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<memref::CopyOp> copies;
       fn.walk([&](memref::CopyOp copy) { copies.push_back(copy); });
       int64_t groups = 0, tiles = 0;

@@ -47,7 +47,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-pipeline", action="store_true", help="Compare blocking, async-only, and common tiled input pipeline")
     parser.add_argument("--input-tile-columns", type=int, default=128)
-    parser.add_argument("--input-scheduling", action="store_true", help="Compare common asynchronous input scheduling against blocking and immediate-wait controls")
+    parser.add_argument("--input-scheduling", action="store_true", help="Compare asynchronous input loads against blocking loads")
     parser.add_argument("--compiler",type=Path,default=root/"build/bin/npu-compile")
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--emulator",type=Path,default=workspace/"core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
@@ -110,16 +110,16 @@ def main():
         reference=value_reference(inputs,h,g,m,s,d);np.save(case/"numpy_reference.npy",reference)
         runs={}
         previous=None
-        modes = [("blocking",False,True,False), ("immediate",True,False,False), ("overlap",True,True,False)] if args.input_scheduling else [("off",False,True,False),("on",False,True,False)]
+        modes = [("blocking",False,False), ("overlap",True,False)] if args.input_scheduling else [("off",False,False),("on",False,False)]
         if args.input_pipeline:
-            modes = [("blocking",False,True,False), ("async",True,True,False), ("pipeline",True,True,True)]
-        for mode,async_input,input_overlap,pipeline in modes:
+            modes = [("blocking",False,False), ("async",True,False), ("pipeline",True,True)]
+        for mode,async_input,pipeline in modes:
             enabled = args.input_pipeline or args.input_scheduling or mode == "on"
             build=case/mode
             spec=json.loads((root/"configs/target.json").read_text())
-            spec["npu"].update(attention_fusion=enabled,overlap_dequant_gemv=False,
+            spec["npu"].update(attention_fusion=enabled,
                                l2_staging_bytes_per_core=0, async_input_loads=async_input,
-                               async_input_load_overlap=input_overlap, input_tile_pipeline=pipeline,
+                               input_tile_pipeline=pipeline,
                                input_tile_columns=args.input_tile_columns)
             target=case/f"{mode}.json";target.write_text(json.dumps(spec,indent=2))
             command=[args.compiler.resolve(),"--pipeline=decode",source,"--manifest",manifest,

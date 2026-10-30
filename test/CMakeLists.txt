@@ -4,68 +4,11 @@ find_program(NPU_FILECHECK NAMES FileCheck HINTS "${LLVM_TOOLS_BINARY_DIR}" REQU
 configure_file(lit.site.cfg.py.in lit.site.cfg.py @ONLY)
 add_custom_target(check-npu
   COMMAND "${Python3_EXECUTABLE}" "${NPU_LIT}" -sv "${CMAKE_CURRENT_BINARY_DIR}"
-  DEPENDS npu-opt npu-asm npu-compile
+  DEPENDS npu-opt npu-compile
   USES_TERMINAL
 )
 add_test(NAME npu-lit
   COMMAND "${Python3_EXECUTABLE}" "${NPU_LIT}" -sv "${CMAKE_CURRENT_BINARY_DIR}")
-add_test(NAME npu-driver COMMAND "${Python3_EXECUTABLE}"
-  "${CMAKE_CURRENT_SOURCE_DIR}/Tools/npu-compile/driver.py"
-  --compiler $<TARGET_FILE:npu-compile> --assembler $<TARGET_FILE:npu-asm>
-  --root "${CMAKE_CURRENT_SOURCE_DIR}")
-
 set(NPU_TEST_EMULATOR "" CACHE FILEPATH "NPU transactional emulator")
 set(NPU_TEST_SETTINGS "" CACHE FILEPATH "Simulator TOML configuration")
 set(NPU_TEST_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python with PyTorch and NumPy")
-if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
-  add_test(NAME npu-matmul32 COMMAND "${NPU_TEST_PYTHON}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/matmul.py"
-    --compiler $<TARGET_FILE:npu-compile>
-    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
-    --source "${CMAKE_CURRENT_SOURCE_DIR}/Integration/matmul32.mlir"
-    --graph "${CMAKE_CURRENT_SOURCE_DIR}/Integration/matmul32-graph.mlir"
-            "${CMAKE_CURRENT_SOURCE_DIR}/Integration/matmul64-graph.mlir"
-            "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hierarchical-graph.mlir"
-    --out "${CMAKE_CURRENT_BINARY_DIR}/matmul32")
-  set_tests_properties(npu-matmul32 PROPERTIES TIMEOUT 300 LABELS integration)
-  add_test(NAME npu-vpu32 COMMAND "${NPU_TEST_PYTHON}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/elementwise.py"
-    --compiler $<TARGET_FILE:npu-compile>
-    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
-    --source "${CMAKE_CURRENT_SOURCE_DIR}/Integration/vpu32.mlir"
-    --graph "${CMAKE_CURRENT_SOURCE_DIR}/Integration/elementwise-graph.mlir"
-    --softmax "${CMAKE_CURRENT_SOURCE_DIR}/Integration/softmax-graph.mlir"
-    --loop "${CMAKE_CURRENT_SOURCE_DIR}/Integration/loop32.mlir"
-    --attention "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn32.mlir"
-    --carry "${CMAKE_CURRENT_SOURCE_DIR}/Integration/carry-graph.mlir"
-    --flash "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn-graph.mlir"
-    --flash8 "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn8-graph.mlir"
-    --flash_d64 "${CMAKE_CURRENT_SOURCE_DIR}/Integration/flashattn-d64-graph.mlir"
-    --divide "${CMAKE_CURRENT_SOURCE_DIR}/Integration/divide-graph.mlir"
-    --constant "${CMAKE_CURRENT_SOURCE_DIR}/Integration/constant-graph.mlir"
-    --transpose "${CMAKE_CURRENT_SOURCE_DIR}/Integration/transpose-graph.mlir"
-    --layer "${CMAKE_CURRENT_SOURCE_DIR}/Integration/decoder-layer.mlir"
-    --out "${CMAKE_CURRENT_BINARY_DIR}/vpu32")
-  set_tests_properties(npu-vpu32 PROPERTIES TIMEOUT 600 LABELS integration)
-  # NPU only against NPU + PIM on one W8A8 graph. The PIM phases need the
-  # dram-pim DRAMSim3 backend: NPU_TEST_LP6_ROOT, or LP6_DRAMSIM3_ROOT
-  # in the environment ctest runs in.
-  set(NPU_TEST_LP6_ROOT "" CACHE PATH "core/simulator/dram-pim checkout for the PIM integration test")
-  add_test(NAME npu-hybrid COMMAND "${NPU_TEST_PYTHON}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid.py"
-    --compiler $<TARGET_FILE:npu-compile> --hybrid $<TARGET_FILE:npu-compile>
-    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
-    --graph "${CMAKE_CURRENT_SOURCE_DIR}/Integration/hybrid-graph.mlir"
-    --out "${CMAKE_CURRENT_BINARY_DIR}/hybrid")
-  set_tests_properties(npu-hybrid PROPERTIES TIMEOUT 900 LABELS integration
-    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/Integration")
-  if(NPU_TEST_LP6_ROOT)
-    set_tests_properties(npu-hybrid PROPERTIES ENVIRONMENT "LP6_DRAMSIM3_ROOT=${NPU_TEST_LP6_ROOT}")
-  endif()
-  add_test(NAME npu-attention COMMAND "${NPU_TEST_PYTHON}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/Integration/attention.py"
-    --compiler $<TARGET_FILE:npu-compile>
-    --emulator "${NPU_TEST_EMULATOR}" --settings "${NPU_TEST_SETTINGS}"
-    --out "${CMAKE_CURRENT_BINARY_DIR}/attention")
-  set_tests_properties(npu-attention PROPERTIES TIMEOUT 900 LABELS integration)
-endif()

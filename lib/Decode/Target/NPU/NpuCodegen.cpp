@@ -15,7 +15,7 @@
 //     ahead into a ring in the staging window. Eligible GEMV loops process several staged tiles
 //     per core block and prefetch the next L1 weight slot while the current MMA runs;
 //   * compute ops -> vector / scalar / matrix instructions (FP16 vectors, FP32 reductions,
-//     FP16 and INT8 MMA, the INT8 quant / dequant contract of the former hybrid_bench).
+//     FP16 and INT8 MMA, INT8 quant / dequant).
 // Command dependencies come from address ranges: a GDMA waits for earlier accesses to its L2
 // and LP6 ranges; a core block that reads or writes L2 waits for the GDMAs touching it.
 // The Codegen class is declared in CodegenImpl.h; this file holds the entry point and the
@@ -124,14 +124,7 @@ void Codegen::collectConstants(func::FuncOp fn) {
     if (auto g = dyn_cast<linalg::GenericOp>(op))
       g.getRegion().walk([&](Operation *b) {
         for (Value o : b->getOperands())
-          if (auto c = constValue(o)) {
-            scalarConst(float(*c));
-            // Online attention uses the existing typed vector ISA. Constants
-            // have their actual element type; legacy generics keep the old
-            // pool and emitted program byte-for-byte.
-            if (g->hasAttr("hyb.flash_math"))
-              vectorConst(*c, o.getType().isInteger(1) ? DT_I8 : dtypeOf(o.getType()));
-          }
+          if (auto c = constValue(o)) scalarConst(float(*c));
       });
     if (auto f = dyn_cast<linalg::FillOp>(op))
       if (auto c = constValue(f.getInputs()[0]))
@@ -159,8 +152,6 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
       llvm::json::Object origin{
           {"id", id}, {"phase", fn.getSymName().str()}, {"op", op->getName().getStringRef().str()},
           {"ir", text}, {"body_ops", body}};
-      if (auto stable = op->getAttrOfType<IntegerAttr>("hyb.schedule_origin"))
-        origin["schedule_origin"] = stable.getInt();
       w.sourceOperations.push_back(llvm::formatv("{0}", llvm::json::Value(std::move(origin))).str());
     });
   }
@@ -200,8 +191,6 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   stats.cores = cores;
   stats.l2StagingPerCore = window();
   stats.weightStreams = std::move(weightStreams);
-  stats.overlapPairs = overlapPairs;
-  stats.overlapChunks = overlapChunks;
   stats.asyncOutputStores = asyncOutputStores;
   stats.outputStoresWithVectorWork = outputStoresWithVectorWork;
   stats.stagingReleaseCuts = stagingReleaseCuts;

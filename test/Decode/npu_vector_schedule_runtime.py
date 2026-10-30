@@ -164,9 +164,9 @@ def main():
             spec = json.loads((root/"configs/target.json").read_text())
             reuse, pipeline = mode in ("reuse","both"), mode in ("pipeline","both")
             spec["npu"].update(vector_scalar_reuse=reuse, vector_chunk_pipeline=pipeline,
-                elementwise_distribution=False, transfer_schedule=False, staging_early_release=False,
+                elementwise_distribution=False, staging_early_release=False,
                 memory_dependency_schedule=False, attention_fusion=False, projection_fusion=False,
-                flash_attention=False, flash_decoding=False, activation_residency=True,
+                activation_residency=True,
                 input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False)
             target = case/f"{mode}.json";target.write_text(json.dumps(spec,indent=2))
             build = case/mode

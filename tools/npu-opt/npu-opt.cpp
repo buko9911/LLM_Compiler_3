@@ -3,15 +3,11 @@
 #include "mlir/InitAllDialects.h"
 #include "mlir/InitAllExtensions.h"
 #include "mlir/InitAllPasses.h"
-#include "npu/Transforms/Passes.h"
-#include "npu/Transforms/Pipeline.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
 int main(int argc, char **argv) {
-  // The stage passes, the npu-pipeline, and the upstream passes the stages
-  // use internally (canonicalize, cse, ...) so each step can be replayed alone.
-  ::npu::registerPasses();
+  // Decode and upstream passes let each pipeline step be replayed alone.
   mlir::registerAllPasses();
   mlir::hybrid::registerHybridPasses();
   mlir::DialectRegistry registry;
@@ -19,7 +15,6 @@ int main(int argc, char **argv) {
   mlir::registerAllExtensions(registry);
   registry.insert<mlir::hyb::HybDialect>();
   mlir::hyb::registerBufferizableOpInterfaceExternalModels(registry);
-  ::npu::registerPipelineDialects(registry);
   return mlir::asMainReturnCode(
-      mlir::MlirOptMain(argc, argv, "NPU modular optimizer\n", registry));
+      mlir::MlirOptMain(argc, argv, "Decode pass replay tool\n", registry));
 }

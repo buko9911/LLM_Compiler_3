@@ -66,7 +66,6 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("matrix_init_elision", s.npu.matrixInitElision) ||
       !booleanOption("async_output_stores", s.npu.asyncOutputStores) ||
       !booleanOption("async_input_loads", s.npu.asyncInputLoads) ||
-      !booleanOption("transfer_schedule", s.npu.transferSchedule) ||
       !booleanOption("staging_early_release", s.npu.stagingEarlyRelease) ||
       !booleanOption("memory_dependency_schedule", s.npu.memoryDependencySchedule) ||
       !booleanOption("command_schedule", s.npu.commandSchedule) ||
@@ -76,13 +75,8 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("input_tile_pipeline", s.npu.inputTilePipeline) ||
       !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
       !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
-      !booleanOption("async_input_load_overlap", s.npu.asyncInputLoadOverlap) ||
-      !booleanOption("weight_prefetch_compute_first", s.npu.weightPrefetchComputeFirst) ||
       !booleanOption("async_output_store_vector_overlap", s.npu.asyncOutputStoreVectorOverlap) ||
-      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots) ||
-      !booleanOption("flash_attention", s.npu.flashAttention) ||
-      !booleanOption("flash_decoding", s.npu.flashDecoding) ||
-      !booleanOption("flash_kv_slicing", s.npu.flashKvSlicing))
+      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots))
     return failure();
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");
@@ -102,35 +96,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     dst = *value;
     return true;
   };
-  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns) ||
-      !positiveIntegerOption("attention_query_tile", s.npu.attentionQueryTile) ||
-      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile) ||
-      !positiveIntegerOption("attention_splits", s.npu.attentionSplits))
-    return failure();
-  if (s.npu.flashDecoding && (!s.npu.flashAttention || s.npu.attentionSplits < 2 ||
-                            s.npu.attentionSplits > s.npu.cores)) {
-    error = "npu.flash_decoding requires flash_attention and attention_splits in [2, cores]";
-    return failure();
-  }
-  if (!s.npu.flashDecoding && s.npu.attentionSplits != 1) {
-    error = "npu.attention_splits must be 1 when flash_decoding is disabled";
-    return failure();
-  }
-  if (s.npu.flashKvSlicing && !s.npu.flashAttention) {
-    error = "npu.flash_kv_slicing requires flash_attention";
-    return failure();
-  }
-  if (n)
-    if (auto v = n->getBoolean("overlap_dequant_gemv")) s.npu.overlapDequantGemv = *v;
-  if (n)
-    if (auto *v = n->get("overlap_dequant_chunk_elements")) {
-      auto elements = v->getAsInteger();
-      if (!elements || *elements < 16 || *elements > 1024 || *elements % 16) {
-        error = "npu.overlap_dequant_chunk_elements must be an integer multiple of 16 in [16, 1024]";
-        return failure();
-      }
-      s.npu.overlapDequantChunkElements = *elements;
-    }
+  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns)) return failure();
   if (s.npu.dequantMinElements < 0) {
     error = "npu.dequant_min_elements must be nonnegative (0 inherits distribute_min_elements)";
     return failure();

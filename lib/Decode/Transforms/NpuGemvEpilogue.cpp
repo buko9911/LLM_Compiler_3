@@ -1,7 +1,11 @@
-// Keep each core's INT32 column partition local through dequantization.
-// Ordinary weight tiling still runs inside that partition; no arithmetic changes.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuGemvEpilogue.cpp - hyb-npu-gemv-epilogue -------------------------===//
+//
+// Split a single-consumer GEMV + dequant by output columns over the cores, so each core keeps
+// its INT32 partition local through dequantization and publishes only FP16. hyb-npu-tile still
+// tiles the weights inside each partition.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -15,10 +19,6 @@ using namespace mlir;
 using namespace mlir::hybrid;
 
 namespace {
-int64_t divisor(int64_t n, int64_t limit) {
-  for (int64_t d = std::min(n, limit); d > 1; --d) if (n % d == 0) return d;
-  return 1;
-}
 SmallVector<OpFoldResult> attrs(OpBuilder &b, ArrayRef<int64_t> values) {
   SmallVector<OpFoldResult> result;
   for (int64_t v : values) result.push_back(b.getIndexAttr(v));
@@ -32,17 +32,16 @@ Value slice(OpBuilder &b, Location loc, Value v, ArrayRef<OpFoldResult> offsets,
 struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNpuGemvEpiloguePass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.gemvEpilogueFusion) return;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel") || fn.empty()) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<hyb::DequantOp> candidates;
-      for (Operation &op : fn.front()) if (auto d = dyn_cast<hyb::DequantOp>(op)) candidates.push_back(d);
+      for (Operation &op : fn.front())
+        if (auto d = dyn_cast<hyb::DequantOp>(op)) candidates.push_back(d);
       int64_t count = 0;
-      for (auto d : candidates) if (fuse(d, *target)) ++count;
+      for (auto d : candidates)
+        if (fuse(d, *target)) ++count;
       fn->setAttr("hyb.gemv_epilogue_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), count));
     }
   }
@@ -84,10 +83,10 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
     if (g.getIndexingMapsArray() != expected || g.getIteratorTypesArray() !=
         SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel,
                                         utils::IteratorType::parallel, utils::IteratorType::reduction}) return false;
-    int64_t cores = divisor(nb, target.npu.cores), part = nb / cores, columns = part * 32;
+    int64_t cores = largestDivisorAtMost(nb, target.npu.cores), part = nb / cores, columns = part * 32;
     // A whole column partition is kept local. Conservative admission; the
     // authoritative liveness planner still accounts for surrounding buffers.
-    int64_t tile = divisor(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (k * 32)));
+    int64_t tile = largestDivisorAtMost(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (k * 32)));
     int64_t bytes = m * columns * 6 + columns * 4 + m * k + m * 4 + 2 * tile * k * 32 +
                     2 * m * tile * 32 * 4 + target.npu.l1ReservedBytes + 4096;
     if (bytes > target.npu.l1Bytes) return false;

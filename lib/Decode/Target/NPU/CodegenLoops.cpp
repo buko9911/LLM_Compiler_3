@@ -7,7 +7,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
-#include "npu/Decode/Support/NpuOperationTrace.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/Support/raw_ostream.h"
@@ -16,14 +15,20 @@
 
 namespace mlir::hybrid::codegen {
 
+/// Ops that only define values the backend evaluates itself (constants, index arithmetic, views,
+/// allocations, weight references): they emit no instructions.
 bool Codegen::isPure(Operation &op) {
-  return isNpuTraceMetadataOnly(op);
+  if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, hyb::WeightOp, affine::AffineApplyOp,
+          affine::AffineMinOp, affine::AffineMaxOp, memref::SubViewOp, memref::ExpandShapeOp,
+          memref::CollapseShapeOp, memref::CastOp>(op))
+    return true;
+  return op.getDialect() && op.getDialect()->getNamespace() == "arith" &&
+         llvm::none_of(op.getOperandTypes(), [](Type type) { return isa<MemRefType>(type); });
 }
 
 LogicalResult Codegen::emitBlock(Block &b, std::string &err) {
   for (Operation &op : b) {
     if (op.hasTrait<OpTrait::IsTerminator>() || isPure(op)) continue;
-    if (emittedDequants.count(&op)) continue;
     int previousSource = w.currentSource;
     if (w.traceOperations) w.currentSource = sourceIds.lookup(&op);
     auto restoreSource = llvm::scope_exit([&] { w.currentSource = previousSource; });
@@ -219,7 +224,6 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
                              pipeline, earlyRelease || crossBatch, reason, int64_t(initialSlot)});
   }
   if (earlyRelease) {
-    bool computeFirst = in.spec->npu.weightPrefetchComputeFirst;
     // Global dependencies can observe core-block completion, not a local DMA
     // event. Consume every local event before splitting a block. A slot read
     // therefore belongs to the load/previous-tile block, never to the compute
@@ -236,7 +240,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
     for (int64_t j = 0; j < n; ++j) {
       env[iv] = *lb + j * *step;
       streamSlot[stream] = slotAddress(j);
-      if (j == 0 || computeFirst) {
+      if (j == 0) {
         if (failed(lowerCopy(stream,stream.getSource(),stream.getTarget(),{},err))) return failure();
         flush(); // first weight is now in L1; release its L2 read before MMA
       }
@@ -251,7 +255,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
         if (out->space == kL2)
           for (auto [s,e] : viewRanges(*out)) coreDependencies(s,e,true,deps);
       }
-      if (j + 1 < n && !computeFirst) {
+      if (j + 1 < n) {
         uint64_t slot = slotAddress(j+1);
         coreDependencies(slot,slot+slotBytes,false,deps);
         env[iv] = *lb + (j+1)* *step;
@@ -266,7 +270,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       prefetchedWeightCopy = stream;
       prefetchedWeightNeedsWait = false;
       if (failed(emitBlock(*f.getBody(),err))) return failure();
-      if (j+1 < n && !computeFirst) {
+      if (j + 1 < n) {
         load(10,1);
         emit(rform(OP_WAIT_EVENT,10));
       }
@@ -349,31 +353,13 @@ LogicalResult Codegen::emitForall(scf::ForallOp f, std::string &err) {
     return failure();
   }
   int home = curCore;
-  hyb::DequantOp overlap;
-  if (auto id = f->getAttrOfType<IntegerAttr>("hyb.overlap_id")) {
-    auto d = dyn_cast_or_null<hyb::DequantOp>(f->getNextNode());
-    if (home != 0 || deferredDequant || !d || d->getAttrOfType<IntegerAttr>("hyb.overlap_id") != id ||
-        !disjointDequantStorage(d, f)) {
-      err = "invalid dequant/GEMV overlap pair: home core, pairing or disjoint physical storage check failed";
-      return failure();
-    }
-    overlap = d;
-  }
-  if (overlap) ++overlapPairs;
   flush();
   std::vector<int> start = last[size_t(home)];
   Value iv = f.getInductionVars()[0];
   for (int64_t c = 0; c < n; ++c) {
     startCore(int(c), start);
     env[iv] = c;
-    if (c == home && overlap) { deferredDequant = overlap; deferredDequantCursor = 0; }
     if (failed(emitBlock(*f.getBody(), err))) return failure();
-    if (c == home && overlap) {
-      // Complete the remainder before the core frontier joins its consumers.
-      if (failed(emitDequantChunk(overlap, deferredDequantCursor, INT64_MAX, err))) return failure();
-      emittedDequants.insert(overlap);
-      deferredDequant = {};
-    }
     endCore();
   }
   env.erase(iv);
@@ -386,48 +372,6 @@ LogicalResult Codegen::emitForall(scf::ForallOp f, std::string &err) {
   last[size_t(home)] = join;
   w.frontier = join;
   return success();
-}
-
-bool Codegen::disjointDequantStorage(hyb::DequantOp d, scf::ForallOp f) {
-  auto allocation = [](Value v) {
-    while (Operation *o = v.getDefiningOp()) {
-      if (!isViewOp(o)) break;
-      v = o->getOperand(0);
-    }
-    return v.getDefiningOp<memref::AllocOp>();
-  };
-  auto range = [](memref::AllocOp a) -> std::optional<L2Range> {
-    auto off = a->getAttrOfType<IntegerAttr>("hyb.offset");
-    if (!off || !a.getType().hasStaticShape()) return {};
-    uint64_t bytes = a.getType().getNumElements() * std::max(1u, a.getType().getElementTypeBitWidth() / 8);
-    if (auto slots = a->getAttrOfType<IntegerAttr>("hyb.buffers")) {
-      auto stride = a->getAttrOfType<IntegerAttr>("hyb.slot_bytes");
-      if (!stride) return {};
-      bytes = uint64_t(slots.getInt()) * stride.getInt();
-    }
-    return L2Range{uint64_t(off.getInt()), uint64_t(off.getInt()) + bytes};
-  };
-  SmallVector<L2Range> protectedRanges;
-  for (Value v : d->getOperands()) {
-    auto a = allocation(v);
-    if (!a || spaceOf(v.getType()) != kL1) return false;
-    auto r = range(a);
-    if (!r) return false;
-    protectedRanges.push_back(*r);
-  }
-  bool safe = true;
-  f.walk([&](Operation *o) {
-    for (Value v : o->getOperands()) {
-      if (!isa<MemRefType>(v.getType()) || spaceOf(v.getType()) != kL1) continue;
-      auto a = allocation(v);
-      if (!a) { safe = false; continue; }
-      auto r = range(a);
-      if (!r) { safe = false; continue; }
-      for (auto p : protectedRanges)
-        if (overlaps(p.first, p.second, r->first, r->second)) safe = false;
-    }
-  });
-  return safe;
 }
 
 } // namespace mlir::hybrid::codegen

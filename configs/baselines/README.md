@@ -1,37 +1,27 @@
-# Validated fixed-shape NPU-only presets
+# Qwen3-4B NPU-only presets
 
-These presets were selected on Qwen3-4B layer0 + final norm + LM head,
-W8A8/FP16, capacity512, valid past32, 4 cores at800MHz, L1 4MiB/core,
-L2 8MiB, with the existing LPDDR6/Ramulator native simulator.
+Target specs chosen by simulation for Qwen3-4B decode on the NPU alone. The fixture was
+Qwen3-4B layer 0 + final norm + LM head, W8A8 / FP16, KV capacity 512 with 32 valid past
+tokens, 4 NPU cores at 800 MHz, L1 4 MiB per core, L2 8 MiB, and the LPDDR6 Ramulator backend.
 
-Use `--force=npu`. M8 uses `--npu-phase-split=layer`; M1 uses
-`--npu-phase-split=none`. These are not universal defaults for other models,
-precision contracts or context lengths. Actual valid-length attention and
-full-model decoding are outside this validation scope.
+| File | Tokens per step | Compile with | Fixture time (simulated) |
+|---|---|---|---|
+| `qwen3_4b_m1_c512.json` | 1 | `--force=npu --npu-phase-split=none` | 5426.089 µs |
+| `qwen3_4b_m8_c512.json` | 8 | `--force=npu --npu-phase-split=layer` | 6239.010 µs |
 
-See [current results, exactness checks, candidate regressions and reproduction](../../../../research/npu_command_schedule_audit/README.md)
-and [pass architecture](../../../../docs/architecture/NPU_LAYER_SCHEDULING.md).
-The presets minimize the complete measured fixture and keep transfer motion
-disabled: moving a safe copy earlier did not improve these executions.
-Both enable generic staging release; M1 additionally enables range-checked
-matrix/output-DMA overlap. Hardware capacities and arithmetic are unchanged.
-Both enable two-chunk VPU scheduling. M8 also reuses row-invariant scalar
-reciprocals and distributes independent elementwise work with a minimum of
-65536 elements; dequant's existing 16384-element threshold is pinned separately.
-M1 leaves scalar reuse and elementwise distribution disabled: their measured
-combinations did not beat chunk scheduling alone. The presets were recompiled
-and checked against the measured programs, system descriptions, lowered IR,
-and operation maps in [preset identity checks](../../../../research/npu_command_schedule_audit/validation/preset_identity.json).
-M8 now enables `command_schedule`: precise strided GDMA effects, dependency-safe
-system-command ordering, and proven transitive-edge reduction. It reduces this
-fixture from 6257.43625 to 6239.01 microseconds. M1 retains its previous preset
-because the measured alternatives were slower. Future-prefetch admission gaps
-remain; this selection does not claim a stall-free or globally optimal schedule.
-The common first-MMA weight prefetch also applies to larger eligible tiles;
-those measured larger-tile configurations did not win the full fixture.
-The [previous VPU sweep](../../../../research/npu_vpu_schedule_audit/README.md)
-is preserved with its original programs and results.
-The [previous dependency sweep](../../../../research/npu_dependency_schedule_audit/README.md)
-and its selected configurations remain available for comparison.
-The [earlier layout/tile/slot sweep](../../../../research/npu_layer_baseline_audit/README.md)
-remains available as an immutable comparison.
+The times are for that one-layer fixture, not for a full decode step. The presets are not
+general defaults for other models, precisions or context lengths.
+
+For the full 36-layer model, the 1-token preset needs `--npu-phase-split=layer`. With `none`,
+one phase exceeds the ISA 2.0 dependency record: command dependencies must lie within 65,535
+earlier commands.
+
+Both presets keep the hardware capacities and the arithmetic of the default target. They differ
+only in which optional passes and backend schedules are on (see the `npu.*` table in the compiler
+`README.md`). Candidate sweeps, exactness checks and reproduction scripts are in the workspace:
+
+- [command scheduling audit](../../../../research/npu_command_schedule_audit/README.md)
+  (current selection, [preset identity checks](../../../../research/npu_command_schedule_audit/validation/preset_identity.json))
+- [VPU schedule sweep](../../../../research/npu_vpu_schedule_audit/README.md)
+- [dependency schedule sweep](../../../../research/npu_dependency_schedule_audit/README.md)
+- [layout / tile / slot sweep](../../../../research/npu_layer_baseline_audit/README.md)

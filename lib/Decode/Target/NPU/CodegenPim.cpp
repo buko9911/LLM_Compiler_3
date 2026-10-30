@@ -15,8 +15,8 @@
 namespace mlir::hybrid::codegen {
 
 /// INT32 GEMV results [rows, cols] of a PIM output -> contiguous L1 rows. A stored tile holds
-/// 8 consecutive outputs of one PU; runs split at DRAM rows and partition boundaries
-/// (as the former hybrid_bench read_outputs), gathered in the staging window, one LDMA per chunk.
+/// 8 consecutive outputs of one PU; runs split at DRAM rows and partition boundaries are
+/// gathered in the staging window, one LDMA per chunk.
 LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &err) {
   const pim::Projection &p = in.pim->projections[size_t(s.lp6.getAs<IntegerAttr>("proj").getInt())];
   if (s.shape.size() != 2 || s.strides[1] != 1 || d.space != kL1 || d.strides.back() != 1) {
@@ -293,7 +293,7 @@ std::string Codegen::parallelActivationPlanJSON() const {
   return llvm::formatv("{0}", json::Value(std::move(object))).str();
 }
 
-/// INT8 activation rows (L1) -> every consuming PU's bank (as the former hybrid_bench write_activation).
+/// INT8 activation rows (L1) -> every consuming PU's bank.
 /// Subchannel and bank group sit below the column in the address, so one column of the
 /// 4 bank groups x C subchannels of a bank is colBytes() = 128 C contiguous bytes: when every
 /// subchannel of a rank reads the vector, each packet is copied 4 C times in L1 scratch and

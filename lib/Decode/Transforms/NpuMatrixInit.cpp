@@ -1,6 +1,11 @@
-// Elide physical zero stores only after proving the matrix INIT owns the value.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuMatrixInit.cpp - hyb-npu-matrix-init ----------------------------===//
+//
+// Mark a private L1 zero fill as `hyb.elide_matrix_init` when the first matrix op that writes the
+// buffer (its INIT overwrites every element) comes before every other use. The fill stays in the
+// IR; codegen omits its vector stores.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/IR/Matchers.h"
 
 namespace mlir::hybrid {
@@ -54,13 +59,10 @@ bool canElide(linalg::FillOp fill) {
 struct HybNpuMatrixInitPass : mlir::hybrid::impl::HybNpuMatrixInitBase<HybNpuMatrixInitPass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.matrixInitElision) return;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0;
       fn.walk([&](linalg::FillOp fill) {
         if (canElide(fill)) {

@@ -27,7 +27,7 @@ namespace json = llvm::json;
 
 namespace {
 
-/// Per-row symmetric INT8 (as the former hybrid_bench prep_npu_weights.py): s = max|W[n,:]| / 127 (FP32),
+/// Per-row symmetric INT8: s = max|W[n,:]| / 127 (FP32),
 /// q = clip(rint(W / s), -127, 127).
 bool quantizeRows(const SafeTensors &st, const std::string &name, std::vector<int8_t> &q, std::vector<float> &s,
                   int64_t &n, int64_t &k, std::string &err) {

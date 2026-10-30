@@ -17,7 +17,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "DriverImage.h"
-#include <cstdlib>
 #include "DriverPackage.h"
 #include "DriverProgram.h"
 #include "DriverStorage.h"
@@ -42,6 +41,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include <chrono>
+#include <cstdlib>
 #include <optional>
 
 using namespace mlir;
@@ -117,31 +117,79 @@ bool checkOptions(bool fixedStorage) {
   return true;
 }
 
-/// Keep scheduling in tensor IR, then establish storage ownership, then lower memory.
-/// In particular, CSE must not run between destination privatization and bufferization:
-/// merging those tensor.empty values would reintroduce the DRAM activation spills.
+/// Attributes the compiler itself attaches. A frontend graph must not contain them: they would
+/// bypass the checks of the CLI options that set them or pretend a pass already ran.
+constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
+    // CLI requests (set on the module before the pipeline runs).
+    "hyb.pim_weight_storage_requested", "hyb.pim_weight_storage_import", "hyb.pim_packet_npu_requested",
+    // PIM packet kernel and 4-core activation feed.
+    "hyb.npu_packet", "hyb.npu_kernel", "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan",
+    // hyb-npu-projection-fusion
+    "hyb.weight_segments", "hyb.projection_fusions",
+    // hyb-npu-attention-fusion
+    "hyb.attention_fusion", "hyb.attention_fused",
+    // hyb-npu-gemv-epilogue
+    "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions",
+    // hyb-npu-elementwise-distribute
+    "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
+    "hyb.elementwise_original_shape", "hyb.elementwise_candidates", "hyb.elementwise_small",
+    "hyb.elementwise_unsupported", "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
+    // hyb-npu-activation-residency
+    "hyb.activation_residency_private_results",
+    // hyb-npu-promote
+    "hyb.shared_copy_staging",
+    // hyb-npu-matrix-init
+    "hyb.elide_matrix_init", "hyb.matrix_init_elisions",
+    // hyb-npu-matmul-layout
+    "hyb.matmul_rhs_pack", "hyb.matmul_rhs_packed", "hyb.matmul_rhs_packings", "hyb.matmul_transpose_output",
+    "hyb.matmul_output_transposes", "hyb.matmul_transpose_scratch",
+    // hyb-npu-input-pipeline
+    "hyb.input_pipeline_copy", "hyb.input_pipeline_tile", "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
+};
+
+/// The MLIR pass pipeline, in five stages. Each stage hands the next one a more concrete program:
+/// math -> device and phases -> core tiles -> buffers -> addresses. The optional NPU passes are
+/// no-ops unless their `npu.*` switch is set in the target spec.
 std::string decodePipeline(const std::string &overrideOpt) {
+  const std::string spec = "{spec=" + specFile + "}";
+  // 1. Tensor math: name the arguments, clean up the import, W8A8 quantization, FP16 storage.
   const std::string tensor =
-      "hyb-annotate{manifest=" + manifestFile + "}," +
-      "func.func(hyb-simplify,canonicalize,cse,hyb-raise-linear,canonicalize,hyb-quantize,cse,hyb-fold-transpose,"
-      "canonicalize),hyb-storage-f16,";
+      "hyb-annotate{manifest=" + manifestFile + "},"          // argument kinds and checkpoint names
+      "func.func(hyb-simplify,canonicalize,cse,"              // import clean-up, elementwise fusion
+      "hyb-raise-linear,canonicalize,"                        // matmul(x, W^T) -> hyb.linear
+      "hyb-quantize,cse,"                                     // linear -> quant + qmatmul + dequant
+      "hyb-fold-transpose,canonicalize),"                     // transpose(K) into the batch_matmul map
+      "hyb-storage-f16,";                                     // FP16 storage, FP32 reductions
+  // 2. Device and phases: NPU or PIM per GEMV group, NPU GEMV layout, one function per phase.
   const std::string placement =
       "hyb-partition{spec=" + specFile + " report=" + outDir + "/partition.json" +
-      (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "}," +
-      "func.func(hyb-lower-npu-gemv),hyb-outline-phases{npu-split=" + npuPhaseSplit + "},canonicalize,";
+      (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "},"
+      "func.func(hyb-lower-npu-gemv),"                        // INT8 contraction on [N/32, K, 32] weights
+      "hyb-outline-phases{npu-split=" + npuPhaseSplit + "},canonicalize,";
+  // 3. Fusion and tiling (tensor level): fuse first, then distribute over cores and tile for L1.
   const std::string fusion =
-      "hyb-npu-projection-fusion{spec=" + specFile + "},hyb-npu-flash-attention{spec=" + specFile + "},hyb-npu-attention-fusion{spec=" + specFile +
-      "},hyb-npu-gemv-epilogue{spec=" + specFile + "},hyb-npu-tile{spec=" + specFile +
-      "},hyb-npu-elementwise-distribute{spec=" + specFile + "},cse,canonicalize,";
+      "hyb-npu-projection-fusion" + spec + ","                // q/k/v and gate/up -> one GEMV each
+      "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
+      "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core
+      "hyb-npu-tile" + spec + ","                             // scf.forall over cores, scf.for over tiles
+      "hyb-npu-elementwise-distribute" + spec + ",cse,canonicalize,";
+  // 4. Ownership and bufferization. No CSE between privatization and bufferization: it would merge
+  //    the private tensor.empty values again and put phase-local activations back into LP6 outputs.
   const std::string ownership =
-      "hyb-private-phase-results,hyb-npu-activation-residency{spec=" + specFile + "},"
+      "hyb-private-phase-results,"                            // PIM-read results get their own buffer
+      "hyb-npu-activation-residency" + spec + ","             // phase outputs get their own buffer
       "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
       "buffer-results-to-out-params{hoist-static-allocs},canonicalize,cse,";
+  // 5. Memory: LP6 addresses, L1/L2 placement, explicit copies, layout rewrites, SRAM offsets.
   const std::string memory =
       "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) + "},"
-      "loop-invariant-code-motion,hyb-npu-place,hyb-npu-promote,hyb-npu-matrix-init{spec=" + specFile +
-      "},hyb-npu-matmul-layout{spec=" + specFile + "},hyb-npu-input-pipeline{spec=" + specFile + "},hyb-npu-overlap{spec=" + specFile +
-      "},hyb-npu-transfer-schedule{spec=" + specFile + "},hyb-npu-memplan{spec=" + specFile + "}";
+      "loop-invariant-code-motion,"
+      "hyb-npu-place,"                                        // L1 (one core) or L2 (shared)
+      "hyb-npu-promote,"                                      // compute reads L1 only: insert copies
+      "hyb-npu-matrix-init" + spec + ","                      // skip zero fills a matrix INIT overwrites
+      "hyb-npu-matmul-layout" + spec + ","                    // fill SA tiles for transpose-B matmuls
+      "hyb-npu-input-pipeline" + spec + ","                   // overlap the next input copy with compute
+      "hyb-npu-memplan" + spec;                               // liveness-based L1/L2 offsets
   return tensor + placement + fusion + ownership + memory;
 }
 
@@ -191,33 +239,11 @@ int compileDecode(int argc, char **argv) {
   llvm::SourceMgr sm;
   OwningOpRef<ModuleOp> module = parseSourceFile<ModuleOp>(inputFile, sm, &ctx);
   if (!module) return 1;
-  bool reservedStorageAttr = false;
+  bool driverOwnedAttr = false;
   module->getOperation()->walk([&](Operation *op) {
-    for (StringRef name : {"hyb.pim_weight_storage_requested", "hyb.pim_weight_storage_import",
-                          "hyb.pim_packet_npu_requested", "hyb.npu_packet", "hyb.npu_kernel",
-                          "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan",
-                          "hyb.overlap_id", "hyb.overlap_pairs",
-                          "hyb.input_pipeline_copy", "hyb.input_pipeline_tile",
-                          "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
-                          "hyb.transfer_scheduled", "hyb.transfer_schedule_moved",
-                          "hyb.transfer_schedule_crossed", "hyb.transfer_schedule_candidates",
-                          "hyb.transfer_schedule_owned", "hyb.schedule_origin", "hyb.schedule_barrier",
-                          "hyb.schedule_origin_count", "hyb.schedule_origin_schema",
-                          "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
-                          "hyb.elementwise_original_shape",
-                          "hyb.shared_copy_staging",
-                          "hyb.elementwise_candidates", "hyb.elementwise_small", "hyb.elementwise_unsupported",
-                          "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
-                          "hyb.matmul_rhs_pack", "hyb.matmul_rhs_packed", "hyb.matmul_rhs_packings",
-                          "hyb.matmul_transpose_output", "hyb.matmul_output_transposes", "hyb.matmul_transpose_scratch",
-                          "hyb.weight_segments", "hyb.projection_fusions",
-                          "hyb.elide_matrix_init", "hyb.matrix_init_elisions", "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions",
-                          "hyb.activation_residency_private_results", "hyb.attention_fusion",
-                          "hyb.attention_fused", "hyb.flash_attention", "hyb.flash_tile",
-                          "hyb.flash_decoding", "hyb.flash_math", "hyb.flash_merge"})
-      reservedStorageAttr |= op->hasAttr(name);
+    for (StringRef name : kDriverOwnedAttributes) driverOwnedAttr |= op->hasAttr(name);
   });
-  if (reservedStorageAttr) {
+  if (driverOwnedAttr) {
     llvm::errs() << "reserved compiler IR attributes are driver-owned; use the CLI with a frontend graph\n";
     return 1;
   }

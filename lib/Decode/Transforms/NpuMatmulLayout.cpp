@@ -1,8 +1,12 @@
-// Materialize transposed FP16 RHS operands to expose full SA output tiles.
-// The backend otherwise computes one output row at a time for transpose-B.
-// Packing changes addresses, not K reduction order or accumulator precision.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuMatmulLayout.cpp - hyb-npu-matmul-layout ------------------------===//
+//
+// The backend computes a transpose-B FP16 matmul one output row at a time. Materialize a layout
+// that fills whole SA output tiles instead: pack B into [K, N], or transpose A, compute the
+// transposed output and transpose it back when that moves fewer elements. Only addresses change;
+// K order and accumulator precision stay the same.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -14,15 +18,8 @@ namespace mlir::hybrid {
 }
 using namespace mlir;
 using namespace mlir::hybrid;
+
 namespace {
-Value allocationRoot(Value value) {
-  while (Operation *op = value.getDefiningOp()) {
-    if (!isa<memref::SubViewOp, memref::ExpandShapeOp, memref::CollapseShapeOp,
-             memref::CastOp, memref::ReinterpretCastOp>(op)) break;
-    value = op->getOperand(0);
-  }
-  return value;
-}
 // Bound the new scratch without relying on future physical allocation reuse.
 // Every allocation in the current block and enclosing blocks is counted, even
 // when dead. Loop allocations reserve both slots required by the memory planner.
@@ -70,12 +67,12 @@ bool fitsScratch(Operation *at, uint64_t extra, const TargetSpec &spec) {
 // The algebraic transpose-output form uses a fresh zero accumulator. Admit
 // only a direct dominating zero fill with no intervening access through aliases.
 linalg::FillOp zeroInitializer(Value output, Operation *matrix) {
-  Value root = allocationRoot(output);
+  Value root = viewRoot(output);
   for (Operation *previous = matrix->getPrevNode(); previous; previous = previous->getPrevNode()) {
     bool touches = false;
     previous->walk([&](Operation *op) {
       for (Value value : op->getOperands())
-        if (isa<MemRefType>(value.getType()) && allocationRoot(value) == root) touches = true;
+        if (isa<MemRefType>(value.getType()) && viewRoot(value) == root) touches = true;
     });
     if (!touches) continue;
     auto fill = dyn_cast<linalg::FillOp>(previous);
@@ -118,18 +115,18 @@ bool transposeOutput(linalg::LinalgOp matrix, Value a, Value b, Value c,
   std::swap(permutation[rank-2], permutation[rank-1]);
   OpBuilder builder(matrix);
   auto alloc = [&](ArrayRef<int64_t> shape) {
-    auto result = builder.create<memref::AllocOp>(matrix.getLoc(),
+    auto result = memref::AllocOp::create(builder, matrix.getLoc(),
       MemRefType::get(shape, at.getElementType(), MemRefLayoutAttrInterface{}, at.getMemorySpace()));
     result->setAttr("hyb.matmul_transpose_scratch", builder.getUnitAttr());
     return result;
   };
   auto packedA = alloc(ashape), temporary = alloc(cshape);
-  // No original C read occurs between its proven fill and the complete final
-  // transpose overwrite. Preserve the former matrix-init zero-store elision.
+  // Nothing reads the original C between its zero fill and the final transpose, which
+  // overwrites it completely: its zero stores can be skipped.
   originalFill->setAttr("hyb.elide_matrix_init", builder.getUnitAttr());
-  builder.create<linalg::TransposeOp>(matrix.getLoc(), a, packedA.getResult(), permutation);
-  auto zero = builder.create<arith::ConstantOp>(matrix.getLoc(), builder.getF16FloatAttr(0.0));
-  auto fill = builder.create<linalg::FillOp>(matrix.getLoc(), ValueRange{zero.getResult()}, ValueRange{temporary.getResult()});
+  linalg::TransposeOp::create(builder, matrix.getLoc(), a, packedA.getResult(), permutation);
+  auto zero = arith::ConstantOp::create(builder, matrix.getLoc(), builder.getF16FloatAttr(0.0));
+  auto fill = linalg::FillOp::create(builder, matrix.getLoc(), ValueRange{zero.getResult()}, ValueRange{temporary.getResult()});
   // This newly private D is fully overwritten by the matrix ISA INIT before
   // its sole later reader, the output transpose. Avoid materializing zeros.
   fill->setAttr("hyb.elide_matrix_init", builder.getUnitAttr());
@@ -139,7 +136,7 @@ bool transposeOutput(linalg::LinalgOp matrix, Value a, Value b, Value c,
   matrix->setAttr("indexing_maps", builder.getAffineMapArrayAttr(maps));
   matrix->setAttr("hyb.matmul_transpose_output", builder.getUnitAttr());
   builder.setInsertionPointAfter(matrix);
-  builder.create<linalg::TransposeOp>(matrix.getLoc(), temporary.getResult(), c, permutation);
+  linalg::TransposeOp::create(builder, matrix.getLoc(), temporary.getResult(), c, permutation);
   return true;
 }
 
@@ -155,9 +152,9 @@ bool pack(linalg::LinalgOp matrix, const TargetSpec &spec) {
         !type.getElementType().isF16() || type.getMemorySpaceAsInt() != 1 ||
         llvm::any_of(type.getShape(), [](int64_t d) { return d <= 0; })) return false;
   }
-  Value outputRoot = allocationRoot(c);
+  Value outputRoot = viewRoot(c);
   if (!outputRoot.getDefiningOp<memref::AllocOp>() ||
-      outputRoot == allocationRoot(a) || outputRoot == allocationRoot(b)) return false;
+      outputRoot == viewRoot(a) || outputRoot == viewRoot(b)) return false;
   auto at = cast<MemRefType>(a.getType()), bt = cast<MemRefType>(b.getType()), ct = cast<MemRefType>(c.getType());
   // Both layout variants change output traversal order; overlapping logical
   // output elements are not a legal layout-rewrite candidate.
@@ -195,10 +192,10 @@ bool pack(linalg::LinalgOp matrix, const TargetSpec &spec) {
   std::swap(shape[rank-2], shape[rank-1]);
   std::swap(permutation[rank-2], permutation[rank-1]);
   OpBuilder builder(matrix);
-  auto packed = builder.create<memref::AllocOp>(matrix.getLoc(),
+  auto packed = memref::AllocOp::create(builder, matrix.getLoc(),
       MemRefType::get(shape, bt.getElementType(), MemRefLayoutAttrInterface{}, bt.getMemorySpace()));
   packed->setAttr("hyb.matmul_rhs_pack", builder.getUnitAttr());
-  builder.create<linalg::TransposeOp>(matrix.getLoc(), b, packed.getResult(), permutation);
+  linalg::TransposeOp::create(builder, matrix.getLoc(), b, packed.getResult(), permutation);
   // The fresh destination cannot alias any source or output. The transpose
   // stays immediately before its consumer and reads the same RHS version.
   matrix->setOperand(1, packed);
@@ -211,13 +208,10 @@ bool pack(linalg::LinalgOp matrix, const TargetSpec &spec) {
 struct HybNpuMatmulLayoutPass : mlir::hybrid::impl::HybNpuMatmulLayoutBase<HybNpuMatmulLayoutPass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.matmulRhsPacking && !target->npu.matmulTransposeOutput) return;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, transposes = 0;
       SmallVector<linalg::LinalgOp> matrices;
       fn.walk([&](linalg::LinalgOp op) {
@@ -228,8 +222,9 @@ struct HybNpuMatmulLayoutPass : mlir::hybrid::impl::HybNpuMatmulLayoutBase<HybNp
         if (matrix->hasAttr("hyb.matmul_transpose_output")) ++transposes;
         else ++count;
       }
-      fn->setAttr("hyb.matmul_rhs_packings", IntegerAttr::get(IntegerType::get(&getContext(),64),count));
-      fn->setAttr("hyb.matmul_output_transposes", IntegerAttr::get(IntegerType::get(&getContext(),64),transposes));
+      auto i64 = IntegerType::get(&getContext(), 64);
+      fn->setAttr("hyb.matmul_rhs_packings", IntegerAttr::get(i64, count));
+      fn->setAttr("hyb.matmul_output_transposes", IntegerAttr::get(i64, transposes));
     }
   }
 };

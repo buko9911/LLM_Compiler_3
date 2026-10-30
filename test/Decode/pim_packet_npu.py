@@ -172,9 +172,7 @@ def provenance_files(args):
              ROOT / "configs/target.json", workspace.NPU_TOOLS / "isa_v2.py"]
     paths += sorted((ROOT / "lib/Decode").rglob("*.cpp"))
     paths += sorted((ROOT / "include/npu/Decode").rglob("*.h"))
-    paths += [ROOT / rel for rel in ["include/npu/Target/PimLayout.h", "lib/Target/PimLayout.cpp",
-                                   "include/npu/Target/Program.h", "lib/Target/Program.cpp",
-                                   "lib/Target/PimPrimitive.cpp", "lib/Target/IsaV2.cpp"]]
+    paths += sorted((ROOT / "lib/Target").glob("*.cpp")) + sorted((ROOT / "include/npu/Target").glob("*.h"))
     if args.old_compiler:
         paths.append(args.old_compiler)
     return sorted(set(p.resolve() for p in paths))
@@ -326,12 +324,12 @@ def main():
             injected = out / "injected_packet_attribute.mlir"
             injected.write_text(source_for(args.m)[0].read_text().replace("module {", 'module attributes {hyb.npu_kernel = "pim_packet_g4"} {', 1))
             compile_case("negative_injected_attribute", args.m, packet_options, source_override=injected,
-                         expect="reserved PIM weight storage IR attributes")
+                         expect="reserved compiler IR attributes are driver-owned")
             nested = out / "injected_nested_packet_attribute.mlir"
             nested.write_text(source_for(args.m)[0].read_text().replace(
                 "arith.constant 0.0 : f32", 'arith.constant {hyb.npu_kernel = "pim_packet_g4"} 0.0 : f32', 1))
             compile_case("negative_nested_attribute", args.m, packet_options, source_override=nested,
-                         expect="reserved PIM weight storage IR attributes")
+                         expect="reserved compiler IR attributes are driver-owned")
             zero = out / "zero_projection.mlir"
             zero.write_text(f'''module {{
   func.func @decode_step(%x: tensor<{args.m}x{args.k}xf32>, %w: tensor<{args.n}x{args.k}xf32>) -> tensor<{args.m}x{args.k}xf32> {{

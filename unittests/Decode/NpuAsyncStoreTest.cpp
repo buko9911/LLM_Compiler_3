@@ -52,7 +52,6 @@ void emit(const std::string &body, bool enabled, Emission &result,
   TargetSpec spec;
   spec.npu.asyncOutputStores = enabled && !inputLoad;
   spec.npu.asyncInputLoads = enabled && inputLoad;
-  spec.npu.asyncInputLoadOverlap = overlap;
   spec.npu.asyncOutputStoreVectorOverlap = overlap;
   spec.npu.memoryDependencySchedule = memorySchedule;
   plena::ProgramBuilder program;
@@ -192,11 +191,6 @@ TEST(NpuAsyncInput, StridedDestinationProtectsRowsButNotHoles) {
     emit(fillB, true, e, offset, true, true, true);
     EXPECT_EQ(windows(e, true), (std::vector<int>{0, expected}));
   }
-}
-TEST(NpuAsyncInput, ImmediateWaitControl) {
-  Emission e;
-  emit(fillB, true, e, 267264, false, false, true);
-  EXPECT_EQ(windows(e, true), (std::vector<int>{0, 0}));
 }
 TEST(NpuAsyncInput, DisabledKeepsBlockingLoad) {
   Emission e;

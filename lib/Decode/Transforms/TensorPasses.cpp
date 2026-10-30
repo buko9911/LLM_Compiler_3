@@ -1,4 +1,4 @@
-//===- TensorPasses.cpp - [A] tensor-level passes --------------------------===//
+//===- TensorPasses.cpp - tensor-level passes ------------------------------===//
 //
 // hyb-annotate, hyb-simplify, hyb-raise-linear, hyb-quantize, hyb-fold-transpose,
 // Linear raising, quantization and transpose normalization.

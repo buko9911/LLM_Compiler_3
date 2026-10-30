@@ -1,7 +1,11 @@
-// Same-input horizontal fusion. Concatenate output columns, preserving every
-// reduction and scale; the image planner places original weights only once.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuProjectionFusion.cpp - hyb-npu-projection-fusion ----------------===//
+//
+// Same-input horizontal fusion: GEMV + dequant chains that read one quantized activation (q/k/v,
+// gate/up) become one GEMV over the concatenated output columns. Every reduction and scale is
+// preserved; the image places the original NK32 weight blocks and row scales contiguously.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -23,6 +27,7 @@ struct Projection {
   int64_t m, n, k;
 };
 
+/// The canonical chain fill -> GEMV (hyb.npu_gemv) -> collapse -> dequant of one projection.
 std::optional<Projection> match(hyb::DequantOp d) {
   if (d->getNumResults() != 1) return std::nullopt;
   auto c = d.getAcc().getDefiningOp<tensor::CollapseShapeOp>();
@@ -42,7 +47,8 @@ std::optional<Projection> match(hyb::DequantOp d) {
       g->getAttrOfType<StringAttr>("hyb.npu_gemv") != d.getWeightAttr() ||
       w->hasAttr("hyb.weight_segments") || s->hasAttr("hyb.weight_segments") ||
       !matchPattern(f.getInputs()[0], m_Constant(&zero)) || !isa<IntegerAttr>(zero) ||
-      !cast<IntegerAttr>(zero).getValue().isZero()) return std::nullopt;
+      !cast<IntegerAttr>(zero).getValue().isZero())
+    return std::nullopt;
   auto q = dyn_cast<RankedTensorType>(g.getDpsInputs()[0].getType());
   auto wt = dyn_cast<RankedTensorType>(w.getType());
   auto a = dyn_cast<RankedTensorType>(g.getResult(0).getType());
@@ -53,23 +59,27 @@ std::optional<Projection> match(hyb::DequantOp d) {
       !y.hasStaticShape() || q.getRank() != 2 || wt.getRank() != 3 || y.getRank() != 2 ||
       !q.getElementType().isInteger(8) || !wt.getElementType().isInteger(8) ||
       !a.getElementType().isInteger(32) || !y.getElementType().isF16() ||
-      !sc.getElementType().isF32() || !ws.getElementType().isF32()) return std::nullopt;
+      !sc.getElementType().isF32() || !ws.getElementType().isF32())
+    return std::nullopt;
   int64_t m = q.getDimSize(0), k = q.getDimSize(1), n = y.getDimSize(1);
   if (m <= 0 || k <= 0 || n <= 0 || n % 32 ||
-      wt.getShape() != ArrayRef<int64_t>({n/32,k,32}) ||
-      a.getShape() != ArrayRef<int64_t>({m,n/32,32}) ||
-      y.getShape() != ArrayRef<int64_t>({m,n}) ||
-      sc.getShape() != ArrayRef<int64_t>({m,1}) || ws.getShape() != ArrayRef<int64_t>({n}))
+      wt.getShape() != ArrayRef<int64_t>({n / 32, k, 32}) ||
+      a.getShape() != ArrayRef<int64_t>({m, n / 32, 32}) ||
+      y.getShape() != ArrayRef<int64_t>({m, n}) ||
+      sc.getShape() != ArrayRef<int64_t>({m, 1}) || ws.getShape() != ArrayRef<int64_t>({n}))
     return std::nullopt;
-  // Require the canonical contraction, including its scalar payload. Cloning
-  // an arbitrary annotated generic would not prove identical arithmetic.
-  AffineExpr x,b,col,r;
-  bindDims(g.getContext(), x,b,col,r);
-  SmallVector<AffineMap> maps = {AffineMap::get(4,0,{x,r},g.getContext()),
-      AffineMap::get(4,0,{b,r,col},g.getContext()), AffineMap::get(4,0,{x,b,col},g.getContext())};
-  if (g.getIndexingMapsArray() != maps || g.getIteratorTypesArray() !=
-      SmallVector<utils::IteratorType>{utils::IteratorType::parallel,utils::IteratorType::parallel,
-          utils::IteratorType::parallel,utils::IteratorType::reduction}) return std::nullopt;
+  // Require the canonical contraction, including its scalar payload: cloning an arbitrary
+  // annotated generic would not prove identical arithmetic.
+  AffineExpr x, b, col, r;
+  bindDims(g.getContext(), x, b, col, r);
+  SmallVector<AffineMap> maps = {AffineMap::get(4, 0, {x, r}, g.getContext()),
+                                 AffineMap::get(4, 0, {b, r, col}, g.getContext()),
+                                 AffineMap::get(4, 0, {x, b, col}, g.getContext())};
+  if (g.getIndexingMapsArray() != maps ||
+      g.getIteratorTypesArray() !=
+          SmallVector<utils::IteratorType>{utils::IteratorType::parallel, utils::IteratorType::parallel,
+                                           utils::IteratorType::parallel, utils::IteratorType::reduction})
+    return std::nullopt;
   auto &body = g.getRegion().front();
   if (body.getOperations().size() != 5) return std::nullopt;
   auto it = body.begin();
@@ -81,27 +91,25 @@ std::optional<Projection> match(hyb::DequantOp d) {
       ew.getIn() != body.getArgument(1) || mul.getLhs() != ex || mul.getRhs() != ew ||
       add.getLhs() != body.getArgument(2) || add.getRhs() != mul || yield.getOperand(0) != add)
     return std::nullopt;
-  return Projection{d,c,g,w,s,f,m,n,k};
+  return Projection{d, c, g, w, s, f, m, n, k};
 }
 
 struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBase<HybNpuProjectionFusionPass> {
   using Base::Base;
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec,error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.projectionFusion) return;
-    // A fixed PIM image is a different contract; never repack its weights.
+    // A fixed PIM weight storage is a different image contract; never repack its weights.
     if (getOperation()->hasAttr("hyb.pim_weight_storage_requested")) return;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn.empty() || fn->hasAttr("hyb.npu_kernel")) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
+      // Group projections by their quantized input and its scale.
       SmallVector<SmallVector<Projection>> groups;
       for (Operation &op : fn.front()) {
         auto d = dyn_cast<hyb::DequantOp>(op);
         auto p = d ? match(d) : std::nullopt;
         if (!p) continue;
-        auto group = llvm::find_if(groups,[&](auto &g) {
+        auto group = llvm::find_if(groups, [&](auto &g) {
           return g.front().gemv.getDpsInputs()[0] == p->gemv.getDpsInputs()[0] &&
                  g.front().dequant.getScale() == d.getScale();
         });
@@ -109,27 +117,28 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
         else group->push_back(*p);
       }
       int64_t count = 0;
-      for (auto &group : groups) if (group.size() > 1 && fuse(group,*target)) ++count;
-      fn->setAttr("hyb.projection_fusions", IntegerAttr::get(IntegerType::get(&getContext(),64),count));
+      for (auto &group : groups)
+        if (group.size() > 1 && fuse(group, *target)) ++count;
+      fn->setAttr("hyb.projection_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), count));
     }
   }
 
   bool fuse(SmallVector<Projection> &ps, const TargetSpec &target) {
-    // Place before the earliest contraction so even early Q-norm users remain
+    // Place the fused GEMV before the earliest contraction so even early Q-norm users remain
     // dominated. All new runtime inputs must already be available there.
-    llvm::sort(ps,[](auto &a,auto &b) { return a.gemv->isBeforeInBlock(b.gemv); });
+    llvm::sort(ps, [](auto &a, auto &b) { return a.gemv->isBeforeInBlock(b.gemv); });
     auto &first = ps.front();
     DominanceInfo dom;
-    if (!dom.dominates(first.dequant.getScale(),first.gemv)) return false;
+    if (!dom.dominates(first.dequant.getScale(), first.gemv)) return false;
     int64_t n = 0;
     for (auto &p : ps) n += p.n;
-    // Bound private accumulator/output growth before authoritative memplan.
-    int64_t cores = std::min<int64_t>(n/32,target.npu.cores);
-    while (cores > 1 && (n/32) % cores) --cores;
-    int64_t local = first.m * (n/cores) * 6 + first.m*first.k + n/cores*4 +
-                    2*std::max<int64_t>(target.npu.gemvTileBytes,first.k*32) +
+    // Bound the private accumulator / output growth; hyb-npu-memplan makes the final check.
+    int64_t cores = largestDivisorAtMost(n / 32, target.npu.cores);
+    int64_t local = first.m * (n / cores) * 6 + first.m * first.k + n / cores * 4 +
+                    2 * std::max<int64_t>(target.npu.gemvTileBytes, first.k * 32) +
                     target.npu.l1ReservedBytes + 4096;
-    if (local > target.npu.l1Bytes || first.m*n*6 > target.npu.l2Bytes) return false;
+    if (local > target.npu.l1Bytes || first.m * n * 6 > target.npu.l2Bytes) return false;
+
     OpBuilder b(first.gemv);
     Location loc = first.gemv.getLoc();
     SmallVector<Attribute> segments;
@@ -137,43 +146,47 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
     for (auto &p : ps) {
       if (segments.size()) name += ";";
       name += p.weight.getName().str();
-      segments.push_back(b.getDictionaryAttr({b.getNamedAttr("name",p.weight.getNameAttr()),
-                                              b.getNamedAttr("rows",b.getI64IntegerAttr(p.n))}));
+      segments.push_back(b.getDictionaryAttr({b.getNamedAttr("name", p.weight.getNameAttr()),
+                                              b.getNamedAttr("rows", b.getI64IntegerAttr(p.n))}));
     }
     name += "]";
     auto segmentAttr = b.getArrayAttr(segments);
-    auto wt = RankedTensorType::get({n/32,first.k,32},b.getI8Type());
-    auto w = hyb::WeightOp::create(b,loc,wt,b.getStringAttr(name),b.getStringAttr("npu_nk32"));
-    auto s = hyb::WeightOp::create(b,loc,RankedTensorType::get({n},b.getF32Type()),
-                                 b.getStringAttr(name),b.getStringAttr("row_scale"));
-    w->setAttr("hyb.weight_segments",segmentAttr);
-    s->setAttr("hyb.weight_segments",segmentAttr);
-    Value e = tensor::EmptyOp::create(b,loc,ArrayRef<int64_t>{first.m,n/32,32},b.getI32Type());
-    Value z = arith::ConstantOp::create(b,loc,b.getI32IntegerAttr(0));
-    Value init = linalg::FillOp::create(b,loc,z,e).getResult(0);
+    auto wt = RankedTensorType::get({n / 32, first.k, 32}, b.getI8Type());
+    auto w = hyb::WeightOp::create(b, loc, wt, b.getStringAttr(name), b.getStringAttr("npu_nk32"));
+    auto s = hyb::WeightOp::create(b, loc, RankedTensorType::get({n}, b.getF32Type()), b.getStringAttr(name),
+                                   b.getStringAttr("row_scale"));
+    w->setAttr("hyb.weight_segments", segmentAttr);
+    s->setAttr("hyb.weight_segments", segmentAttr);
+    Value e = tensor::EmptyOp::create(b, loc, ArrayRef<int64_t>{first.m, n / 32, 32}, b.getI32Type());
+    Value z = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+    Value init = linalg::FillOp::create(b, loc, z, e).getResult(0);
     IRMapping mapping;
-    mapping.map(first.weight.getResult(),w.getResult());
-    mapping.map(first.gemv.getDpsInits()[0],init);
-    auto g = cast<linalg::GenericOp>(b.clone(*first.gemv,mapping));
+    mapping.map(first.weight.getResult(), w.getResult());
+    mapping.map(first.gemv.getDpsInits()[0], init);
+    auto g = cast<linalg::GenericOp>(b.clone(*first.gemv, mapping));
     g.getResult(0).setType(init.getType());
-    g->setAttr("hyb.npu_gemv",b.getStringAttr(name));
-    Value acc = tensor::CollapseShapeOp::create(b,loc,RankedTensorType::get({first.m,n},b.getI32Type()),
-        g.getResult(0),SmallVector<ReassociationIndices>{{0},{1,2}});
-    Value out = tensor::EmptyOp::create(b,loc,ArrayRef<int64_t>{first.m,n},b.getF16Type());
-    auto d = hyb::DequantOp::create(b,loc,TypeRange{out.getType()},acc,first.dequant.getScale(),s,out,b.getStringAttr(name));
+    g->setAttr("hyb.npu_gemv", b.getStringAttr(name));
+    Value acc = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({first.m, n}, b.getI32Type()),
+                                                g.getResult(0), SmallVector<ReassociationIndices>{{0}, {1, 2}});
+    Value out = tensor::EmptyOp::create(b, loc, ArrayRef<int64_t>{first.m, n}, b.getF16Type());
+    auto d = hyb::DequantOp::create(b, loc, TypeRange{out.getType()}, acc, first.dequant.getScale(), s, out,
+                                    b.getStringAttr(name));
+    // Each original result becomes a column slice of the fused FP16 output.
     int64_t offset = 0;
     for (auto &p : ps) {
-      Value slice = tensor::ExtractSliceOp::create(b,loc,d.getResult(0),
-          SmallVector<OpFoldResult>{b.getIndexAttr(0),b.getIndexAttr(offset)},
-          SmallVector<OpFoldResult>{b.getIndexAttr(p.m),b.getIndexAttr(p.n)},
-          SmallVector<OpFoldResult>{b.getIndexAttr(1),b.getIndexAttr(1)});
+      Value slice = tensor::ExtractSliceOp::create(
+          b, loc, d.getResult(0), SmallVector<OpFoldResult>{b.getIndexAttr(0), b.getIndexAttr(offset)},
+          SmallVector<OpFoldResult>{b.getIndexAttr(p.m), b.getIndexAttr(p.n)},
+          SmallVector<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
       p.dequant.getResult(0).replaceAllUsesWith(slice);
       offset += p.n;
     }
     for (auto &p : ps) {
-      p.dequant.erase(); p.collapse.erase(); p.gemv.erase();
+      p.dequant.erase();
+      p.collapse.erase();
+      p.gemv.erase();
     }
     return true;
   }
 };
-}
+} // namespace

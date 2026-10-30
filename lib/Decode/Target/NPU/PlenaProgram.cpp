@@ -1,5 +1,12 @@
+//===- PlenaProgram.cpp - the step program: records, dependencies, encoding -===//
+//
+// ProgramBuilder collects the system commands of one decode step (GDMA, core blocks, barriers,
+// PIM records) with their dependencies, bounds GDMA lookahead per core, and in finish() lowers
+// every core block to ISA ver 2.0 and writes program.bin and system.json.
+//===----------------------------------------------------------------------===//
+
 #include "npu/Decode/Target/PlenaProgram.h"
-#include "npu/Target/IsaV2.h"
+#include "npu/Target/ISAv2.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>

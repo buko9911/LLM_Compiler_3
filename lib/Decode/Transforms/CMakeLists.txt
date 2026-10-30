@@ -7,17 +7,14 @@ add_mlir_library(NPUDecodeTransforms
   PlanLP6.cpp
   NpuTensorPasses.cpp
   NpuMemoryPasses.cpp
-  NpuOverlap.cpp
   NpuMatmulLayout.cpp
   NpuInputPipeline.cpp
-  NpuTransferSchedule.cpp
   NpuGemvEpilogue.cpp
   NpuProjectionFusion.cpp
   NpuMatrixInit.cpp
   NpuActivationResidency.cpp
   NpuAttentionFusion.cpp
   NpuElementwiseDistribution.cpp
-  NpuFlashAttention.cpp
   DEPENDS HybridPassesIncGen MLIRHybOpsIncGen
   LINK_LIBS PUBLIC NPUDecodeDialect NPUDecodeSupport NPUDecodeTarget MLIRAnalysis MLIRIR MLIRPass MLIRTransforms MLIRFuncDialect MLIRLinalgDialect
     MLIRLinalgTransforms MLIRTensorDialect MLIRArithDialect MLIRMathDialect MLIRMemRefDialect

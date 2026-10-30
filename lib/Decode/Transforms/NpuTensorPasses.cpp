@@ -5,8 +5,7 @@
 //   hyb-npu-tile        core distribution (scf.forall) and L1-sized loop tiles (scf.for)
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -92,12 +91,6 @@ struct HybLowerNpuGemvPass : mlir::hybrid::impl::HybLowerNpuGemvBase<HybLowerNpu
 //===----------------------------------------------------------------------===//
 // hyb-npu-tile
 //===----------------------------------------------------------------------===//
-int64_t largestDivisorAtMost(int64_t n, int64_t limit) {
-  for (int64_t d = std::min(n, limit); d > 1; --d)
-    if (n % d == 0) return d;
-  return 1;
-}
-
 bool insideForall(Operation *op) { return op->getParentOfType<scf::ForallOp>() != nullptr; }
 
 SmallVector<OpFoldResult> indexAttrs(OpBuilder &b, ArrayRef<int64_t> v) {
@@ -112,17 +105,10 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
   TargetSpec target;
 
   void runOnOperation() override {
-    std::string err;
-    auto specOr = TargetSpec::load(spec, err);
-    if (failed(specOr)) {
-      getOperation().emitError(err);
-      return signalPassFailure();
-    }
+    auto specOr = loadTargetSpec(getOperation(), spec);
+    if (failed(specOr)) return signalPassFailure();
     target = *specOr;
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu") continue;
-      if (fn->hasAttr("hyb.npu_kernel")) continue; // checked isolated packet plan owns its tiling
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       if (failed(tileGemvs(fn)) || failed(tileAttention(fn)) || failed(tileDequants(fn))) return signalPassFailure();
       cleanup(fn);
     }

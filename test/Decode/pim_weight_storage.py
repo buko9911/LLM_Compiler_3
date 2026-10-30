@@ -243,7 +243,7 @@ def main():
         compile_case(f'negative_stale_{label}',4,opts,expect=needle)
     injected=out/'injected_storage_attribute.mlir'
     injected.write_text(sources[4][0].read_text().replace('module {','module attributes {hyb.pim_weight_storage_requested = unit} {',1))
-    compile_case('negative_ir_attribute',4,['--no-image'],expect='reserved PIM weight storage IR attributes',source_override=injected)
+    compile_case('negative_ir_attribute',4,['--no-image'],expect='reserved compiler IR attributes are driver-owned',source_override=injected)
     compile_case('negative_npu',4,['--pim-weight-storage-import',exported,'--force=npu'],expect='requires at least one PIM projection')
     compile_case('negative_explicit_bankset',4,['--pim-weight-storage-import',exported,'--pim-bankset-pingpong=12'],expect='bankset layout differs')
     result['all_checks_passed']=True

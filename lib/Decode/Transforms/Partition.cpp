@@ -7,8 +7,7 @@
 // activation broadcast (PIM) or one weight stream pass (NPU).
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
@@ -26,12 +25,8 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
   using Base::Base;
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    std::string err;
-    auto specOr = TargetSpec::load(spec, err);
-    if (failed(specOr)) {
-      module.emitError(err);
-      return signalPassFailure();
-    }
+    auto specOr = loadTargetSpec(module, spec);
+    if (failed(specOr)) return signalPassFailure();
     for (StringRef item : llvm::split(StringRef(overrides), ';')) {
       auto [key, t] = item.split(':');
       if (!key.empty()) specOr->mapping.overrides.push_back({key.str(), t.str()});

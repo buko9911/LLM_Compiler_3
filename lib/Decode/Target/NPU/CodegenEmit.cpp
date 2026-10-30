@@ -132,8 +132,7 @@ void Codegen::waitOutputStore() {
 
 void Codegen::guardOutputStoreVectorWrite(uint64_t address, uint32_t funct) {
   if (!pendingOutputStore) return;
-  // A vector store is at most one 512-bit register. Use its full footprint
-  // conservatively: typed-vector records can change VL independently of cfg.
+  // A vector store is at most one 512-bit register; use its full footprint conservatively.
   if (funct != 2 && funct != 4 && funct != 6 && funct != 8 && funct != 10) {
     waitOutputStore();
     return;
@@ -322,10 +321,7 @@ void Codegen::ldma(uint64_t l1, uint64_t l2, uint32_t rowBytes, uint32_t rows, u
     if (async || inputAsync) load(10, inputAsync ? 3 : 2);
     emit(rform(OP_LDMA, 1, 2, (async || inputAsync) ? 10 : 0, 0, inputAsync ? 12 : toL1 ? 4 : async ? 13 : 5));
   }
-  if (inputAsync) {
-    pendingInputLoad = PendingInputLoad{rowRanges(l1,rowBytes,rows,dstStride),w.currentSource};
-    if (!in.spec->npu.asyncInputLoadOverlap) waitInputLoad();
-  }
+  if (inputAsync) pendingInputLoad = PendingInputLoad{rowRanges(l1, rowBytes, rows, dstStride), w.currentSource};
   if (async) {
     pendingOutputStore = PendingOutputStore{rowRanges(l1, rowBytes, rows, srcStride), false, w.currentSource};
     ++asyncOutputStores;

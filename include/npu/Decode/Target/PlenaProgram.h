@@ -6,7 +6,7 @@
 // 32-bit word stream. A core block starts when its dependencies complete; CORE_BEGIN resets
 // the GP and control registers, so the builder replays their tracked values at every new block.
 // Core code is written as a builder stream (the encodings below); finish() lowers every core
-// block to ISA ver 2.0 (IsaV2.h) and writes ISA ver 2.0 system records.
+// block to ISA ver 2.0 (ISAv2.h) and writes ISA ver 2.0 system records.
 //
 // One decode step is one program: every NPU phase is a stretch of records between
 // beginPhase() and endPhase() (a BARRIER that joins the phase), and every PIM phase is one PIM
@@ -113,7 +113,7 @@ private:
   std::vector<int> base;                  // the current phase's entry
 };
 
-// ---- builder-stream encodings (lowered to ISA ver 2.0 by IsaV2.h) ------------------------------------------------------
+// ---- builder-stream encodings (lowered to ISA ver 2.0 by ISAv2.h) ------------------------------------------------------
 inline uint32_t rform(uint32_t opcode, uint32_t rd = 0, uint32_t rs1 = 0, uint32_t rs2 = 0, uint32_t rs3 = 0,
                       uint32_t funct = 0) {
   return opcode | rd << 6 | rs1 << 10 | rs2 << 14 | rs3 << 18 | funct << 22;

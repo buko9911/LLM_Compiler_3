@@ -186,8 +186,7 @@ def main():
             spec = json.loads((root / "configs/target.json").read_text())
             spec["npu"].update(elementwise_distribution=enabled, distribute_min_elements=1,
                 vector_scalar_reuse=False, vector_chunk_pipeline=False,
-                activation_residency=True, attention_fusion=False, flash_attention=False,
-                flash_decoding=False, projection_fusion=False, overlap_dequant_gemv=False,
+                activation_residency=True, attention_fusion=False, projection_fusion=False,
                 l2_staging_bytes_per_core=0)
             if args.command_schedule:
                 spec["npu"]["command_schedule"] = True

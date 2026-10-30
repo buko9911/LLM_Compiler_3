@@ -6,14 +6,11 @@
 //
 // Give each escaping result a private empty destination before bufferization.
 // The original shared destination stays phase-local; hyb-npu-place puts it in
-// shared L2 when several cores consume it. No producer/consumer is reordered,
-// no tensor value is approximated, and final phase outputs retain the DRAM ABI.
-// This is activation residency, not weight fusion or cross-phase SRAM linking.
+// shared L2 when several cores consume it. Phase outputs keep their LP6 buffers.
 //===----------------------------------------------------------------------===//
 
-#include "npu/Decode/Support/TargetSpec.h"
 #include "npu/Decode/Support/TensorDestination.h"
-#include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Transforms/PassSupport.h"
 
 namespace mlir::hybrid {
 #define GEN_PASS_DEF_HYBNPUACTIVATIONRESIDENCY
@@ -25,6 +22,7 @@ using namespace mlir::hybrid;
 
 namespace {
 
+/// Only NPU phases, and none of them the PIM packet kernel.
 bool isNpuOnly(ModuleOp module) {
   if (module->hasAttr("hyb.pim_packet_npu_requested")) return false;
   bool hasNpu = false;
@@ -42,19 +40,13 @@ struct HybNpuActivationResidencyPass
   using Base::Base;
 
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) {
-      getOperation().emitError(error);
-      return signalPassFailure();
-    }
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
     if (!target->npu.activationResidency || !isNpuOnly(getOperation())) return;
 
-    for (auto fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      // OutlinePhases emits one straight-line block. Unknown control flow is
-      // left untouched rather than treating one return as the function exit.
-      if (!phase || phase.getValue() != "npu" || !llvm::hasSingleElement(fn.getBody())) continue;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
+      // hyb-outline-phases emits one straight-line block; leave anything else untouched.
+      if (!llvm::hasSingleElement(fn.getBody())) continue;
       auto ret = dyn_cast<func::ReturnOp>(fn.front().getTerminator());
       if (!ret) continue;
       int64_t count = 0;
@@ -69,8 +61,7 @@ struct HybNpuActivationResidencyPass
         destination->set(builder.clone(*empty.getOperation())->getResult(0));
         ++count;
       }
-      // Preserve the recorded transformation count when the pass is repeated.
-      // This records privatized destinations, not assumed DRAM bytes saved.
+      // Accumulate when the pass is run more than once.
       auto previous = fn->getAttrOfType<IntegerAttr>("hyb.activation_residency_private_results");
       fn->setAttr("hyb.activation_residency_private_results",
           IntegerAttr::get(IntegerType::get(&getContext(), 64), count + (previous ? previous.getInt() : 0)));

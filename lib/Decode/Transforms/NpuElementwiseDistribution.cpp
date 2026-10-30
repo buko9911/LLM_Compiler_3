@@ -1,10 +1,11 @@
-// Distribute independent tensor elements, without changing their scalar body.
-// This is deliberately separate from reduction and attention producer fusion:
-// only a static, top-level, all-parallel generic with an identity output map
-// participates. The normal placement/promoter passes provide private L1 tiles
-// and explicit shared-L2 publication; no cross-core L1 access is introduced.
-#include "npu/Decode/Support/TargetSpec.h"
-#include "npu/Decode/Transforms/Passes.h"
+//===- NpuElementwiseDistribution.cpp - hyb-npu-elementwise-distribute ----===//
+//
+// Split a static, top-level, all-parallel FP16 linalg.generic with an identity output map over
+// the cores, without changing its scalar body. Reductions and attention are left to the other
+// passes. hyb-npu-place / -promote then give each core private L1 tiles and a shared L2 result.
+//===----------------------------------------------------------------------===//
+
+#include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -29,7 +30,7 @@ bool supported(linalg::GenericOp op, func::FuncOp fn) {
   if (op->getBlock() != &fn.front() || !op.hasPureTensorSemantics() ||
       op.getNumResults() != 1 || op.getNumDpsInits() != 1 ||
       op.getNumLoops() == 0 || op.getNumReductionLoops() ||
-      op->hasAttr("hyb.npu_gemv") || op->hasAttr("hyb.flash_math") || op->hasAttr(marker)) return false;
+      op->hasAttr("hyb.npu_gemv") || op->hasAttr(marker)) return false;
   // A distributed shared destination must begin as an uninitialized fresh
   // tensor. Preserving an initialized phase argument can make bufferization
   // require an LP6 -> LP6 copy, which the current DMA backend cannot lower.
@@ -63,9 +64,7 @@ bool supported(linalg::GenericOp op, func::FuncOp fn) {
         if (constant.getValue() != 0 || type.getDimSize(axis) != 1) return false;
       } else return false;
     }
-    // Match the existing generic ISA contract: contiguous FP16 vector
-    // operands and FP32 row scalars. Distribution does not add strided vector
-    // loads, scalar FP16 loads, or change the explicitly typed Flash path.
+    // The vectorizer reads contiguous FP16 vector operands and FP32 row scalars.
     if (vector ? !type.getElementType().isF16() : !type.getElementType().isF32()) return false;
   }
   for (Operation &scalar : op.getRegion().front()) {
@@ -128,17 +127,11 @@ struct HybNpuElementwiseDistributePass
   using Base::Base;
 
   void runOnOperation() override {
-    std::string error;
-    auto target = TargetSpec::load(spec, error);
-    if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
-    if (!target->npu.elementwiseDistribution) return;
-    // Mixed NPU/PIM phase ownership is a separately tuned policy, as in the
-    // existing head-local attention fusion pass.
-    for (func::FuncOp fn : getOperation().getOps<func::FuncOp>())
-      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() == "pim") return;
-    for (func::FuncOp fn : getOperation().getOps<func::FuncOp>()) {
-      auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn.empty() || fn->hasAttr("hyb.npu_kernel")) continue;
+    auto target = loadTargetSpec(getOperation(), spec);
+    if (failed(target)) return signalPassFailure();
+    // An NPU-only option, like hyb-npu-attention-fusion.
+    if (!target->npu.elementwiseDistribution || hasPimPhase(getOperation())) return;
+    for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, candidates = 0, small = 0, unsupported = 0, capacity = 0, indivisible = 0;
       fn.walk([&](scf::ForallOp loop) { count += loop->hasAttr(marker); });
       SmallVector<linalg::GenericOp> work;

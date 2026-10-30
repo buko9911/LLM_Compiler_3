@@ -271,13 +271,6 @@ private:
     uint32_t bytes;
   };
   std::optional<WeightPrefetch> nextWeight;
-  // One home-core L1 dequant whose liveness covers an independent GEMV forall.
-  hyb::DequantOp deferredDequant;
-  int64_t deferredDequantCursor = 0;
-  std::set<Operation *> emittedDequants;
-  int64_t overlapPairs = 0, overlapChunks = 0;
-  LogicalResult emitDequantChunk(hyb::DequantOp d, int64_t &cursor, int64_t budget, std::string &err);
-  bool disjointDequantStorage(hyb::DequantOp d, scf::ForallOp f);
   void transfer2d(int64_t ss, int64_t ds, uint64_t src, uint64_t dst, uint32_t runBytes, uint32_t rows,
                   uint32_t sStride, uint32_t dStride, std::string &err);
   LogicalResult lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef<int64_t> perm, std::string &err);
@@ -315,7 +308,6 @@ private:
   // Kind of a body value: folded constant, row-invariant scalar, or FP16 vector.
   enum class K { Const, Scalar, Vector };
   LogicalResult lowerGeneric(linalg::GenericOp g, std::string &err);
-  LogicalResult lowerTypedGeneric(linalg::GenericOp g, std::string &err);
   LogicalResult emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, DenseMap<Value, K> &kind,
                           ArrayRef<Operation *> vops, DenseMap<Value, Value> &aliasOf, DenseMap<Value, int> &lastUse,
                           ArrayRef<uint64_t> base, int64_t n, bool reduction, Value pre, Value dotA, Value dotB,

@@ -1,4 +1,4 @@
-"""Check input-contract routing, the prefill alias, and malformed selectors."""
+"""Check decode routing and malformed selectors."""
 import argparse
 import subprocess
 import tempfile
@@ -8,18 +8,18 @@ p = argparse.ArgumentParser()
 p.add_argument("--compiler", required=True)
 a = p.parse_args()
 for args, code, needle in [
-    (["--help"], 0, "LLM_Compiler_3"),
-    (["--pipeline=graph", "--help"], 0, "--from="),
-    (["--pipeline=prefill", "--help"], 0, "--from="),
-    (["--pipeline=graph-hybrid", "--help"], 0, "--split-every"),
+    (["--help"], 0, "--npu-weight-prefetch"),
+    (["--pipeline=graph", "--help"], 2, "--pipeline must be decode"),
+    (["--pipeline=prefill", "--help"], 2, "--pipeline must be decode"),
+    (["--pipeline=graph-hybrid", "--help"], 2, "--pipeline must be decode"),
     (["--pipeline=decode", "--help"], 0, "--npu-weight-prefetch"),
     (["--pipeline=decode", "--help"], 0, "--npu-phase-split"),
     (["--pipeline", "decode", "--help"], 0, "--pim-bankset-pingpong"),
     (["--manifest=unused.json", "--help"], 0, "--npu-weight-prefetch"),
-    (["--pipeline=unknown"], 2, "must be prefill, graph, graph-hybrid or decode"),
+    (["--pipeline=unknown"], 2, "must be decode"),
     (["--pipeline"], 2, "needs a value"),
     (["--pipeline=decode", "--pipeline=graph"], 2, "only once"),
-    (["--pipeline=graph", "--manifest=unused.json"], 2, "requires --pipeline=decode"),
+    (["--pipeline=graph", "--manifest=unused.json"], 2, "--pipeline must be decode"),
 ]:
     r = subprocess.run([a.compiler, *args], text=True, capture_output=True)
     assert r.returncode == code and needle in r.stdout + r.stderr, (args, r.returncode, r.stdout, r.stderr)

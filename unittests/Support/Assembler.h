@@ -1,5 +1,5 @@
-#ifndef NPU_TARGET_ISA_H
-#define NPU_TARGET_ISA_H
+#ifndef NPU_UNITTESTS_SUPPORT_ASSEMBLER_H
+#define NPU_UNITTESTS_SUPPORT_ASSEMBLER_H
 #include "npu/Target/Result.h"
 #include <cstdint>
 #include <string>
@@ -7,9 +7,9 @@
 #include <vector>
 
 namespace npu {
-// Core builder stream in the ISA ver 1.0 encodings. Stage 5 writes core blocks in
-// this form; encoding lowers each block to ISA ver 2.0 (ISAv2.h), which the
-// simulator executes.
+// Test support: a text assembler for the builder-stream encodings that the decode backend
+// emits directly (Decode/Target/PlenaProgram.h). Tests write core blocks as text, assemble
+// them and check their ISA 2.0 lowering (npu/Target/ISAv2.h).
 //
 // Most instructions are one 32-bit word. Matrix operand loads and accumulator
 // writeouts are four-word records: a header word followed by three u32

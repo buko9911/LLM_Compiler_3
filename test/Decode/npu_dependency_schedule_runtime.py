@@ -230,11 +230,10 @@ def main():
         for mode in args.modes:
             spec = json.loads((root / "configs/target.json").read_text())
             spec["npu"].update(staging_early_release=mode in ("release", "both"),
-                memory_dependency_schedule=mode in ("memory", "both"), transfer_schedule=False,
-                async_input_loads=mode != "blocking", async_input_load_overlap=True,
+                memory_dependency_schedule=mode in ("memory", "both"),
+                async_input_loads=mode != "blocking",
                 async_output_stores=mode != "blocking", async_output_store_vector_overlap=True,
-                attention_fusion=False, projection_fusion=False, overlap_dequant_gemv=False,
-                flash_attention=False, flash_decoding=False, activation_residency=True,
+                attention_fusion=False, projection_fusion=False, activation_residency=True,
                 input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False,
                 l2_staging_bytes_per_core=fixture["staging"], **fixture["options"])
             target = case / f"{mode}.json"

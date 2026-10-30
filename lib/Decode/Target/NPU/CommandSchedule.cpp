@@ -1,5 +1,14 @@
-// System-command scheduling after physical address dependencies are built.
-// No operation names, trace timestamps or synthetic speedups enter this pass.
+//===- CommandSchedule.cpp - system command order of one NPU phase --------===//
+//
+// ProgramBuilder::schedulePhase (npu.command_schedule), run after the address-range dependencies
+// of a phase are built:
+//   1. list-schedule the phase's commands in dependency order, preferring the command whose
+//      nearest core-block consumer has the smallest accumulated instruction depth (core blocks
+//      before DMA on ties); keep the original order if an edge would no longer fit the 16-bit
+//      ISA 2.0 dependency distance;
+//   2. drop a dependency only when another dependency of the same command provably reaches it.
+//===----------------------------------------------------------------------===//
+
 #include "npu/Decode/Target/PlenaProgram.h"
 #include <algorithm>
 #include <cassert>
@@ -74,9 +83,8 @@ void ProgramBuilder::schedulePhase() {
   }
   std::move(sorted.begin(), sorted.end(), cmds.begin() + phaseStart);
 
-  // Drop an edge only after proving another dependency reaches it. Bound the
-  // search; exceeding the budget keeps the edge, never invents independence.
-  // This also reduces command-fetch/decode work for conservatively built DAGs.
+  // Drop an edge only after proving another dependency reaches it. The search is bounded; past
+  // the budget the edge is kept.
   std::vector<unsigned> seen(cmds.size(), 0);
   unsigned generation = 0;
   for (size_t id = phaseStart; id < cmds.size(); ++id) {
