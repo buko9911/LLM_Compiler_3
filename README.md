@@ -155,6 +155,6 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 ## 문서
 
 - `../../docs/walkthrough/D_compiler_qwen3_4b_npu.md`: Qwen3-4B를 직접 컴파일하며 pass마다 IR이 어떻게 바뀌는지 따라간 기록
-- `../../docs/architecture/NPU_DECODE_PASSES.md`: NPU pass의 설계와 측정 이력
+- `../../docs/architecture/COMPILER.md`: pass별 설계·안전 조건, backend 스케줄링, NPU/PIM 분할, PIM 배치
 - `../../docs/architecture/NPU_FLASH_ATTENTION.md`: FlashAttention / Flash-Decoding의 구조와 수치 계약
 - `../../docs/BUILD_AND_RUN.md`: 빌드, 실행, 회귀 검증 전체

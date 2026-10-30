@@ -52,11 +52,15 @@ struct TargetSpec {
     bool attentionFusion = false;          // hyb-npu-attention-fusion
     bool gemvEpilogueFusion = false;       // hyb-npu-gemv-epilogue
     bool elementwiseDistribution = false;  // hyb-npu-elementwise-distribute
+    // hyb-npu-elementwise-distribute also splits token-row work over the cores: hyb.quant and
+    // row reductions (RMSNorm, q/k norm), with their single-use row-wise producers fused.
+    bool rowDistribution = false;
     bool activationResidency = false;      // hyb-npu-activation-residency
     bool matrixInitElision = false;        // hyb-npu-matrix-init
     bool matmulRhsPacking = false;         // hyb-npu-matmul-layout: pack the transposed RHS
     bool matmulTransposeOutput = false;    // hyb-npu-matmul-layout: transpose A and the output instead
     bool inputTilePipeline = false;        // hyb-npu-input-pipeline
+    bool gemvEpiloguePipeline = false;     // hyb-npu-epilogue-pipeline
     int64_t inputTileColumns = 128;
     // hyb-npu-flash-attention: online softmax over key tiles with FP32 running max / sum / output.
     // Flash-Decoding additionally splits the keys over cores and merges the states; KV slicing

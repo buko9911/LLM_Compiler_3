@@ -149,6 +149,66 @@ struct DequantTiling : TilingInterface::ExternalModel<DequantTiling, DequantOp> 
     return generateResultTileValue(op, b, n, offsets, sizes);
   }
 };
+/// Tiling of hyb.quant over its token rows. The scale is a maximum over the whole row, so the
+/// column axis is not part of the iteration domain and a tile always holds complete rows.
+struct QuantTiling : TilingInterface::ExternalModel<QuantTiling, QuantOp> {
+  SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *) const {
+    return {utils::IteratorType::parallel};
+  }
+  SmallVector<Range> getIterationDomain(Operation *op, OpBuilder &b) const {
+    auto t = cast<ShapedType>(cast<QuantOp>(op).getInput().getType());
+    return {Range{b.getIndexAttr(0), b.getIndexAttr(t.getDimSize(0)), b.getIndexAttr(1)}};
+  }
+  FailureOr<TilingResult> getTiledImplementation(Operation *op, OpBuilder &b, ArrayRef<OpFoldResult> offsets,
+                                                 ArrayRef<OpFoldResult> sizes) const {
+    auto q = cast<QuantOp>(op);
+    Location loc = op->getLoc();
+    OpFoldResult zero = b.getIndexAttr(0), one = b.getIndexAttr(1);
+    auto rows = [&](Value v) -> Value {
+      auto t = dyn_cast<RankedTensorType>(v.getType());
+      if (!t || t.getRank() != 2) return {};
+      return tensor::ExtractSliceOp::create(b, loc, v, ArrayRef<OpFoldResult>{offsets[0], zero},
+                                            ArrayRef<OpFoldResult>{sizes[0], b.getIndexAttr(t.getDimSize(1))},
+                                            ArrayRef<OpFoldResult>{one, one});
+    };
+    Value input = rows(q.getInput()), qInit = rows(q.getQInit()), scaleInit = rows(q.getScaleInit());
+    if (!input || !qInit || !scaleInit) return failure();
+    auto tiled = QuantOp::create(b, loc, TypeRange{qInit.getType(), scaleInit.getType()}, input, qInit, scaleInit);
+    tiled->setDiscardableAttrs(op->getDiscardableAttrDictionary());
+    SmallVector<Operation *> slices;
+    for (Value v : {input, qInit, scaleInit}) slices.push_back(v.getDefiningOp());
+    return TilingResult{{tiled}, SmallVector<Value>(tiled->getResults()), slices};
+  }
+  LogicalResult getResultTilePosition(Operation *op, OpBuilder &b, unsigned result, ArrayRef<OpFoldResult> offsets,
+                                      ArrayRef<OpFoldResult> sizes, SmallVector<OpFoldResult> &resultOffsets,
+                                      SmallVector<OpFoldResult> &resultSizes) const {
+    auto t = cast<ShapedType>(op->getResult(result).getType());
+    resultOffsets = {offsets[0], b.getIndexAttr(0)};
+    resultSizes = {sizes[0], b.getIndexAttr(t.getDimSize(1))};
+    return success();
+  }
+  FailureOr<TilingResult> generateResultTileValue(Operation *op, OpBuilder &b, unsigned, ArrayRef<OpFoldResult> offsets,
+                                                  ArrayRef<OpFoldResult> sizes) const {
+    return getTiledImplementation(op, b, offsets.take_front(1), sizes.take_front(1));
+  }
+  LogicalResult getIterationDomainTileFromResultTile(Operation *, OpBuilder &, unsigned, ArrayRef<OpFoldResult> offsets,
+                                                     ArrayRef<OpFoldResult> sizes,
+                                                     SmallVectorImpl<OpFoldResult> &domainOffsets,
+                                                     SmallVectorImpl<OpFoldResult> &domainSizes) const {
+    domainOffsets.assign({offsets[0]});
+    domainSizes.assign({sizes[0]});
+    return success();
+  }
+  // Variants with a pack/unpack alignment hint (unused here).
+  FailureOr<TilingResult> getTiledImplementation(Operation *op, OpBuilder &b, ArrayRef<OpFoldResult> offsets,
+                                                 ArrayRef<OpFoldResult> sizes, ArrayRef<InnerTileAlignment>) const {
+    return getTiledImplementation(op, b, offsets, sizes);
+  }
+  FailureOr<TilingResult> generateResultTileValue(Operation *op, OpBuilder &b, unsigned n, ArrayRef<OpFoldResult> offsets,
+                                                  ArrayRef<OpFoldResult> sizes, ArrayRef<InnerTileAlignment>) const {
+    return generateResultTileValue(op, b, n, offsets, sizes);
+  }
+};
 } // namespace
 
 void mlir::hyb::registerBufferizableOpInterfaceExternalModels(DialectRegistry &registry) {
@@ -158,6 +218,7 @@ void mlir::hyb::registerBufferizableOpInterfaceExternalModels(DialectRegistry &r
     DequantOp::attachInterface<DpsBufferization<DequantOp>>(*ctx);
     WeightOp::attachInterface<WeightBufferization>(*ctx);
     DequantOp::attachInterface<DequantTiling>(*ctx);
+    QuantOp::attachInterface<QuantTiling>(*ctx);
   });
 }
 

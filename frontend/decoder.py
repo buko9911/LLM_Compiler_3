@@ -1,7 +1,9 @@
 """Qwen3 / Llama decode step with explicit state, for torch.export.
 
 A decode step processes M new tokens against a KV cache of fixed capacity. All shapes are
-static (the NPU program has no indirect addressing):
+static (the NPU program has no indirect addressing). The same step covers three uses:
+decode (M = 1), verify (M > 1 against the cache, e.g. a speculative block) and prefill
+(capacity P = 0: the M prompt tokens attend only to each other and there is no cache input).
 
   inputs   x        [M, H]              token embeddings (the host gathers the rows)
            cos, sin [M, D]              rotary tables of the M positions (host)
@@ -112,9 +114,11 @@ def fake_quant_rows(x):
 class DecodeStep(torch.nn.Module):
     """act_quant: quantize the input of every linear token-wise to INT8 (reference for W8A8;
     pass dequantized per-row INT8 weights). Off for export."""
-    def __init__(self, d: DecoderDims, tokens: int, capacity: int, act_quant: bool = False):
+    def __init__(self, d: DecoderDims, tokens: int, capacity: int, act_quant: bool = False,
+                 last_logits: bool = False):
         super().__init__()
         self.d, self.M, self.P, self.act_quant = d, tokens, capacity, act_quant
+        self.last_logits = last_logits         # prefill: the LM head only for the last position
 
     def lin(self, x, w):
         if isinstance(w, tuple):            # (INT8 weight, per-row scale): dequantize on use
@@ -148,8 +152,11 @@ class DecodeStep(torch.nn.Module):
             k = k.transpose(0, 1)                          # [KVH, M, D]
             v = v.transpose(0, 1)
             new_k.append(k); new_v.append(v)
-            K = torch.cat((past_k[i], k), dim=1)           # [KVH, P + M, D]
-            V = torch.cat((past_v[i], v), dim=1)
+            if self.P:
+                K = torch.cat((past_k[i], k), dim=1)       # [KVH, P + M, D]
+                V = torch.cat((past_v[i], v), dim=1)
+            else:                                          # prefill from an empty cache
+                K, V = k, v
             qg = q.transpose(0, 1).reshape(KVH, G * M, D)  # query rows of a KV group: head-major
             sc = (qg @ K.transpose(1, 2)) * (1.0 / D ** 0.5)
             sc = sc.reshape(KVH, G, M, -1) + mask          # mask [M, P + M] broadcast
@@ -159,6 +166,8 @@ class DecodeStep(torch.nn.Module):
             h = rmsnorm(x, ln2, d.eps)
             x = x + self.lin(torch.nn.functional.silu(self.lin(h, wg)) * self.lin(h, wu), wd)
         fn, lm = next(w), next(w)
+        if self.last_logits:
+            x = x[-1:]
         logits = self.lin(rmsnorm(x, fn, d.eps), lm)
         return logits, new_k, new_v
 

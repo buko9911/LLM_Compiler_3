@@ -45,7 +45,8 @@ def main():
     policies = {'off': (False, False), 'init': (True, False), 'epilogue': (False, True),
                 'both': (True, True), 'rotated': (True, True), 'batch1': (True, True),
                 'async': (False, False), 'both_async': (True, True),
-                'async_immediate': (False, False), 'release': (False, False)}
+                'async_immediate': (False, False), 'release': (False, False),
+                'pipeline': (True, True), 'pipeline_release': (True, True)}
     parser.add_argument('--modes', nargs='+', choices=list(policies),
                         default=['off', 'init', 'epilogue', 'both', 'rotated', 'batch1'])
     args = parser.parse_args()
@@ -80,8 +81,10 @@ def main():
             init, fuse = policies[mode]
             spec = json.loads((workspace/'research/npu_schedule_audit/configs/off.json').read_text())
             spec['npu'].update(matrix_init_elision=init,gemv_epilogue_fusion=fuse,gemv_tile_bytes=tile)
-            if mode == 'release':
+            if mode in ('release', 'pipeline_release'):
                 spec['npu']['weight_stream_early_release'] = True
+            if mode in ('pipeline', 'pipeline_release'):
+                spec['npu']['gemv_epilogue_pipeline'] = True
             if mode in ('async', 'both_async', 'async_immediate'):
                 spec['npu']['async_output_stores'] = True
             if mode == 'async_immediate':

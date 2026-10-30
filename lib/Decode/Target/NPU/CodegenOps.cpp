@@ -305,6 +305,8 @@ LogicalResult Codegen::lowerGemv(linalg::GenericOp g, std::string &err) {
     return failure();
   }
   if (failed(checkZeroInit(g, err))) return failure();
+  const int64_t mmas = NB * ((M + 31) / 32);
+  int64_t issued = 0;
   for (int64_t j = 0; j < NB; ++j)
     for (int64_t m0 = 0; m0 < M; m0 += 32) {
       int64_t mm_ = std::min<int64_t>(32, M - m0);
@@ -323,9 +325,25 @@ LogicalResult Codegen::lowerGemv(linalg::GenericOp g, std::string &err) {
         prefetchWeight(p.l1, p.l2, p.bytes);
         nextWeight.reset();
       }
+      // The VPU dequantizes the previous loop tile while the SA works on this one. Issue it before
+      // the writeout: the core holds the writeout until the MMA is done.
+      if (failed(emitPendingDequant(++issued, mmas, err))) return failure();
       load(9, uint32_t(addr(*C, m0 * C->strides[0] + j * C->strides[1])));
       rec(matrixWriteout(9, uint32_t(mm_), 32, uint32_t(C->strides[0] * 4), 2));
     }
+  return success();
+}
+
+LogicalResult Codegen::emitPendingDequant(int64_t done, int64_t total, std::string &err) {
+  if (!pendingDequant) return success();
+  PendingDequant &p = *pendingDequant;
+  int64_t rows = cast<ShapedType>(p.dequant.getInit().getType()).getDimSize(0);
+  int64_t due = rows * done / total;              // rows owed after `done` of `total` MMAs
+  if (due > p.row) {
+    if (failed(lowerDequant(p.dequant, err, p.row, due - p.row, p.col0, p.cols))) return failure();
+    p.row = due;
+  }
+  if (p.row == rows) pendingDequant.reset();
   return success();
 }
 
@@ -381,17 +399,26 @@ void Codegen::reduceToScalar(uint64_t src, int64_t elements, uint32_t funct, uin
   sstore(dst, s);
 }
 
-/// y[m, n] = acc[m, n] * scale[m] * wscale[n], 16 lanes per vector (INT32 -> FP16).
-LogicalResult Codegen::lowerDequant(hyb::DequantOp d, std::string &err) {
+/// y[m, n] = acc[m, n] * scale[m] * wscale[n], 16 lanes per vector (INT32 -> FP16), over rows
+/// [row0, row0 + rows) and columns [col0, col0 + cols). The op itself (rows < 0) covers all of
+/// it, or only the columns a pipelined GEMV loop left (dequantTail).
+LogicalResult Codegen::lowerDequant(hyb::DequantOp d, std::string &err, int64_t row0, int64_t rows, int64_t col0,
+                                    int64_t cols) {
   FailureOr<View> A = viewOf(d.getAcc(), err), S = viewOf(d.getScale(), err), B = viewOf(d.getWscale(), err),
                   Y = viewOf(d.getInit(), err);
   if (failed(A) || failed(S) || failed(B) || failed(Y)) return failure();
   int64_t M = Y->shape[0], N = Y->shape[1];
-  for (int64_t m = 0; m < M; ++m) {
+  if (rows < 0) {
+    auto tail = dequantTail.find(d);
+    col0 = tail == dequantTail.end() ? 0 : tail->second;
+    rows = M;
+    cols = N - col0;
+  }
+  for (int64_t m = row0; m < row0 + rows; ++m) {
     sload(0, addr(*S, m * S->strides[0]));
     uint64_t src = addr(*A, m * A->strides[0]), dst = addr(*Y, m * Y->strides[0]);
-    for (int64_t s = 0; s < N; s += 16) {
-      setVL(uint32_t(std::min<int64_t>(16, N - s)));
+    for (int64_t s = col0; s < col0 + cols; s += 16) {
+      setVL(uint32_t(std::min<int64_t>(16, col0 + cols - s)));
       vload(0, src + s * 4, 7);
       vload(1, addr(*B, s), 3);
       emit(rform(OP_V_CONV, 2, 0, 0, 1, 3));        // V_DEQUANT_I32_F16 v2 = v0 * s0 * v1

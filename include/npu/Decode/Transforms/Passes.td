@@ -288,6 +288,18 @@ def HybNpuInputPipeline : Pass<"hyb-npu-input-pipeline", "ModuleOp"> {
   let dependentDialects = ["linalg::LinalgDialect", "memref::MemRefDialect", "arith::ArithDialect"];
 }
 
+def HybNpuEpiloguePipeline : Pass<"hyb-npu-epilogue-pipeline", "ModuleOp"> {
+  let summary = "Dequantize each GEMV loop tile behind the next tile's MMA (npu.gemv_epilogue_pipeline)";
+  let description = [{
+    A core's GEMV partition streams its weights in an scf.for and is dequantized after the loop.
+    For such a loop and dequant (equal column tiles, all in L1) this pass moves the dequant's
+    scale copies in front of the loop and gives the loop and the dequant the same
+    `hyb.epilogue_pipeline` id. The backend then issues the dequant of tile j - 1 between the
+    MMAs of tile j, and hyb-npu-memplan keeps the dequant's buffers live across the loop.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+}
+
 def HybNpuMemPlan : Pass<"hyb-npu-memplan", "ModuleOp"> {
   let summary = "Assign L1 and L2 offsets by liveness; double-buffer loop tiles";
   let description = [{

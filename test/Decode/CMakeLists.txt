@@ -50,6 +50,11 @@ add_test(NAME decode-elementwise-distribution COMMAND "${Python3_EXECUTABLE}"
   --output "${CMAKE_CURRENT_BINARY_DIR}/elementwise-distribution")
 set_tests_properties(decode-elementwise-distribution PROPERTIES LABELS compiler)
 
+add_test(NAME decode-row-distribution COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/npu_row_distribution.py" --optimizer $<TARGET_FILE:npu-opt>
+  --output "${CMAKE_CURRENT_BINARY_DIR}/row-distribution")
+set_tests_properties(decode-row-distribution PROPERTIES LABELS compiler)
+
 add_test(NAME decode-runtime-backend COMMAND "${NPU_TEST_PYTHON}" -B
   "${CMAKE_CURRENT_SOURCE_DIR}/runtime_backend.py")
 set_tests_properties(decode-runtime-backend PROPERTIES LABELS runtime)

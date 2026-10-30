@@ -9,7 +9,10 @@
 #include "npu/Decode/Support/TargetSpec.h"
 #include "npu/Decode/Transforms/Passes.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include <algorithm>
+#include <optional>
 
 namespace mlir::hybrid {
 
@@ -54,6 +57,14 @@ inline Value viewRoot(Value value) {
     value = op->getOperand(0);
   }
   return value;
+}
+
+/// Iterations of an scf.for with constant bounds and a positive step.
+inline std::optional<int64_t> constantTripCount(scf::ForOp f) {
+  auto lb = getConstantIntValue(f.getLowerBound()), ub = getConstantIntValue(f.getUpperBound()),
+       st = getConstantIntValue(f.getStep());
+  if (!lb || !ub || !st || *st <= 0) return std::nullopt;
+  return (*ub - *lb + *st - 1) / *st;
 }
 
 /// The largest divisor of `n` that is at most `limit`, or 1 when there is none above 1. Used to

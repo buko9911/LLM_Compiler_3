@@ -1,8 +1,14 @@
 //===- NpuElementwiseDistribution.cpp - hyb-npu-elementwise-distribute ----===//
 //
 // Split a static, top-level, all-parallel FP16 linalg.generic with an identity output map over
-// the cores, without changing its scalar body. Reductions and attention are left to the other
-// passes. hyb-npu-place / -promote then give each core private L1 tiles and a shared L2 result.
+// the cores, without changing its scalar body. Attention is left to the other passes.
+// hyb-npu-place / -promote then give each core private L1 tiles and a shared L2 result.
+//
+// With npu.row_distribution, work on whole token rows is split by rows as well: every hyb.quant
+// (its scale is a maximum over the row) and every distributed elementwise op whose operand comes
+// from a row reduction (RMSNorm, q/k norm). Their single-use row-wise producers (the reduction,
+// its zero fill, the normalization) are fused into the same core loop, so a core reads its rows
+// once and no intermediate goes through L2.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -83,6 +89,88 @@ bool supported(linalg::GenericOp op, func::FuncOp fn) {
   return llvm::all_of(output.getShape(), [](int64_t d) { return d > 0; });
 }
 
+/// A top-level static linalg.generic whose leading loop is parallel and indexes only the leading
+/// axis of the output and of the operands that depend on it: row r of the result needs only row r
+/// of those operands. Trailing loops may be reductions (sum of squares of a row).
+bool rowWise(linalg::GenericOp op, func::FuncOp fn) {
+  if (op->getBlock() != &fn.front() || !op.hasPureTensorSemantics() || op.getNumResults() != 1 ||
+      op.getNumDpsInits() != 1 || op.getNumLoops() == 0 || op->hasAttr("hyb.npu_gemv") ||
+      op->hasAttr("hyb.flash_math") || op->hasAttr(marker) ||
+      op.getIteratorTypesArray().front() != utils::IteratorType::parallel)
+    return false;
+  AffineExpr row = getAffineDimExpr(0, op.getContext());
+  for (auto [value, map] : llvm::zip(op->getOperands(), op.getIndexingMapsArray())) {
+    auto type = dyn_cast<RankedTensorType>(value.getType());
+    if (!type || !type.hasStaticShape() || map.getNumSymbols()) return false;
+    for (auto [axis, expression] : llvm::enumerate(map.getResults()))
+      if (!isa<AffineDimExpr, AffineConstantExpr>(expression) || (expression == row && axis != 0)) return false;
+  }
+  AffineMap output = op.getIndexingMapsArray().back();
+  if (!output.getNumResults() || output.getResult(0) != row) return false;
+  for (Operation &scalar : op.getRegion().front()) {
+    if (isa<linalg::YieldOp>(scalar)) continue;
+    StringRef dialect = scalar.getName().getDialectNamespace();
+    if ((dialect != "arith" && dialect != "math") || scalar.getNumRegions() || !isMemoryEffectFree(&scalar))
+      return false;
+  }
+  return true;
+}
+
+/// The operands of a row-chain op whose leading axis is the token row.
+SmallVector<Value> rowOperands(Operation *op) {
+  if (auto quant = dyn_cast<hyb::QuantOp>(op)) return {quant.getInput()};
+  auto generic = cast<linalg::GenericOp>(op);
+  SmallVector<Value> operands;
+  AffineExpr row = getAffineDimExpr(0, op->getContext());
+  for (OpOperand &operand : generic->getOpOperands()) {
+    AffineMap map = generic.getMatchingIndexingMap(&operand);
+    if (map.getNumResults() && map.getResult(0) == row) operands.push_back(operand.get());
+  }
+  return operands;
+}
+
+/// The producers fused into a row chain ending at `root`: single-use row-wise generics reached
+/// through row operands, and the zero fill that initializes a fused reduction.
+llvm::SetVector<Operation *> rowProducers(Operation *root, func::FuncOp fn) {
+  llvm::SetVector<Operation *> chain;
+  SmallVector<Operation *> work{root};
+  while (!work.empty()) {
+    for (Value value : rowOperands(work.pop_back_val())) {
+      Operation *producer = value.getDefiningOp();
+      if (!producer || !value.hasOneUse() || producer->getBlock() != &fn.front() || chain.contains(producer)) continue;
+      if (isa<linalg::FillOp>(producer)) {
+        chain.insert(producer);
+      } else if (auto generic = dyn_cast<linalg::GenericOp>(producer); generic && rowWise(generic, fn)) {
+        chain.insert(producer);
+        work.push_back(producer);
+      }
+    }
+  }
+  return chain;
+}
+
+/// L1 bytes of one core's row tiles of every operand in the chain (an upper bound: an operand
+/// read by two chain ops is counted twice).
+bool chainFits(Operation *root, const llvm::SetVector<Operation *> &chain, int64_t cores, const TargetSpec &target) {
+  if (target.npu.l1Bytes <= target.npu.l1ReservedBytes) return false;
+  uint64_t available = target.npu.l1Bytes - target.npu.l1ReservedBytes, used = 0;
+  SmallVector<Operation *> ops(chain.begin(), chain.end());
+  ops.push_back(root);
+  for (Operation *op : ops) {
+    if (isa<linalg::FillOp>(op)) continue;      // its tile is a row operand of the op it initializes
+    SmallVector<Value> rows = rowOperands(op);
+    for (Value value : op->getOperands()) {
+      auto type = dyn_cast<RankedTensorType>(value.getType());
+      if (!type) continue;
+      uint64_t bytes = uint64_t(type.getNumElements()) * std::max<unsigned>(1, type.getElementTypeBitWidth() / 8);
+      if (isa<hyb::QuantOp>(op) || llvm::is_contained(rows, value)) bytes /= uint64_t(cores);
+      used += bytes;
+      if (used > available) return false;
+    }
+  }
+  return true;
+}
+
 struct Partition { unsigned axis; int64_t cores; };
 
 std::optional<Partition> partition(linalg::GenericOp op, int64_t limit) {
@@ -123,6 +211,73 @@ bool fitsLocalTile(linalg::GenericOp op, Partition part, const TargetSpec &targe
   return true;
 }
 
+/// npu.row_distribution: splits every row chain over the cores by token rows. Roots are hyb.quant
+/// ops and admitted elementwise generics that read a row reduction; each root is tiled with its
+/// row producers fused. The last root goes first, so a quant takes in the normalization (itself
+/// a root) and the reduction before them.
+LogicalResult distributeRows(func::FuncOp fn, const TargetSpec &target, IRRewriter &rewriter, int64_t &chains,
+                             int64_t &fused) {
+  auto readsReduction = [&](Operation *op) {
+    return llvm::any_of(rowProducers(op, fn), [](Operation *producer) {
+      auto generic = dyn_cast<linalg::GenericOp>(producer);
+      return generic && generic.getNumReductionLoops();
+    });
+  };
+  SmallVector<Operation *> roots;
+  for (Operation &op : fn.front()) {
+    auto generic = dyn_cast<linalg::GenericOp>(op);
+    if (isa<hyb::QuantOp>(op) || (generic && supported(generic, fn) && readsReduction(&op))) roots.push_back(&op);
+  }
+  for (Operation *root : llvm::reverse(roots)) {
+    if (root->getBlock() != &fn.front() || root->use_empty()) continue;     // fused into a later chain
+    auto type = dyn_cast<RankedTensorType>(root->getResult(0).getType());
+    if (!type || !type.hasStaticShape() || type.getRank() < 2 ||
+        type.getNumElements() < target.npu.distributeMinElements)
+      continue;
+    int64_t cores = largestDivisorAtMost(type.getDimSize(0), target.npu.cores);
+    llvm::SetVector<Operation *> chain = rowProducers(root, fn);
+    if (cores < 2 || !chainFits(root, chain, cores, target)) continue;
+    root->setAttr(marker, rewriter.getUnitAttr());
+    root->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
+    for (Operation *op : chain)
+      if (!isa<linalg::FillOp>(op)) op->setAttr(marker, rewriter.getUnitAttr());
+    SmallVector<OpFoldResult> threads(cast<TilingInterface>(root).getLoopIteratorTypes().size(),
+                                      rewriter.getIndexAttr(0));
+    threads[0] = rewriter.getIndexAttr(cores);
+    scf::SCFTileAndFuseOptions options;
+    options.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+    options.tilingOptions.setNumThreads(threads);
+    options.setFusionControlFn([&](tensor::ExtractSliceOp, OpResult producer,
+                                   bool) -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+      if (chain.contains(producer.getOwner())) return scf::SCFTileAndFuseOptions::ControlFnResult{};
+      return std::nullopt;
+    });
+    rewriter.setInsertionPoint(root);
+    auto result = scf::tileConsumerAndFuseProducersUsingSCF(rewriter, cast<TilingInterface>(root), options);
+    if (failed(result) || result->loops.size() != 1) return root->emitError("cannot distribute the row chain");
+    for (auto &[original, replacement] : result->replacements) rewriter.replaceAllUsesWith(original, replacement);
+    Operation *loop = result->loops.front();
+    loop->setAttr("hyb.cores", rewriter.getI64IntegerAttr(cores));
+    loop->setAttr(marker, rewriter.getUnitAttr());
+    loop->setAttr("hyb.elementwise_axis", rewriter.getI64IntegerAttr(0));
+    loop->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
+    int64_t producers = llvm::count_if(chain, [](Operation *op) { return !isa<linalg::FillOp>(op); });
+    loop->setAttr("hyb.row_chain", rewriter.getI64IntegerAttr(producers));
+    // Consumers precede their producers in `chain`, so each one is dead when it is reached. Fusion
+    // leaves the slice it replaced in the loop; it is unused.
+    rewriter.eraseOp(root);
+    for (Operation *op : chain) {
+      for (Operation *user : llvm::make_early_inc_range(op->getUsers()))
+        if (isa<tensor::ExtractSliceOp>(user) && isOpTriviallyDead(user)) rewriter.eraseOp(user);
+      if (!isOpTriviallyDead(op)) return op->emitError("a fused row producer is still used outside its chain");
+      rewriter.eraseOp(op);
+    }
+    ++chains;
+    fused += producers;
+  }
+  return success();
+}
+
 struct HybNpuElementwiseDistributePass
     : mlir::hybrid::impl::HybNpuElementwiseDistributeBase<HybNpuElementwiseDistributePass> {
   using Base::Base;
@@ -135,9 +290,13 @@ struct HybNpuElementwiseDistributePass
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, candidates = 0, small = 0, unsupported = 0, capacity = 0, indivisible = 0;
       fn.walk([&](scf::ForallOp loop) { count += loop->hasAttr(marker); });
+      IRRewriter rewriter(&getContext());
+      int64_t rowChains = 0, rowFused = 0;
+      if (target->npu.rowDistribution && failed(distributeRows(fn, *target, rewriter, rowChains, rowFused)))
+        return signalPassFailure();
+      count += rowChains;
       SmallVector<linalg::GenericOp> work;
       for (Operation &op : fn.front()) if (auto generic = dyn_cast<linalg::GenericOp>(op)) work.push_back(generic);
-      IRRewriter rewriter(&getContext());
       for (linalg::GenericOp generic : work) {
         if (!supported(generic, fn)) { ++unsupported; continue; }
         ++candidates;
@@ -182,6 +341,10 @@ struct HybNpuElementwiseDistributePass
       record("hyb.elementwise_unsupported", unsupported);
       record("hyb.elementwise_capacity", capacity);
       record("hyb.elementwise_indivisible", indivisible);
+      if (target->npu.rowDistribution) {
+        record("hyb.row_distributions", rowChains);
+        record("hyb.row_fused", rowFused);
+      }
     }
   }
 };

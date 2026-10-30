@@ -271,6 +271,16 @@ private:
     uint32_t bytes;
   };
   std::optional<WeightPrefetch> nextWeight;
+  // hyb-npu-epilogue-pipeline: the dequant of the previous loop tile (columns [col0, col0 + cols)),
+  // issued in row shares between the MMAs of the current tile; per pipelined dequant, the first
+  // column its own op still has to do (the last tile).
+  struct PendingDequant {
+    hyb::DequantOp dequant;
+    int64_t col0, cols, row = 0;
+  };
+  std::optional<PendingDequant> pendingDequant;
+  DenseMap<Operation *, int64_t> dequantTail;
+  LogicalResult emitPendingDequant(int64_t done, int64_t total, std::string &err);
   void transfer2d(int64_t ss, int64_t ds, uint64_t src, uint64_t dst, uint32_t runBytes, uint32_t rows,
                   uint32_t sStride, uint32_t dStride, std::string &err);
   LogicalResult lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef<int64_t> perm, std::string &err);
@@ -290,7 +300,8 @@ private:
   LogicalResult lowerGemv(linalg::GenericOp g, std::string &err);
   LogicalResult lowerQuant(hyb::QuantOp q, std::string &err);
   void reduceToScalar(uint64_t src, int64_t elements, uint32_t funct, uint64_t dst);
-  LogicalResult lowerDequant(hyb::DequantOp d, std::string &err);
+  LogicalResult lowerDequant(hyb::DequantOp d, std::string &err, int64_t row0 = 0, int64_t rows = -1,
+                             int64_t col0 = 0, int64_t cols = -1);
   LogicalResult lower(Operation *op, std::string &err);
 
   // ---- control flow (CodegenLoops.cpp) -------------------------------------------------------

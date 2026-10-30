@@ -10,6 +10,7 @@ add_mlir_library(NPUDecodeTransforms
   NpuMatmulLayout.cpp
   NpuInputPipeline.cpp
   NpuGemvEpilogue.cpp
+  NpuEpiloguePipeline.cpp
   NpuProjectionFusion.cpp
   NpuMatrixInit.cpp
   NpuActivationResidency.cpp

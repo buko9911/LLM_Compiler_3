@@ -216,6 +216,19 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
     return win + ((uint64_t(tile) + initialSlot) % nslots) * slotBytes;
   };
   bool earlyRelease = pipeline && in.spec->npu.weightStreamEarlyRelease;
+  // hyb-npu-epilogue-pipeline: the dequant after this loop, done one tile behind the GEMV.
+  hyb::DequantOp epilogue;
+  int64_t epilogueColumns = 0;
+  if (Attribute id = f->getAttr("hyb.epilogue_pipeline"))
+    for (Operation *op = f->getNextNode(); op; op = op->getNextNode())
+      if (auto d = dyn_cast<hyb::DequantOp>(op); d && d->getAttr("hyb.epilogue_pipeline") == id) {
+        epilogue = d;
+        epilogueColumns = cast<ShapedType>(d.getInit().getType()).getDimSize(1) / n;
+        break;
+      }
+  auto pipelineEpilogue = [&](int64_t tile) {
+    if (epilogue && tile > 0) pendingDequant = PendingDequant{epilogue, (tile - 1) * epilogueColumns, epilogueColumns};
+  };
   if (f->hasAttr("hyb.stream")) {
     std::string reason = pipeline ? "enabled" : !in.weightPrefetch ? "disabled" :
         !stream ? "no_staging_slot" : n <= 1 ? "single_iteration" :
@@ -269,7 +282,12 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       env[iv] = *lb + j * *step;
       prefetchedWeightCopy = stream;
       prefetchedWeightNeedsWait = false;
+      pipelineEpilogue(j);
       if (failed(emitBlock(*f.getBody(),err))) return failure();
+      if (pendingDequant) {
+        err = "the epilogue-pipelined loop body has no GEMV to interleave the dequant with";
+        return failure();
+      }
       if (j + 1 < n) {
         load(10,1);
         emit(rform(OP_WAIT_EVENT,10));
@@ -277,6 +295,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       flush();
     }
     streamSlot.erase(stream); env.erase(iv); loopBounds.erase(f);
+    if (epilogue) dequantTail[epilogue] = (n - 1) * epilogueColumns;
     return success();
   }
   int64_t issued = -1;
@@ -322,7 +341,12 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       prefetchedWeightCopy = pipeline && (j > i || (crossBatch && i > 0)) ? stream.getOperation() : nullptr;
       prefetchedWeightNeedsWait = j > i;
       env[iv] = *lb + j * *step;
+      pipelineEpilogue(j);
       if (failed(emitBlock(*f.getBody(), err))) return failure();
+      if (pendingDequant) {
+        err = "the epilogue-pipelined loop body has no GEMV to interleave the dequant with";
+        return failure();
+      }
     }
     if (crossBatch && end < n) {
       // Local events are reset at block entry. Consume the event in its producer
@@ -335,6 +359,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
   if (stream) streamSlot.erase(stream);
   env.erase(iv);
   loopBounds.erase(f);
+  if (epilogue) dequantTail[epilogue] = (n - 1) * epilogueColumns;
   return success();
 }
 

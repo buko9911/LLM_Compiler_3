@@ -70,9 +70,11 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("memory_dependency_schedule", s.npu.memoryDependencySchedule) ||
       !booleanOption("command_schedule", s.npu.commandSchedule) ||
       !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
+      !booleanOption("row_distribution", s.npu.rowDistribution) ||
       !booleanOption("vector_scalar_reuse", s.npu.vectorScalarReuse) ||
       !booleanOption("vector_chunk_pipeline", s.npu.vectorChunkPipeline) ||
       !booleanOption("input_tile_pipeline", s.npu.inputTilePipeline) ||
+      !booleanOption("gemv_epilogue_pipeline", s.npu.gemvEpiloguePipeline) ||
       !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
       !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
       !booleanOption("async_output_store_vector_overlap", s.npu.asyncOutputStoreVectorOverlap) ||

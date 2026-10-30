@@ -136,6 +136,7 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
     "hyb.elementwise_original_shape", "hyb.elementwise_candidates", "hyb.elementwise_small",
     "hyb.elementwise_unsupported", "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
+    "hyb.row_chain", "hyb.row_distributions", "hyb.row_fused",
     // hyb-npu-activation-residency
     "hyb.activation_residency_private_results",
     // hyb-npu-promote
@@ -147,6 +148,8 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.matmul_output_transposes", "hyb.matmul_transpose_scratch",
     // hyb-npu-input-pipeline
     "hyb.input_pipeline_copy", "hyb.input_pipeline_tile", "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
+    // hyb-npu-epilogue-pipeline
+    "hyb.epilogue_pipeline", "hyb.epilogue_pipelines",
 };
 
 /// The MLIR pass pipeline, in five stages. Each stage hands the next one a more concrete program:
@@ -192,6 +195,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
       "hyb-npu-matrix-init" + spec + ","                      // skip zero fills a matrix INIT overwrites
       "hyb-npu-matmul-layout" + spec + ","                    // fill SA tiles for transpose-B matmuls
       "hyb-npu-input-pipeline" + spec + ","                   // overlap the next input copy with compute
+      "hyb-npu-epilogue-pipeline" + spec + ","                // dequantize GEMV tiles behind the next MMA
       "hyb-npu-memplan" + spec;                               // liveness-based L1/L2 offsets
   return tensor + placement + fusion + ownership + memory;
 }

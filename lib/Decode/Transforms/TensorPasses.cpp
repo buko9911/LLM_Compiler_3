@@ -201,20 +201,47 @@ struct HybQuantizePass : mlir::hybrid::impl::HybQuantizeBase<HybQuantizePass> {
 
 //===----------------------------------------------------------------------===//
 // hyb-fold-transpose: batch_matmul(A, transpose(B, [0, 2, 1])) -> B read transposed.
+// A prefill step has no cache concat in front of K, so canonicalization merges the head-major
+// transpose of K and its [0, 2, 1] into one transpose [1, 2, 0] that moves the token axis
+// innermost (an element gather). Such an RHS transpose(X, [p0, p1, p2]) with p1 = 2 is read as
+// transpose(X, [p0, p2, p1]) transposed: a copy that keeps whole rows (or nothing), shared with
+// an identical transpose of X when there is one (the new-K output).
 //===----------------------------------------------------------------------===//
 struct FoldTransposeIntoBatchMatmul : OpRewritePattern<linalg::BatchMatmulOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(linalg::BatchMatmulOp op, PatternRewriter &rewriter) const override {
     if (op.hasUserDefinedMaps()) return failure();
     auto tr = op.getDpsInputs()[1].getDefiningOp<linalg::TransposeOp>();
-    if (!tr || tr.getPermutation() != ArrayRef<int64_t>({0, 2, 1})) return failure();
+    if (!tr || tr.getPermutation().size() != 3 || tr.getPermutation()[1] != 2) return failure();
+    ArrayRef<int64_t> perm = tr.getPermutation();
+    SmallVector<int64_t> rows = {perm[0], perm[2], perm[1]};
+    Value rhs = tr.getInput();
+    if (rows != ArrayRef<int64_t>({0, 1, 2})) {
+      auto type = dyn_cast<RankedTensorType>(rhs.getType());
+      if (!type || !type.hasStaticShape()) return failure();
+      linalg::TransposeOp same;
+      for (Operation *user : rhs.getUsers())
+        if (auto other = dyn_cast<linalg::TransposeOp>(user);
+            other && other.getPermutation() == ArrayRef<int64_t>(rows) && other.getInit().getDefiningOp<tensor::EmptyOp>() &&
+            other->getBlock() == op->getBlock() && other->isBeforeInBlock(op))
+          same = other;
+      if (same) {
+        rhs = same->getResult(0);
+      } else {
+        rewriter.setInsertionPoint(tr);
+        SmallVector<int64_t> shape = {type.getDimSize(rows[0]), type.getDimSize(rows[1]), type.getDimSize(rows[2])};
+        Value init = tensor::EmptyOp::create(rewriter, tr.getLoc(), shape, type.getElementType());
+        rhs = linalg::TransposeOp::create(rewriter, tr.getLoc(), rhs, init, rows)->getResult(0);
+        rewriter.setInsertionPoint(op);
+      }
+    }
     MLIRContext *ctx = getContext();
     AffineExpr b, m, n, k;
     bindDims(ctx, b, m, n, k);
     SmallVector<AffineMap> maps = {AffineMap::get(4, 0, {b, m, k}, ctx), AffineMap::get(4, 0, {b, n, k}, ctx),
                                    AffineMap::get(4, 0, {b, m, n}, ctx)};
     auto fused = linalg::BatchMatmulOp::create(rewriter, op.getLoc(), op.getResultTypes(),
-                                               ValueRange{op.getDpsInputs()[0], tr.getInput()}, op.getDpsInits());
+                                               ValueRange{op.getDpsInputs()[0], rhs}, op.getDpsInits());
     fused->setAttr("indexing_maps", rewriter.getAffineMapArrayAttr(maps));
     rewriter.replaceOp(op, fused->getResults());
     return success();

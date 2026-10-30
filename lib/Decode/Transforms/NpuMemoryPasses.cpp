@@ -309,13 +309,6 @@ struct HybNpuPromotePass : mlir::hybrid::impl::HybNpuPromoteBase<HybNpuPromotePa
 //===----------------------------------------------------------------------===//
 // hyb-npu-memplan
 //===----------------------------------------------------------------------===//
-std::optional<int64_t> tripCount(scf::ForOp f) {
-  auto lb = getConstantIntValue(f.getLowerBound()), ub = getConstantIntValue(f.getUpperBound()),
-       st = getConstantIntValue(f.getStep());
-  if (!lb || !ub || !st || *st <= 0) return std::nullopt;
-  return (*ub - *lb + *st - 1) / *st;
-}
-
 struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPass> {
   using Base::Base;
   void runOnOperation() override {
@@ -343,6 +336,12 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
           for (Operation &c : b) e = std::max(e, end[&c]);
       end[op] = e;
     });
+    // hyb-npu-epilogue-pipeline: the backend runs a marked dequant inside the GEMV loop with the
+    // same id, so the dequant's buffers are live from the start of that loop.
+    DenseMap<Attribute, Operation *> pipelineLoops;
+    fn.walk([&](scf::ForOp f) {
+      if (Attribute id = f->getAttr("hyb.epilogue_pipeline")) pipelineLoops[id] = f;
+    });
     std::vector<Buf> bufs;
     fn.walk([&](memref::AllocOp a) {
       int64_t space = spaceOf(a.getType());
@@ -352,7 +351,7 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
       int64_t bytes = (mt.getNumElements() * eb + 63) / 64 * 64;
       int64_t slots = 1;
       if (auto f = a->getParentOfType<scf::ForOp>(); f && fn->isAncestor(f))
-        if (auto tc = tripCount(f); tc && *tc > 1) slots = 2;
+        if (auto tc = constantTripCount(f); tc && *tc > 1) slots = 2;
       // Live from the first to the last use (an alloc holds no data before its first use).
       Buf b{a, space, bytes, slots, INT64_MAX, -1};
       forEachUser(a.getResult(), [&](Operation *u) {
@@ -362,6 +361,8 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
           if (isa<scf::ForOp, scf::ForallOp>(p) && !p->isAncestor(a)) anchor = p;
         b.first = std::min(b.first, pos[anchor]);
         b.last = std::max(b.last, end[anchor]);
+        if (Attribute id = u->getAttr("hyb.epilogue_pipeline"); id && pipelineLoops.count(id))
+          b.first = std::min(b.first, pos[pipelineLoops[id]]);
       });
       if (b.last < 0) {
         b.first = b.last = pos[a];
