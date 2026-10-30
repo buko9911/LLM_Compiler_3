@@ -58,6 +58,11 @@ struct TargetSpec {
     bool matmulTransposeOutput = false;    // hyb-npu-matmul-layout: transpose A and the output instead
     bool inputTilePipeline = false;        // hyb-npu-input-pipeline
     int64_t inputTileColumns = 128;
+    // hyb-npu-flash-attention: online softmax over key tiles with FP32 running max / sum / output.
+    // Flash-Decoding additionally splits the keys over cores and merges the states; KV slicing
+    // streams [past KV, new KV] without a full copy. Its rounding differs from the FP16 softmax.
+    bool flashAttention = false, flashDecoding = false, flashKvSlicing = false;
+    int64_t attentionQueryTile = 32, attentionKeyTile = 128, attentionSplits = 1;
 
     // ---- backend scheduling (off by default) -------------------------------------------------------
     // L2 -> L1 loads and L1 -> L2 stores complete on a local event; the core waits only when an

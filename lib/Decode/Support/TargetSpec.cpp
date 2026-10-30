@@ -76,7 +76,10 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
       !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
       !booleanOption("async_output_store_vector_overlap", s.npu.asyncOutputStoreVectorOverlap) ||
-      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots))
+      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots) ||
+      !booleanOption("flash_attention", s.npu.flashAttention) ||
+      !booleanOption("flash_decoding", s.npu.flashDecoding) ||
+      !booleanOption("flash_kv_slicing", s.npu.flashKvSlicing))
     return failure();
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");
@@ -96,7 +99,24 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     dst = *value;
     return true;
   };
-  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns)) return failure();
+  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns) ||
+      !positiveIntegerOption("attention_query_tile", s.npu.attentionQueryTile) ||
+      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile) ||
+      !positiveIntegerOption("attention_splits", s.npu.attentionSplits))
+    return failure();
+  if (s.npu.flashDecoding && (!s.npu.flashAttention || s.npu.attentionSplits < 2 ||
+                            s.npu.attentionSplits > s.npu.cores)) {
+    error = "npu.flash_decoding requires flash_attention and attention_splits in [2, cores]";
+    return failure();
+  }
+  if (!s.npu.flashDecoding && s.npu.attentionSplits != 1) {
+    error = "npu.attention_splits must be 1 when flash_decoding is disabled";
+    return failure();
+  }
+  if (s.npu.flashKvSlicing && !s.npu.flashAttention) {
+    error = "npu.flash_kv_slicing requires flash_attention";
+    return failure();
+  }
   if (s.npu.dequantMinElements < 0) {
     error = "npu.dequant_min_elements must be nonnegative (0 inherits distribute_min_elements)";
     return failure();

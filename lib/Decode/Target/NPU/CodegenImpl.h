@@ -308,6 +308,7 @@ private:
   // Kind of a body value: folded constant, row-invariant scalar, or FP16 vector.
   enum class K { Const, Scalar, Vector };
   LogicalResult lowerGeneric(linalg::GenericOp g, std::string &err);
+  LogicalResult lowerTypedGeneric(linalg::GenericOp g, std::string &err);
   LogicalResult emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, DenseMap<Value, K> &kind,
                           ArrayRef<Operation *> vops, DenseMap<Value, Value> &aliasOf, DenseMap<Value, int> &lastUse,
                           ArrayRef<uint64_t> base, int64_t n, bool reduction, Value pre, Value dotA, Value dotB,

@@ -54,6 +54,18 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
   // Optional passes, in pipeline order.
   if (spec.npu.projectionFusion)
     report["projection_fusion"] = json::Object{{"groups", count("hyb.projection_fusions")}};
+  if (spec.npu.flashAttention) {
+    json::Object flash{{"flash_decoding", spec.npu.flashDecoding}, {"kv_slicing", spec.npu.flashKvSlicing},
+                       {"query_tile", spec.npu.attentionQueryTile}, {"key_tile", spec.npu.attentionKeyTile},
+                       {"splits", spec.npu.attentionSplits}};
+    if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.flash_attention"))
+      for (NamedAttribute field : attr) {
+        if (auto value = dyn_cast<IntegerAttr>(field.getValue())) flash[field.getName().str()] = value.getInt();
+        else if (auto value = dyn_cast<StringAttr>(field.getValue()))
+          flash[field.getName().str()] = value.getValue().str();
+      }
+    report["flash_attention"] = std::move(flash);
+  }
   if (spec.npu.attentionFusion) {
     json::Object counts;
     if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.attention_fusion"))

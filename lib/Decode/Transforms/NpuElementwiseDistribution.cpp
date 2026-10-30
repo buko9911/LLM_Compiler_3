@@ -30,7 +30,7 @@ bool supported(linalg::GenericOp op, func::FuncOp fn) {
   if (op->getBlock() != &fn.front() || !op.hasPureTensorSemantics() ||
       op.getNumResults() != 1 || op.getNumDpsInits() != 1 ||
       op.getNumLoops() == 0 || op.getNumReductionLoops() ||
-      op->hasAttr("hyb.npu_gemv") || op->hasAttr(marker)) return false;
+      op->hasAttr("hyb.npu_gemv") || op->hasAttr("hyb.flash_math") || op->hasAttr(marker)) return false;
   // A distributed shared destination must begin as an uninitialized fresh
   // tensor. Preserving an initialized phase argument can make bufferization
   // require an LP6 -> LP6 copy, which the current DMA backend cannot lower.
@@ -64,7 +64,8 @@ bool supported(linalg::GenericOp op, func::FuncOp fn) {
         if (constant.getValue() != 0 || type.getDimSize(axis) != 1) return false;
       } else return false;
     }
-    // The vectorizer reads contiguous FP16 vector operands and FP32 row scalars.
+    // The vectorizer reads contiguous FP16 vector operands and FP32 row scalars (online attention
+    // math uses its own typed path and is excluded above).
     if (vector ? !type.getElementType().isF16() : !type.getElementType().isF32()) return false;
   }
   for (Operation &scalar : op.getRegion().front()) {

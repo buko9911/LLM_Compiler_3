@@ -124,7 +124,13 @@ void Codegen::collectConstants(func::FuncOp fn) {
     if (auto g = dyn_cast<linalg::GenericOp>(op))
       g.getRegion().walk([&](Operation *b) {
         for (Value o : b->getOperands())
-          if (auto c = constValue(o)) scalarConst(float(*c));
+          if (auto c = constValue(o)) {
+            scalarConst(float(*c));
+            // Online attention uses the typed vector ISA: its constants also need vector slots
+            // of their actual element type.
+            if (g->hasAttr("hyb.flash_math"))
+              vectorConst(*c, o.getType().isInteger(1) ? int(DT_I8) : dtypeOf(o.getType()));
+          }
       });
     if (auto f = dyn_cast<linalg::FillOp>(op))
       if (auto c = constValue(f.getInputs()[0]))

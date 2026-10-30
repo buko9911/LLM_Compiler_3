@@ -25,6 +25,10 @@ add_test(NAME decode-attention-fusion COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/npu_attention_fusion.py" --optimizer $<TARGET_FILE:npu-opt>
   --output "${CMAKE_CURRENT_BINARY_DIR}/attention-fusion")
 set_tests_properties(decode-attention-fusion PROPERTIES LABELS compiler)
+add_test(NAME decode-flash-attention COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/npu_flash_attention.py" --optimizer $<TARGET_FILE:npu-opt>
+  --output "${CMAKE_CURRENT_BINARY_DIR}/flash-attention")
+set_tests_properties(decode-flash-attention PROPERTIES LABELS compiler)
 
 if(NPU_TEST_EMULATOR AND NPU_TEST_SETTINGS)
   add_test(NAME decode-frontend COMMAND "${NPU_TEST_PYTHON}"

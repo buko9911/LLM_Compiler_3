@@ -126,6 +126,8 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.npu_packet", "hyb.npu_kernel", "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan",
     // hyb-npu-projection-fusion
     "hyb.weight_segments", "hyb.projection_fusions",
+    // hyb-npu-flash-attention
+    "hyb.flash_attention", "hyb.flash_tile", "hyb.flash_decoding", "hyb.flash_math", "hyb.flash_merge",
     // hyb-npu-attention-fusion
     "hyb.attention_fusion", "hyb.attention_fused",
     // hyb-npu-gemv-epilogue
@@ -169,6 +171,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
   // 3. Fusion and tiling (tensor level): fuse first, then distribute over cores and tile for L1.
   const std::string fusion =
       "hyb-npu-projection-fusion" + spec + ","                // q/k/v and gate/up -> one GEMV each
+      "hyb-npu-flash-attention" + spec + ","                  // online-softmax attention (opt-in)
       "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
       "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core
       "hyb-npu-tile" + spec + ","                             // scf.forall over cores, scf.for over tiles

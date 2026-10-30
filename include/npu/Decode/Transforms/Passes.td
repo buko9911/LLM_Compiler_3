@@ -125,6 +125,19 @@ def HybNpuProjectionFusion : Pass<"hyb-npu-projection-fusion", "ModuleOp"> {
                            "arith::ArithDialect"];
 }
 
+def HybNpuFlashAttention : Pass<"hyb-npu-flash-attention", "ModuleOp"> {
+  let summary = "Tile attention with online softmax and optional parallel KV splits (npu.flash_attention)";
+  let description = [{
+    Keeps only Q/K tiles and FP32 running maximum, sum and output state on chip. Flash-Decoding
+    (npu.flash_decoding) computes independent KV splits and stably merges their states. This
+    opt-in changes the softmax rounding: it is not a bit-identical replacement for the
+    materialized FP16 path. Unsupported attention is diagnosed.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
+}
+
 def HybNpuAttentionFusion : Pass<"hyb-npu-attention-fusion", "ModuleOp"> {
   let summary = "Keep each head's QK, mask, softmax and PV on one core (npu.attention_fusion)";
   let description = [{

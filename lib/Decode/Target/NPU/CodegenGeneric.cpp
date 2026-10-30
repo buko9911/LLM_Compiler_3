@@ -1,11 +1,15 @@
 //===- CodegenGeneric.cpp - NPU codegen: linalg.generic vectorizer ----------===//
 //
-// Body values are Const (folded), Scalar (row-invariant: per-row f32 operands and
+// In the legacy lowering, body values are Const (folded), Scalar (row-invariant: per-row f32 operands and
 // expressions of them, computed once per row on the scalar unit) or Vector (depend on the
 // innermost loop; FP16 lanes, 32 per register). extf / truncf of a vector alias its
 // register (the vector unit is FP16). A reduction over the innermost loop folds each tile
 // with V_REDUCE (FP16 -> FP32; a product of two vectors uses the dot mode, so x*x never
 // rounds to FP16) and an FP32 scalar accumulator.
+// Generics explicitly marked hyb.flash_math use the separate typed path below:
+// FP32 vector state, real casts, comparisons and masked selection. Keeping the
+// dispatch explicit preserves the numerical and instruction contract of old
+// programs while online attention opts into the existing typed ISA.
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
@@ -16,7 +20,232 @@
 
 namespace mlir::hybrid::codegen {
 
+/// Typed vector lowering for online-attention state. This is deliberately
+/// separate from the legacy FP16 vectorizer: an extf in that path is a register
+/// alias, while here it must be an actual F16 -> F32 conversion. The existing
+/// ISA supports every operation below; no host arithmetic or timing shortcut
+/// participates in execution. Sixteen lanes fit both FP32 and FP16 values.
+LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) {
+  auto fail = [&](StringRef message) {
+    err = ("typed generic: " + message).str();
+    return failure();
+  };
+  const unsigned loops = g.getNumLoops(), inputs = g.getNumDpsInputs();
+  if (!loops || g.getNumDpsInits() != 1) return fail("requires loops and one output");
+  const unsigned inner = loops - 1;
+  auto iterators = g.getIteratorTypesArray();
+  auto ranges = g.getStaticLoopRanges();
+  if (llvm::any_of(ranges, [](int64_t n) { return n <= 0; })) return fail("requires positive static ranges");
+  for (unsigned d = 0; d < inner; ++d)
+    if (iterators[d] != utils::IteratorType::parallel) return fail("only the innermost axis may reduce");
+  const bool reduction = iterators[inner] == utils::IteratorType::reduction;
+  SmallVector<View> views;
+  SmallVector<AffineMap> maps;
+  SmallVector<bool> contiguous;
+  for (OpOperand &operand : g->getOpOperands()) {
+    auto view = viewOf(operand.get(), err);
+    if (failed(view)) return failure();
+    if (!view->et.isF16() && !view->et.isF32()) return fail("memory operands must be F16 or F32");
+    AffineMap map = g.getMatchingIndexingMap(&operand);
+    bool vector = false;
+    for (auto [axis, expression] : llvm::enumerate(map.getResults())) {
+      auto dimension = dyn_cast<AffineDimExpr>(expression);
+      if (!dimension && !isa<AffineConstantExpr>(expression)) return fail("requires projected dimension maps");
+      if (dimension && dimension.getPosition() == inner) {
+        if (axis + 1 != map.getNumResults() || view->strides.back() != 1)
+          return fail("innermost vector axis must be contiguous");
+        vector = true;
+      }
+    }
+    views.push_back(*view);
+    maps.push_back(map);
+    contiguous.push_back(vector);
+  }
+  if (reduction && (contiguous.back() || !views.back().et.isF32()))
+    return fail("reduction output must be an FP32 row scalar");
+  if (!reduction && !contiguous.back()) return fail("parallel output must contain the innermost axis");
+
+  Block &body = g.getRegion().front();
+  BlockArgument accumulator = body.getArgument(inputs);
+  Value yielded = cast<linalg::YieldOp>(body.getTerminator()).getValues()[0];
+  Value pre;
+  uint32_t combine = 1;
+  DenseSet<Operation *> skip;
+  if (reduction) {
+    auto stripCasts = [&](Value value) {
+      while (Operation *op = value.getDefiningOp()) {
+        if (!isa<arith::ExtFOp, arith::TruncFOp>(op)) break;
+        skip.insert(op);
+        value = op->getOperand(0);
+      }
+      return value;
+    };
+    Value combined = stripCasts(yielded);
+    Operation *op = combined.getDefiningOp();
+    if (!op || !isa<arith::AddFOp, arith::MaximumFOp, arith::MaxNumFOp>(op))
+      return fail("reduction requires one sum or maximum combiner");
+    auto isAccumulator = [&](Value value) {
+      while (Operation *cast = value.getDefiningOp()) {
+        if (!isa<arith::ExtFOp, arith::TruncFOp>(cast)) break;
+        value = cast->getOperand(0);
+      }
+      return value == accumulator;
+    };
+    const bool first = isAccumulator(op->getOperand(0)), second = isAccumulator(op->getOperand(1));
+    if (first == second) return fail("reduction combiner must consume its accumulator once");
+    stripCasts(op->getOperand(first ? 0 : 1));
+    pre = op->getOperand(first ? 1 : 0);
+    combine = isa<arith::AddFOp>(op) ? 1 : 4;
+    skip.insert(op);
+    for (Operation *user : accumulator.getUsers())
+      if (!skip.contains(user)) return fail("unsupported additional accumulator use");
+  }
+
+  SmallVector<Operation *> operations;
+  for (Operation &op : body.without_terminator()) {
+    if (skip.contains(&op) || isa<arith::ConstantOp>(op)) continue;
+    if (op.getNumResults() != 1) return fail("scalar body operation must have one result");
+    operations.push_back(&op);
+  }
+  DenseMap<Value, int> lastUse;
+  for (auto [index, op] : llvm::enumerate(operations))
+    for (Value operand : op->getOperands()) lastUse[operand] = int(index);
+  lastUse[reduction ? pre : yielded] = int(operations.size());
+
+  SmallVector<int64_t> outer(ranges.begin(), ranges.begin() + inner);
+  SmallVector<uint64_t> bases(views.size());
+  LogicalResult status = success();
+  forEachOuter(outer, 0, [&](ArrayRef<int64_t> index) {
+    if (failed(status)) return;
+    for (size_t i = 0; i < views.size(); ++i) {
+      int64_t offset = 0;
+      for (auto [axis, expression] : llvm::enumerate(maps[i].getResults())) {
+        int64_t coordinate = 0;
+        if (auto d = dyn_cast<AffineDimExpr>(expression))
+          coordinate = d.getPosition() < inner ? index[d.getPosition()] : 0;
+        else coordinate = cast<AffineConstantExpr>(expression).getValue();
+        offset += coordinate * views[i].strides[axis];
+      }
+      bases[i] = addr(views[i], offset);
+    }
+    if (reduction) sload(11, bases.back());
+    for (int64_t start = 0; start < ranges[inner]; start += 16) {
+      const uint32_t lanes = uint32_t(std::min<int64_t>(16, ranges[inner] - start));
+      setVL(lanes);
+      std::array<bool, 16> used{};
+      DenseMap<Value, uint32_t> registers;
+      auto allocate = [&]() -> FailureOr<uint32_t> {
+        for (uint32_t r = 0; r < used.size(); ++r)
+          if (!used[r]) { used[r] = true; return r; }
+        err = "typed generic: out of vector registers";
+        return failure();
+      };
+      auto vector = [&](uint32_t op, uint32_t dtype, uint32_t dst,
+                        uint32_t a, uint32_t b = 0, uint32_t c = 0) {
+        rec(typedVector(op, dtype, dst, a, b, c, lanes));
+      };
+      auto typeCode = [&](Type type) { return type.isInteger(1) ? uint32_t(DT_I8) : uint32_t(dtypeOf(type)); };
+      std::function<FailureOr<uint32_t>(Value)> materialize = [&](Value value) -> FailureOr<uint32_t> {
+        if (auto found = registers.find(value); found != registers.end()) return found->second;
+        auto reg = allocate();
+        if (failed(reg)) return failure();
+        if (auto arg = dyn_cast<BlockArgument>(value)) {
+          if (arg.getOwner() != &body || arg.getArgNumber() >= views.size()) {
+            err = "typed generic: unsupported captured block argument";
+            return failure();
+          }
+          const unsigned n = arg.getArgNumber();
+          uint32_t loadKind = views[n].et.isF32() ? 3 : 1;
+          if (contiguous[n]) vload(*reg, bases[n] + uint64_t(start * views[n].eb), loadKind);
+          else {
+            setVL(1);
+            vload(*reg, bases[n], loadKind);
+            setVL(lanes);
+            vector(T_BCAST, typeCode(views[n].et), *reg, *reg);
+          }
+        } else if (auto constant = constValue(value)) {
+          uint32_t dtype = typeCode(value.getType());
+          uint32_t loadKind = dtype == DT_F32 ? 3 : dtype == DT_I8 ? 5 : 1;
+          vload(*reg, uint64_t(poolL1 + vectorConst(*constant, dtype)), loadKind);
+        } else {
+          err = "typed generic: operand was not emitted in SSA order";
+          return failure();
+        }
+        registers[value] = *reg;
+        return *reg;
+      };
+      auto release = [&](int instruction) {
+        SmallVector<Value> dead;
+        for (auto [value, reg] : registers)
+          if (!lastUse.contains(value) || lastUse.lookup(value) <= instruction) {
+            used[reg] = false;
+            dead.push_back(value);
+          }
+        for (Value value : dead) registers.erase(value);
+      };
+      for (auto [instruction, op] : llvm::enumerate(operations)) {
+        SmallVector<uint32_t> args;
+        for (Value operand : op->getOperands()) {
+          auto reg = materialize(operand);
+          if (failed(reg)) { status = failure(); return; }
+          args.push_back(*reg);
+        }
+        auto dst = allocate();
+        if (failed(dst)) { status = failure(); return; }
+        uint32_t dtype = typeCode(op->getOperand(0).getType());
+        auto binary = [&](uint32_t code) { vector(code, dtype, *dst, args[0], args[1]); };
+        auto unary = [&](uint32_t code) { vector(code, dtype, *dst, args[0]); };
+        if (isa<arith::AddFOp>(op)) binary(T_ADD);
+        else if (isa<arith::SubFOp>(op)) binary(T_SUB);
+        else if (isa<arith::MulFOp>(op)) binary(T_MUL);
+        else if (isa<arith::MaximumFOp, arith::MaxNumFOp>(op)) binary(T_MAX);
+        else if (isa<arith::MinimumFOp, arith::MinNumFOp>(op)) binary(T_MIN);
+        else if (isa<arith::DivFOp>(op)) {
+          vector(T_RCP, dtype, *dst, args[1]);
+          vector(T_MUL, dtype, *dst, args[0], *dst);
+        } else if (isa<arith::NegFOp>(op)) unary(T_NEG);
+        else if (isa<math::AbsFOp>(op)) unary(T_ABS);
+        else if (isa<math::ExpOp>(op)) unary(T_EXP);
+        else if (isa<math::SqrtOp>(op)) unary(T_SQRT);
+        else if (isa<math::RsqrtOp>(op)) unary(T_RSQRT);
+        else if (isa<arith::ExtFOp>(op)) unary(T_CAST_F32);
+        else if (isa<arith::TruncFOp>(op)) unary(T_CAST_F16);
+        else if (auto compare = dyn_cast<arith::CmpFOp>(op)) {
+          switch (compare.getPredicate()) {
+          case arith::CmpFPredicate::OEQ: binary(T_CMP_EQ); break;
+          case arith::CmpFPredicate::OLT: binary(T_CMP_LT); break;
+          case arith::CmpFPredicate::OLE: binary(T_CMP_LE); break;
+          case arith::CmpFPredicate::OGT: vector(T_CMP_LT, dtype, *dst, args[1], args[0]); break;
+          case arith::CmpFPredicate::OGE: vector(T_CMP_LE, dtype, *dst, args[1], args[0]); break;
+          default: status = fail("unsupported floating-point predicate"); return;
+          }
+        } else if (isa<arith::SelectOp>(op)) {
+          vector(T_SELECT, typeCode(op->getResult(0).getType()), *dst, args[1], args[2], args[0]);
+        } else {
+          err = "typed generic: unsupported operation " + op->getName().getStringRef().str();
+          status = failure(); return;
+        }
+        registers[op->getResult(0)] = *dst;
+        release(int(instruction));
+      }
+      auto result = materialize(reduction ? pre : yielded);
+      if (failed(result)) { status = failure(); return; }
+      if (reduction) {
+        bool f32 = pre.getType().isF32();
+        uint32_t function = combine == 1 ? (f32 ? 4 : 1) : (f32 ? 5 : 2);
+        emit(rform(OP_V_RED, 3, *result, 0, 0, function));
+        emit(rform(OP_S_ALU, 11, 11, 3, 0, combine));
+      } else {
+        vstore(bases.back() + uint64_t(start * views.back().eb), *result, views.back().et.isF32() ? 4 : 2);
+      }
+    }
+    if (reduction) sstore(bases.back(), 11);
+  });
+  return status;
+}
+
 LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
+  if (g->hasAttr("hyb.flash_math")) return lowerTypedGeneric(g, err);
   auto iters = g.getIteratorTypesArray();
   unsigned nLoops = g.getNumLoops();
   SmallVector<int64_t> ranges = g.getStaticLoopRanges();

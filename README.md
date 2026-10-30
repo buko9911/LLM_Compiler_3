@@ -46,6 +46,7 @@ HF checkpoint ── frontend/export.py ──▶ step.mlir + manifest.json
 | | `hyb-lower-npu-gemv` | NPU GEMV → `[N/32, K, 32]` INT8 weight의 INT32 contraction | |
 | | `hyb-outline-phases` | 연속 NPU 연산/PIM 그룹을 phase 함수로 분리 | |
 | 3. 묶기·타일링 | `hyb-npu-projection-fusion` | q/k/v, gate/up을 출력 방향으로 이어 GEMV 하나로 | `projection_fusion` |
+| | `hyb-npu-flash-attention` | key 타일 단위 online softmax(FP32 running max/sum/output), 선택적으로 KV를 코어에 나누는 Flash-Decoding. 반올림이 FP16 softmax와 다름 | `flash_attention`, `flash_decoding`, `flash_kv_slicing` |
 | | `hyb-npu-attention-fusion` | head 하나의 QK·mask·softmax·PV를 한 코어에(M>1의 reshape 통과) | `attention_fusion` |
 | | `hyb-npu-gemv-epilogue` | GEMV 출력 열을 코어별로 나눠 같은 코어에서 역양자화 | `gemv_epilogue_fusion` |
 | | `hyb-npu-tile` | 코어 분배(`scf.forall`)와 weight 타일 루프(`scf.for {hyb.stream}`) | |
@@ -119,6 +120,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | 키 | 담당 | 1토큰 | 8토큰 |
 |---|---|:-:|:-:|
 | `projection_fusion` | pass | 켬 | 켬 |
+| `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | | |
 | `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | | 켬 |
 | `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 | 켬 |
 | `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 | 켬 |
@@ -143,7 +145,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `npu-lit` | `npu-opt` lit 테스트 |
 | `pim-layout` | PIM 배치 |
 | `decode-driver` | CLI 경로와 오류 |
-| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution` | pass별 IR 회귀 |
+| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-flash-attention`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution` | pass별 IR 회귀 |
 | `decode-frontend` | export한 그래프를 HF 모델과 비교(simulator 설정 필요) |
 | `decode-runtime-backend` | runtime의 DRAM backend 선택 |
 
@@ -154,4 +156,5 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 - `../../docs/walkthrough/D_compiler_qwen3_4b_npu.md`: Qwen3-4B를 직접 컴파일하며 pass마다 IR이 어떻게 바뀌는지 따라간 기록
 - `../../docs/architecture/NPU_DECODE_PASSES.md`: NPU pass의 설계와 측정 이력
+- `../../docs/architecture/NPU_FLASH_ATTENTION.md`: FlashAttention / Flash-Decoding의 구조와 수치 계약
 - `../../docs/BUILD_AND_RUN.md`: 빌드, 실행, 회귀 검증 전체

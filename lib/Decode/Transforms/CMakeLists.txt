@@ -15,6 +15,7 @@ add_mlir_library(NPUDecodeTransforms
   NpuActivationResidency.cpp
   NpuAttentionFusion.cpp
   NpuElementwiseDistribution.cpp
+  NpuFlashAttention.cpp
   DEPENDS HybridPassesIncGen MLIRHybOpsIncGen
   LINK_LIBS PUBLIC NPUDecodeDialect NPUDecodeSupport NPUDecodeTarget MLIRAnalysis MLIRIR MLIRPass MLIRTransforms MLIRFuncDialect MLIRLinalgDialect
     MLIRLinalgTransforms MLIRTensorDialect MLIRArithDialect MLIRMathDialect MLIRMemRefDialect

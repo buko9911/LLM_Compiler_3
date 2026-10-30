@@ -132,7 +132,8 @@ void Codegen::waitOutputStore() {
 
 void Codegen::guardOutputStoreVectorWrite(uint64_t address, uint32_t funct) {
   if (!pendingOutputStore) return;
-  // A vector store is at most one 512-bit register; use its full footprint conservatively.
+  // A vector store is at most one 512-bit register. Use its full footprint
+  // conservatively: typed-vector records can change VL independently of cfg.
   if (funct != 2 && funct != 4 && funct != 6 && funct != 8 && funct != 10) {
     waitOutputStore();
     return;
