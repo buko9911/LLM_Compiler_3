@@ -2,6 +2,7 @@
 // The lowering follows NPU_Simulator tools/isa_v2.py (lower_core_block)
 // decision for decision; tests compare the two word for word.
 #include "npu/Target/ISAv2.h"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <map>
@@ -279,6 +280,7 @@ public:
       return;
     }
     case 0x35: memory(funct, rd, rs1); return;
+    case 0x36: typed(record); return;
     case 0x30: {
       int op = f16Binary(funct); unsigned type = F16;
       if (op < 0) { op = f32Binary(funct); type = F32; }
@@ -321,6 +323,56 @@ public:
     char hex[16];
     snprintf(hex, sizeof hex, "%#010x", word);
     fail(std::string("unsupported builder-stream instruction ") + hex);
+  }
+
+  // Typed builder records use the same operation numbers as the simulator's
+  // generic_vector_isa.py. They lower to existing ISA-v2 V_OP/V_CVT words.
+  // The record's element count is authoritative, including short tail tiles.
+  void typed(const uint32_t *record) {
+    unsigned rd = record[0] >> 6 & 15, a = record[0] >> 10 & 15;
+    unsigned b = record[0] >> 14 & 15, c = record[0] >> 18 & 15;
+    unsigned op = record[1], dtype = record[2], elements = record[3];
+    if (record[0] >> 22 || dtype > I32 || op > 40) {
+      fail("invalid typed-vector header, dtype or operation"); return;
+    }
+    bool integer = dtype == I8 || dtype == I32;
+    if ((((op >= 8 && op <= 12) || op == 37) && integer) ||
+        (op >= 21 && op <= 26 && !integer) ||
+        ((op == 38 || op == 39) && !integer) || (op == 40 && dtype != F32 && dtype != I32)) {
+      fail("typed-vector operation does not support this dtype"); return;
+    }
+    unsigned target = dtype;
+    if ((op >= 13 && op <= 15) || op == 37) target = I8;
+    else if (op >= 27 && op <= 30) target = op - 27;
+    else if (op == 38) target = F32;
+    else if (op == 39) target = F16;
+    unsigned bytes[] = {2, 4, 1, 4};
+    unsigned maximum = 64 / std::max(bytes[dtype], bytes[target]);
+    if (!elements || elements > maximum) {
+      fail("typed-vector lane count exceeds the 512-bit source or result register"); return;
+    }
+    control[SET_VL] = elements;
+    need(SET_VL);
+    if (op <= 26) {
+      if (op == 19) b = unsigned(use(b)); // SLICE offset is a GP value.
+      out.push_back(vOp(op, dtype, rd, a, b, c));
+    } else if (op >= 31 && op <= 36) {
+      if (integer) {
+        if (op == 31) a = unsigned(use(a));
+        else b = unsigned(use(b));
+      }
+      out.push_back(vOp(op - 4, dtype, rd, a, b, c));
+    } else if (op >= 27 && op <= 30) {
+      unsigned round = target == F16 || target == F32;
+      unsigned saturate = !round && !integer;
+      out.push_back(vCvt(0, dtype, target, rd, a, 0, 0, round, saturate));
+    } else if (op == 37) {
+      out.push_back(vCvt(4, dtype, I8, rd, a, b, c, 1, 1));
+    } else if (op == 38 || op == 39) {
+      out.push_back(vCvt(8, dtype, target, rd, a, b, c, 1, 0));
+    } else { // BITCAST names the destination dtype in the builder record.
+      out.push_back(vCvt(1, dtype == F32 ? I32 : F32, dtype, rd, a, 0, 0, 0, 0));
+    }
   }
 
   void matrixLoad(const uint32_t *record) {
@@ -391,11 +443,14 @@ Words dependencyWords(Encoder &e, uint32_t ordinal, const std::vector<uint32_t> 
 }
 } // namespace
 
-Result<std::vector<uint32_t>> lowerCoreBlock(const std::vector<uint32_t> &words) {
+Result<std::vector<uint32_t>> lowerCoreBlock(const std::vector<uint32_t> &words,
+                                           std::vector<size_t> *sourceWords) {
   using R = Result<std::vector<uint32_t>>;
   Lowering lowering;
   size_t index = 0;
+  if (sourceWords) sourceWords->clear();
   while (index < words.size() && lowering.error.empty()) {
+    const size_t sourceIndex = index;
     const uint32_t word = words[index];
     const unsigned opcode = word & 0x3f;
     if (opcode == 0x3b) {
@@ -414,11 +469,13 @@ Result<std::vector<uint32_t>> lowerCoreBlock(const std::vector<uint32_t> &words)
         accumulate = true;
         count -= chunk;
       }
+      if (sourceWords) sourceWords->resize(lowering.out.size(), sourceIndex);
       continue;
     }
     const size_t length = isRecordOpcode(opcode) ? 4 : 1;
     if (index + length > words.size()) return R::failure("truncated four-word builder-stream record");
     lowering.instruction(words.data() + index);
+    if (sourceWords) sourceWords->resize(lowering.out.size(), sourceIndex);
     index += length;
   }
   if (!lowering.error.empty()) return R::failure(lowering.error);

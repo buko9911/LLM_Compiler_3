@@ -1,6 +1,7 @@
 add_mlir_library(NPUDecodeTarget
   PimMetadata.cpp
   NPU/PlenaProgram.cpp
+  NPU/CommandSchedule.cpp
   NPU/NpuCodegen.cpp
   NPU/CodegenEmit.cpp
   NPU/CodegenGeneric.cpp

@@ -87,8 +87,6 @@ private:
   int64_t poolL1 = kL1Base, poolBytes = 0;
   uint64_t poolLP6 = 0;
   uint64_t scratchBase = kL1Base + kPoolMax;
-  // Zero-filled L1 ranges whose fill was folded into the MMA that overwrites them.
-  std::set<std::pair<uint64_t, uint64_t>> zeroed;
   // Address-range hazards.
   enum AccKind { GW, GR, CW, CR };
   struct Acc {
@@ -125,10 +123,13 @@ private:
   uint64_t windowBase(int c) const { return uint64_t(c) * uint64_t(window()); }
 
   // ---- instruction helpers -------------------------------------------------------------
-  void emit(uint32_t word) { w.append(word); }
-  void rec(const std::array<uint32_t, 4> &r) { w.appendRecord(r); }
+  void emit(uint32_t word);
+  void rec(const std::array<uint32_t, 4> &r);
+  void matrixInputs(const std::array<uint32_t,4> &a, const std::array<uint32_t,4> &b);
   /// Load weight, load activation, then one fixed-tile M_MMA per 32-wide K slice.
   void mma(int64_t k, uint32_t funct) {
+    // MMA consumes the private SA operand buffers, not the pending store's L1 source.
+    if (!in.spec->npu.memoryDependencySchedule) waitOutputStore();
     for (uint32_t word : matrixMma(uint32_t(k), funct, false)) w.append(word);
   }
   void load(uint32_t gp, uint32_t v) {
@@ -144,20 +145,30 @@ private:
   }
   void setVL(uint32_t n) { setConfig(3, n); }
   void vload(uint32_t v, uint64_t addr, uint32_t funct) {
+    guardInputLoad(addr,64);
     load(4, uint32_t(addr));
-    emit(rform(OP_V_MEM, v, 4, 0, 0, funct));
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, v, 4, 0, 0, funct));
   }
   void vstore(uint64_t addr, uint32_t v, uint32_t funct) {
+    guardInputLoad(addr,64);
+    guardOutputStoreVectorWrite(addr, funct);
     load(4, uint32_t(addr));
-    emit(rform(OP_V_MEM, 4, v, 0, 0, funct));
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, 4, v, 0, 0, funct));
   }
   void sload(uint32_t s, uint64_t addr) {
+    guardInputLoad(addr,4);
     load(5, uint32_t(addr));
-    emit(rform(OP_V_MEM, s, 5, 0, 0, 9));
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, s, 5, 0, 0, 9));
   }
   void sstore(uint64_t addr, uint32_t s) {
+    guardInputLoad(addr,4);
+    guardOutputStoreVectorWrite(addr, 10);
     load(5, uint32_t(addr));
-    emit(rform(OP_V_MEM, 5, s, 0, 0, 10));
+    noteOutputStoreVectorWork();
+    w.append(rform(OP_V_MEM, 5, s, 0, 0, 10));
   }
 
   // ---- command stream per core, hazards (CodegenEmit.cpp) -----------------------------------
@@ -169,6 +180,30 @@ private:
   static bool overlaps(uint64_t s1, uint64_t e1, uint64_t s2, uint64_t e2) { return s1 < e2 && s2 < e1; }
 
   using L2Range = std::pair<uint64_t, uint64_t>;
+  struct PendingOutputStore {
+    SmallVector<L2Range> sourceRanges;
+    bool vectorWork = false;
+    int source = -1;
+  };
+  std::optional<PendingOutputStore> pendingOutputStore;
+  struct PendingInputLoad { SmallVector<L2Range> destinationRanges; int source; };
+  std::optional<PendingInputLoad> pendingInputLoad;
+  void waitInputLoad();
+  bool inputLoadOverlaps(uint64_t address, uint64_t bytes) const;
+  void guardInputLoad(uint64_t address, uint64_t bytes);
+  bool matrixTransferPending(const std::array<uint32_t,4> &record) const;
+  int64_t asyncOutputStores = 0, outputStoresWithVectorWork = 0;
+  int64_t stagingReleaseCuts = 0;
+  int64_t vectorScalarReciprocals = 0, vectorScalarReuses = 0;
+  int64_t vectorPipelineGroups = 0, vectorPipelinedChunks = 0;
+  void guardLocalMemory(ArrayRef<L2Range> ranges, bool write);
+  bool matrixMemoryAccess(const std::array<uint32_t,4> &record,
+                          SmallVector<L2Range> &ranges, bool &write) const;
+  void waitOutputStore();
+  void guardOutputStoreVectorWrite(uint64_t address, uint32_t funct);
+  void noteOutputStoreVectorWork() {
+    if (pendingOutputStore) pendingOutputStore->vectorWork = true;
+  }
   // Bound compiler-side hazard metadata for unusually fragmented copies. Above this
   // limit retain the old conservative bounding range; never omit an actual access.
   static constexpr uint64_t kMaxL2AccessRanges = 1024;
@@ -236,6 +271,13 @@ private:
     uint32_t bytes;
   };
   std::optional<WeightPrefetch> nextWeight;
+  // One home-core L1 dequant whose liveness covers an independent GEMV forall.
+  hyb::DequantOp deferredDequant;
+  int64_t deferredDequantCursor = 0;
+  std::set<Operation *> emittedDequants;
+  int64_t overlapPairs = 0, overlapChunks = 0;
+  LogicalResult emitDequantChunk(hyb::DequantOp d, int64_t &cursor, int64_t budget, std::string &err);
+  bool disjointDequantStorage(hyb::DequantOp d, scf::ForallOp f);
   void transfer2d(int64_t ss, int64_t ds, uint64_t src, uint64_t dst, uint32_t runBytes, uint32_t rows,
                   uint32_t sStride, uint32_t dStride, std::string &err);
   LogicalResult lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef<int64_t> perm, std::string &err);
@@ -248,9 +290,8 @@ private:
   LogicalResult scatterPimAct(const View &s, const View &d, std::string &err);
 
   // ---- compute ops (CodegenOps.cpp) ----------------------------------------------------------
-  static std::pair<uint64_t, uint64_t> rangeOf(const View &v, uint64_t base);
   static bool isMatmulInit(Operation *user, Value out);
-  LogicalResult checkZeroInit(const View &c, std::string &err);
+  LogicalResult checkZeroInit(linalg::LinalgOp operation, std::string &err);
   LogicalResult lowerFill(linalg::FillOp f, std::string &err);
   LogicalResult lowerMatmul(linalg::LinalgOp mm, std::string &err);
   LogicalResult lowerGemv(linalg::GenericOp g, std::string &err);
@@ -262,6 +303,7 @@ private:
   // ---- control flow (CodegenLoops.cpp) -------------------------------------------------------
   static bool isPure(Operation &op);
   LogicalResult emitBlock(Block &b, std::string &err);
+  DenseMap<Operation *, int> sourceIds;
   static uint64_t spanBytes(const View &v);
   SmallVector<L2Range> viewRanges(const View &v) const;
   bool weightPipeline(scf::ForOp f, memref::CopyOp stream, linalg::GenericOp &gemv, memref::CopyOp &output,
@@ -273,11 +315,13 @@ private:
   // Kind of a body value: folded constant, row-invariant scalar, or FP16 vector.
   enum class K { Const, Scalar, Vector };
   LogicalResult lowerGeneric(linalg::GenericOp g, std::string &err);
+  LogicalResult lowerTypedGeneric(linalg::GenericOp g, std::string &err);
   LogicalResult emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, DenseMap<Value, K> &kind,
                           ArrayRef<Operation *> vops, DenseMap<Value, Value> &aliasOf, DenseMap<Value, int> &lastUse,
                           ArrayRef<uint64_t> base, int64_t n, bool reduction, Value pre, Value dotA, Value dotB,
                           uint32_t redFunct, uint32_t combFunct, Value result, DenseMap<Value, uint32_t> &constReg,
-                          DenseMap<Value, uint32_t> &rowReg, uint32_t accReg, uint32_t tmpReg, std::string &err);
+                          DenseMap<Value, uint32_t> &rowReg, DenseMap<Value, uint32_t> &reciprocals,
+                          bool pipelineSafe, uint32_t accReg, uint32_t tmpReg, std::string &err);
 };
 
 } // namespace mlir::hybrid::codegen

@@ -1,7 +1,7 @@
 //===- TensorPasses.cpp - [A] tensor-level passes --------------------------===//
 //
 // hyb-annotate, hyb-simplify, hyb-raise-linear, hyb-quantize, hyb-fold-transpose,
-// hyb-group-linear.
+// Linear raising, quantization and transpose normalization.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/Passes.h"
@@ -18,7 +18,6 @@ namespace mlir::hybrid {
 #define GEN_PASS_DEF_HYBRAISELINEAR
 #define GEN_PASS_DEF_HYBQUANTIZE
 #define GEN_PASS_DEF_HYBFOLDTRANSPOSE
-#define GEN_PASS_DEF_HYBGROUPLINEAR
 #include "npu/Decode/Transforms/Passes.h.inc"
 } // namespace mlir::hybrid
 
@@ -227,22 +226,6 @@ struct HybFoldTransposePass : mlir::hybrid::impl::HybFoldTransposeBase<HybFoldTr
     RewritePatternSet patterns(&getContext());
     patterns.add<FoldTransposeIntoBatchMatmul>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) signalPassFailure();
-  }
-};
-
-//===----------------------------------------------------------------------===//
-// hyb-group-linear
-//===----------------------------------------------------------------------===//
-struct HybGroupLinearPass : mlir::hybrid::impl::HybGroupLinearBase<HybGroupLinearPass> {
-  void runOnOperation() override {
-    DenseMap<Value, int64_t> groupOf;
-    int64_t next = 0;
-    Builder b(&getContext());
-    getOperation().walk([&](hyb::QMatmulOp op) {
-      auto it = groupOf.try_emplace(op.getInput(), next);
-      if (it.second) next++;
-      op.setGroupAttr(b.getI64IntegerAttr(it.first->second));
-    });
   }
 };
 

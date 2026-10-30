@@ -32,7 +32,10 @@ inline constexpr uint32_t kMaxDistance = 0xffff;
 inline constexpr uint64_t kMaxGdmaRowBytes = uint64_t(1) << 20;  // exclusive
 
 // One builder-stream (ISA ver 1.0) core block -> ISA ver 2.0 core words.
-Result<std::vector<uint32_t>> lowerCoreBlock(const std::vector<uint32_t> &builderWords);
+// Optional diagnostic map: each emitted word's originating builder instruction.
+// Coalesced MMA slices identify their first source instruction. Encoding is unchanged.
+Result<std::vector<uint32_t>> lowerCoreBlock(const std::vector<uint32_t> &builderWords,
+                                           std::vector<size_t> *sourceWords = nullptr);
 
 // Length in words of the ver 2.0 core instruction at words[0], or 0 when the
 // opcode is not a ver 2.0 core instruction or the record is truncated.

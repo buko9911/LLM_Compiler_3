@@ -7,24 +7,26 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
+#include "npu/Decode/Support/NpuOperationTrace.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/ScopeExit.h"
 #include <algorithm>
 
 namespace mlir::hybrid::codegen {
 
 bool Codegen::isPure(Operation &op) {
-  if (isa<arith::ConstantOp, memref::AllocOp, memref::DeallocOp, hyb::WeightOp, affine::AffineApplyOp,
-          affine::AffineMinOp, affine::AffineMaxOp>(op) || isViewOp(&op))
-    return true;
-  return op.getDialect() && op.getDialect()->getNamespace() == "arith" &&
-         llvm::none_of(op.getOperandTypes(), [](Type t) { return isa<MemRefType>(t); });
+  return isNpuTraceMetadataOnly(op);
 }
 
 LogicalResult Codegen::emitBlock(Block &b, std::string &err) {
   for (Operation &op : b) {
     if (op.hasTrait<OpTrait::IsTerminator>() || isPure(op)) continue;
+    if (emittedDequants.count(&op)) continue;
+    int previousSource = w.currentSource;
+    if (w.traceOperations) w.currentSource = sourceIds.lookup(&op);
+    auto restoreSource = llvm::scope_exit([&] { w.currentSource = previousSource; });
     LogicalResult r = success();
     if (auto f = dyn_cast<scf::ForOp>(op)) r = emitFor(f, err);
     else if (auto f = dyn_cast<scf::ForallOp>(op)) r = emitForall(f, err);
@@ -89,7 +91,8 @@ SmallVector<Codegen::L2Range> Codegen::viewRanges(const View &v) const {
   return ranges;
 }
 
-/// Only pipeline the isolated fill -> weight copy -> GEMV -> L2 output pattern. Other
+/// Pipeline fill -> weight copy -> GEMV -> optional output copy. A fused
+/// epilogue writes directly into its core-private accumulator partition.
 /// loops keep the original schedule; moving arbitrary copies would require alias analysis.
 bool Codegen::weightPipeline(scf::ForOp f, memref::CopyOp stream, linalg::GenericOp &gemv, memref::CopyOp &output,
                              std::string &err) {
@@ -112,32 +115,42 @@ bool Codegen::weightPipeline(scf::ForOp f, memref::CopyOp stream, linalg::Generi
       return false;
     }
   }
-  if (stage != 4 || f.getNumRegionIterArgs() || gemv.getDpsInputs()[1] != stream.getTarget() ||
-      fill.getOutputs()[0] != gemv.getDpsInits()[0] || output.getSource() != gemv.getDpsInits()[0] ||
+  bool direct = stage == 3 && gemv->hasAttr("hyb.gemv_epilogue");
+  if ((!direct && stage != 4) || f.getNumRegionIterArgs() || gemv.getDpsInputs()[1] != stream.getTarget() ||
+      fill.getOutputs()[0] != gemv.getDpsInits()[0] ||
+      (output && output.getSource() != gemv.getDpsInits()[0]) ||
       constValue(fill.getInputs()[0]) != std::optional<double>(0.0)) return false;
   // The activation is loop invariant; both weight slots must be distinct from it and all
   // output slots. Allocation metadata makes this check independent of the iteration.
   Operation *qdef = gemv.getDpsInputs()[0].getDefiningOp();
   if (qdef && f->isProperAncestor(qdef)) return false;
   auto wa = stream.getTarget().getDefiningOp<memref::AllocOp>();
-  auto ca = output.getSource().getDefiningOp<memref::AllocOp>();
-  if (!wa || !ca || wa->getParentOp() != f || ca->getParentOp() != f) return false;
+  Value accumulator = gemv.getDpsInits()[0], root = accumulator;
+  if (direct)
+    while (Operation *op = root.getDefiningOp()) {
+      if (!isViewOp(op)) break;
+      root = op->getOperand(0);
+    }
+  auto ca = root.getDefiningOp<memref::AllocOp>();
+  if (!wa || !ca || wa->getParentOp() != f ||
+      ca->getParentOp() != (direct ? f->getParentOp() : f.getOperation())) return false;
   auto buffers = wa->getAttrOfType<IntegerAttr>("hyb.buffers");
   auto slot = wa->getAttrOfType<IntegerAttr>("hyb.slot_bytes");
   auto cb = ca->getAttrOfType<IntegerAttr>("hyb.buffers");
   auto cs = ca->getAttrOfType<IntegerAttr>("hyb.slot_bytes");
-  if (!buffers || buffers.getInt() != 2 || !slot || !cb || !cs) return false;
+  if (!buffers || buffers.getInt() != 2 || !slot || (!direct && (!cb || !cs))) return false;
   auto W = viewOf(stream.getTarget(), err), Q = viewOf(gemv.getDpsInputs()[0], err),
-       C = viewOf(output.getSource(), err), O = viewOf(output.getTarget(), err);
+       C = viewOf(root, err), O = viewOf(output ? output.getTarget() : accumulator, err);
   if (failed(W) || failed(Q) || failed(C) || failed(O)) return false;
   uint64_t wb = uint64_t(wa->getAttrOfType<IntegerAttr>("hyb.offset").getInt()),
            cbeg = uint64_t(ca->getAttrOfType<IntegerAttr>("hyb.offset").getInt()),
            we = wb + 2 * uint64_t(slot.getInt());
-  return W->space == kL1 && Q->space == kL1 && C->space == kL1 && O->space == kL2 &&
+  bool outputSafe = O->space == kL2 ? addr(*O) >= uint64_t(cores) * uint64_t(window()) :
+      O->space == kL1 && !overlaps(wb, we, addr(*O), addr(*O) + spanBytes(*O));
+  return W->space == kL1 && Q->space == kL1 && C->space == kL1 && outputSafe &&
          spanBytes(*W) == uint64_t(W->elements() * W->eb) && slot.getInt() >= W->elements() * W->eb &&
          !overlaps(wb, we, addr(*Q), addr(*Q) + spanBytes(*Q)) &&
-         !overlaps(wb, we, cbeg, cbeg + uint64_t(cb.getInt() * cs.getInt())) &&
-         addr(*O) >= uint64_t(cores) * uint64_t(window());
+         !overlaps(wb, we, cbeg, cbeg + (direct ? spanBytes(*C) : uint64_t(cb.getInt() * cs.getInt())));
 }
 
 LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
@@ -184,14 +197,85 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
   if (pipeline && in.spec->npu.weightPrefetchBatchTiles)
     batch = std::min<int64_t>(in.spec->npu.weightPrefetchBatchTiles, int64_t(nslots));
   if (crossBatch) batch = std::min(batch, int64_t(nslots) - 1);
+  uint64_t win = windowBase(curCore), initialSlot = 0;
+  if (stream && in.spec->npu.weightStreamRotateSlots) {
+    for (uint64_t candidate = 0; candidate < nslots; ++candidate) {
+      uint64_t begin = win + candidate * slotBytes;
+      if (llvm::none_of(l2acc, [&](const Acc &a) { return overlaps(a.s, a.e, begin, begin + slotBytes); })) {
+        initialSlot = candidate;
+        break;
+      }
+    }
+  }
+  auto slotAddress = [&](int64_t tile) {
+    return win + ((uint64_t(tile) + initialSlot) % nslots) * slotBytes;
+  };
+  bool earlyRelease = pipeline && in.spec->npu.weightStreamEarlyRelease;
   if (f->hasAttr("hyb.stream")) {
     std::string reason = pipeline ? "enabled" : !in.weightPrefetch ? "disabled" :
         !stream ? "no_staging_slot" : n <= 1 ? "single_iteration" :
         nslots < 3 ? "fewer_than_three_slots" : "unsupported_loop_pattern";
-    weightStreams.push_back({int64_t(slotBytes), n, int64_t(nslots), batch, pipeline, crossBatch, reason});
+    weightStreams.push_back({int64_t(slotBytes), n, int64_t(nslots), earlyRelease ? 1 : batch,
+                             pipeline, earlyRelease || crossBatch, reason, int64_t(initialSlot)});
+  }
+  if (earlyRelease) {
+    bool computeFirst = in.spec->npu.weightPrefetchComputeFirst;
+    // Global dependencies can observe core-block completion, not a local DMA
+    // event. Consume every local event before splitting a block. A slot read
+    // therefore belongs to the load/previous-tile block, never to the compute
+    // of the tile that just arrived. No hazard is deleted speculatively.
+    auto stage = [&](int64_t tile) -> LogicalResult {
+      env[iv] = *lb + tile * *step;
+      auto src = viewOf(stream.getSource(), err);
+      if (failed(src)) return failure();
+      gdmaLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb), 1, 0, 0);
+      return success();
+    };
+    for (int64_t j = 0; j < std::min<int64_t>(n,nslots); ++j)
+      if (failed(stage(j))) return failure();
+    for (int64_t j = 0; j < n; ++j) {
+      env[iv] = *lb + j * *step;
+      streamSlot[stream] = slotAddress(j);
+      if (j == 0 || computeFirst) {
+        if (failed(lowerCopy(stream,stream.getSource(),stream.getTarget(),{},err))) return failure();
+        flush(); // first weight is now in L1; release its L2 read before MMA
+      }
+      if (j + int64_t(nslots) < n && failed(stage(j + int64_t(nslots)))) return failure();
+      // Only the next staged load must be ready before this compute block.
+      // The current tile was consumed in the preceding block.
+      std::vector<int> deps;
+      env[iv] = *lb + j * *step;
+      if (output) {
+        auto out = viewOf(output.getTarget(),err);
+        if (failed(out)) return failure();
+        if (out->space == kL2)
+          for (auto [s,e] : viewRanges(*out)) coreDependencies(s,e,true,deps);
+      }
+      if (j + 1 < n && !computeFirst) {
+        uint64_t slot = slotAddress(j+1);
+        coreDependencies(slot,slot+slotBytes,false,deps);
+        env[iv] = *lb + (j+1)* *step;
+        auto dst = viewOf(stream.getTarget(),err);
+        if (failed(dst)) return failure();
+        nextWeight = WeightPrefetch{gemv,addr(*dst),slot,uint32_t(dst->elements()*dst->eb)};
+      }
+      std::sort(deps.begin(),deps.end());
+      deps.erase(std::unique(deps.begin(),deps.end()),deps.end());
+      blockAfter(deps);
+      env[iv] = *lb + j * *step;
+      prefetchedWeightCopy = stream;
+      prefetchedWeightNeedsWait = false;
+      if (failed(emitBlock(*f.getBody(),err))) return failure();
+      if (j+1 < n && !computeFirst) {
+        load(10,1);
+        emit(rform(OP_WAIT_EVENT,10));
+      }
+      flush();
+    }
+    streamSlot.erase(stream); env.erase(iv); loopBounds.erase(f);
+    return success();
   }
   int64_t issued = -1;
-  uint64_t win = windowBase(curCore);
   for (int64_t i = 0; i < n; i += batch) {
     int64_t end = std::min(n, i + batch);
     if (stream) {
@@ -200,7 +284,7 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
         env[iv] = *lb + issued * *step;
         FailureOr<View> v = viewOf(stream.getSource(), err);
         if (failed(v)) return failure();
-        gdmaLoad(addr(*v), win + uint64_t(issued % int64_t(nslots)) * slotBytes, uint32_t(v->elements() * v->eb), 1, 0, 0);
+        gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0);
       }
     }
     if (pipeline) {
@@ -208,13 +292,14 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       // A carried tile is loaded while this batch's last MMA runs. Its GDMA must
       // already be complete before entering the block, just like all other loads.
       for (int64_t j = i; j < std::min(n, end + int64_t(crossBatch)); ++j) {
-        uint64_t slot = win + uint64_t(j % int64_t(nslots)) * slotBytes;
+        uint64_t slot = slotAddress(j);
         coreDependencies(slot, slot + slotBytes, false, deps);
-        if (j < end) {
+        if (j < end && output) {
           env[iv] = *lb + j * *step;
           auto o = viewOf(output.getTarget(), err);
           if (failed(o)) return failure();
-          for (auto [s, e] : viewRanges(*o)) coreDependencies(s, e, true, deps);
+          if (o->space == kL2)
+            for (auto [s, e] : viewRanges(*o)) coreDependencies(s, e, true, deps);
         }
       }
       std::sort(deps.begin(), deps.end());
@@ -222,13 +307,13 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       blockAfter(deps);
     }
     for (int64_t j = i; j < end; ++j) {
-      if (stream) streamSlot[stream] = win + uint64_t(j % int64_t(nslots)) * slotBytes;
+      if (stream) streamSlot[stream] = slotAddress(j);
       if (pipeline && j + 1 < (crossBatch ? n : end)) {
         env[iv] = *lb + (j + 1) * *step;
         auto dst = viewOf(stream.getTarget(), err);
         if (failed(dst)) return failure();
         nextWeight = WeightPrefetch{gemv, addr(*dst),
-            win + uint64_t((j + 1) % int64_t(nslots)) * slotBytes, uint32_t(dst->elements() * dst->eb)};
+            slotAddress(j + 1), uint32_t(dst->elements() * dst->eb)};
       }
       prefetchedWeightCopy = pipeline && (j > i || (crossBatch && i > 0)) ? stream.getOperation() : nullptr;
       prefetchedWeightNeedsWait = j > i;
@@ -264,13 +349,31 @@ LogicalResult Codegen::emitForall(scf::ForallOp f, std::string &err) {
     return failure();
   }
   int home = curCore;
+  hyb::DequantOp overlap;
+  if (auto id = f->getAttrOfType<IntegerAttr>("hyb.overlap_id")) {
+    auto d = dyn_cast_or_null<hyb::DequantOp>(f->getNextNode());
+    if (home != 0 || deferredDequant || !d || d->getAttrOfType<IntegerAttr>("hyb.overlap_id") != id ||
+        !disjointDequantStorage(d, f)) {
+      err = "invalid dequant/GEMV overlap pair: home core, pairing or disjoint physical storage check failed";
+      return failure();
+    }
+    overlap = d;
+  }
+  if (overlap) ++overlapPairs;
   flush();
   std::vector<int> start = last[size_t(home)];
   Value iv = f.getInductionVars()[0];
   for (int64_t c = 0; c < n; ++c) {
     startCore(int(c), start);
     env[iv] = c;
+    if (c == home && overlap) { deferredDequant = overlap; deferredDequantCursor = 0; }
     if (failed(emitBlock(*f.getBody(), err))) return failure();
+    if (c == home && overlap) {
+      // Complete the remainder before the core frontier joins its consumers.
+      if (failed(emitDequantChunk(overlap, deferredDequantCursor, INT64_MAX, err))) return failure();
+      emittedDequants.insert(overlap);
+      deferredDequant = {};
+    }
     endCore();
   }
   env.erase(iv);
@@ -283,6 +386,48 @@ LogicalResult Codegen::emitForall(scf::ForallOp f, std::string &err) {
   last[size_t(home)] = join;
   w.frontier = join;
   return success();
+}
+
+bool Codegen::disjointDequantStorage(hyb::DequantOp d, scf::ForallOp f) {
+  auto allocation = [](Value v) {
+    while (Operation *o = v.getDefiningOp()) {
+      if (!isViewOp(o)) break;
+      v = o->getOperand(0);
+    }
+    return v.getDefiningOp<memref::AllocOp>();
+  };
+  auto range = [](memref::AllocOp a) -> std::optional<L2Range> {
+    auto off = a->getAttrOfType<IntegerAttr>("hyb.offset");
+    if (!off || !a.getType().hasStaticShape()) return {};
+    uint64_t bytes = a.getType().getNumElements() * std::max(1u, a.getType().getElementTypeBitWidth() / 8);
+    if (auto slots = a->getAttrOfType<IntegerAttr>("hyb.buffers")) {
+      auto stride = a->getAttrOfType<IntegerAttr>("hyb.slot_bytes");
+      if (!stride) return {};
+      bytes = uint64_t(slots.getInt()) * stride.getInt();
+    }
+    return L2Range{uint64_t(off.getInt()), uint64_t(off.getInt()) + bytes};
+  };
+  SmallVector<L2Range> protectedRanges;
+  for (Value v : d->getOperands()) {
+    auto a = allocation(v);
+    if (!a || spaceOf(v.getType()) != kL1) return false;
+    auto r = range(a);
+    if (!r) return false;
+    protectedRanges.push_back(*r);
+  }
+  bool safe = true;
+  f.walk([&](Operation *o) {
+    for (Value v : o->getOperands()) {
+      if (!isa<MemRefType>(v.getType()) || spaceOf(v.getType()) != kL1) continue;
+      auto a = allocation(v);
+      if (!a) { safe = false; continue; }
+      auto r = range(a);
+      if (!r) { safe = false; continue; }
+      for (auto p : protectedRanges)
+        if (overlaps(p.first, p.second, r->first, r->second)) safe = false;
+    }
+  });
+  return safe;
 }
 
 } // namespace mlir::hybrid::codegen

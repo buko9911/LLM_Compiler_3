@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/Passes.h"
+#include "npu/Decode/Support/TensorDestination.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/SymbolTable.h"
@@ -49,6 +50,11 @@ bool isFree(Operation *op) {
 struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlinePhasesPass> {
   using Base::Base;
   void runOnOperation() override {
+    if (npuSplit != "layer" && npuSplit != "none") {
+      getOperation().emitError("npu-split must be layer or none");
+      signalPassFailure();
+      return;
+    }
     ModuleOp module = getOperation();
     func::FuncOp step = getStepFunction(module);
     Block &body = step.getBody().front();
@@ -185,23 +191,6 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
 // hyb-private-phase-results
 //===----------------------------------------------------------------------===//
 
-/// The operand through which `v` is computed into a tensor.empty, following destination
-/// operands, loop inits and reshapes; null when the chain starts elsewhere.
-OpOperand *emptyDestination(Value v) {
-  while (auto r = dyn_cast<OpResult>(v)) {
-    Operation *op = r.getOwner();
-    OpOperand *tied = nullptr;
-    if (auto dps = dyn_cast<DestinationStyleOpInterface>(op)) tied = dps.getTiedOpOperand(r);
-    else if (auto forall = dyn_cast<scf::ForallOp>(op)) tied = forall.getTiedOpOperand(r);
-    else if (auto loop = dyn_cast<LoopLikeOpInterface>(op)) tied = loop.getTiedLoopInit(r);
-    else if (isa<tensor::ExpandShapeOp, tensor::CollapseShapeOp, tensor::CastOp>(op)) tied = &op->getOpOperand(0);
-    if (!tied) return nullptr;
-    if (tied->get().getDefiningOp<tensor::EmptyOp>()) return tied;
-    v = tied->get();
-  }
-  return nullptr;
-}
-
 bool isPhase(func::FuncOp fn, StringRef kind) {
   auto k = fn ? fn->getAttrOfType<StringAttr>(kPhase) : StringAttr();
   return k && k.getValue() == kind;
@@ -221,7 +210,7 @@ struct HybPrivatePhaseResultsPass
           auto use = dyn_cast<func::CallOp>(user);
           return use && isPhase(symbols.lookup<func::FuncOp>(use.getCallee()), "pim");
         });
-        OpOperand *dest = toPim ? emptyDestination(ret.getOperand(r.getResultNumber())) : nullptr;
+        OpOperand *dest = toPim ? findEmptyDestination(ret.getOperand(r.getResultNumber())) : nullptr;
         if (!dest) continue;
         auto empty = dest->get().getDefiningOp<tensor::EmptyOp>();
         if (empty->hasOneUse()) continue;

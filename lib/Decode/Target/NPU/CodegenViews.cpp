@@ -134,6 +134,13 @@ FailureOr<View> Codegen::viewOf(Value v, std::string &err) {
   }
   Operation *d = v.getDefiningOp();
   if (auto a = dyn_cast<memref::AllocOp>(d)) {
+    // Planned allocations have dense physical storage. Non-identity layout
+    // roots must not silently acquire dense strides: that would invalidate
+    // both address generation and every downstream alias/lifetime proof.
+    if (!mt.getLayout().isIdentity()) {
+      err = "non-identity allocation layout is unsupported; use an identity allocation with explicit views";
+      return failure();
+    }
     auto off = a->getAttrOfType<IntegerAttr>("hyb.offset");
     if (!off || (r.space != kL1 && r.space != kL2)) {
       err = "buffer without an L1 / L2 offset";

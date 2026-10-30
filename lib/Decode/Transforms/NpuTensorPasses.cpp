@@ -178,13 +178,13 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
   LogicalResult tileGemvs(func::FuncOp fn) {
     SmallVector<linalg::GenericOp> gemvs;
     fn.walk([&](linalg::GenericOp g) {
-      if (g->hasAttr("hyb.npu_gemv") && !insideForall(g)) gemvs.push_back(g);
+      if (g->hasAttr("hyb.npu_gemv") && (!insideForall(g) || g->hasAttr("hyb.gemv_epilogue"))) gemvs.push_back(g);
     });
     IRRewriter rewriter(&getContext());
     for (linalg::GenericOp g : gemvs) {
       SmallVector<int64_t> dom = g.getStaticLoopRanges();       // (m, nb, c, k)
       int64_t NB = dom[1], K = dom[3];
-      int64_t cores = largestDivisorAtMost(NB, target.npu.cores);
+      int64_t cores = insideForall(g) ? 1 : largestDivisorAtMost(NB, target.npu.cores);
       Operation *tiled = g;
       if (cores > 1) {
         auto r = tileAndFuse(rewriter, g, /*forall=*/true, {0, cores, 0, 0}, /*fuseAll=*/false);
@@ -228,7 +228,7 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
     return success();
   }
 
-  /// Large dequant (the lm_head logits) split by columns.
+  /// Dequant split by columns, independently tunable for PIM epilogues.
   LogicalResult tileDequants(func::FuncOp fn) {
     SmallVector<hyb::DequantOp> deqs;
     fn.walk([&](hyb::DequantOp d) {
@@ -238,7 +238,9 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
     for (hyb::DequantOp d : deqs) {
       auto t = cast<ShapedType>(d.getInit().getType());
       int64_t N = t.getDimSize(1);
-      if (t.getNumElements() < target.npu.distributeMinElements) continue;
+      const int64_t threshold = target.npu.dequantMinElements > 0
+          ? target.npu.dequantMinElements : target.npu.distributeMinElements;
+      if (t.getNumElements() < threshold) continue;
       int64_t cores = largestDivisorAtMost(N / 32, target.npu.cores);
       if (cores < 2) continue;
       scf::SCFTilingOptions opts;

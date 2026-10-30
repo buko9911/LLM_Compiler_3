@@ -59,7 +59,8 @@ void driver::removeStaleOutputs(const std::string &outDir) {
     StringRef rest = base.drop_while([](char c) { return isdigit(c); });
     bool phaseDir = rest.size() < base.size() && (rest.starts_with("_npu_") || rest.starts_with("_pim_"));
     if (phaseDir || base == "collect") llvm::sys::fs::remove_directories(it->path());
-    else if (base == "schedule.json" || base == "pim.bin" || base == "phases.json") llvm::sys::fs::remove(it->path());
+    else if (base == "schedule.json" || base == "pim.bin" || base == "phases.json" || base == "operation_map.json")
+      llvm::sys::fs::remove(it->path());
   }
 }
 

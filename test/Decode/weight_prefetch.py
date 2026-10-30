@@ -90,6 +90,8 @@ def main():
              ("cross_batch_down", 1, 14336, 4 * 32 * 7, 131072, 1572864, True),
              ("cross_batch_odd", 2, 256, 4 * 32 * 36, 32768, 1048576, True),
              ("cross_batch_many_m", 33, 64, 4 * 32 * 9, 2048, 1048576, True),
+             ("cross_batch_single_tile", 1, 2560, 4 * 32 * 19, 131072, 1048576, True),
+             ("cross_batch_single_tile_many_m", 33, 64, 4 * 32 * 9, 2048, 1048576, True),
              ("cross_batch_large_join", 1, 64, 4 * 32 * 600, 2048, 1048576, True)]
     if a.case:
         unknown = set(a.case) - {c[0] for c in cases}
@@ -138,6 +140,8 @@ def main():
             spec["npu"]["weight_prefetch_batch_tiles"] = 6 if name == "cross_batch_ring" else 2
         if name == "cross_batch_large_join":
             spec["npu"]["weight_prefetch_batch_tiles"] = 256
+        if name.startswith("cross_batch_single_tile"):
+            spec["npu"]["weight_prefetch_batch_tiles"] = 1
         spec_path = case / "target.json"
         spec_path.write_text(json.dumps(spec, indent=2))
         modes = {}
@@ -178,6 +182,24 @@ def main():
             if name.startswith("cross_batch_") and mode == "pipeline":
                 assert async_loads == sum(s["iterations"] - 1 for s in streams if s["prefetch"]), (name, async_loads, streams)
             assert (async_loads > 0) == (pipeline and mode == "pipeline"), (name, mode, async_loads)
+            early_prefetches = 0
+            for tr in traces:
+                for index, event in enumerate(tr):
+                    if event[0:2] != ("ldma", 10):
+                        continue
+                    # The next ping/pong slot is independent of this tile.
+                    # A multi-rectangle tile must issue its transfer before
+                    # finishing all remaining MMAs, not at the tile's tail.
+                    for following in tr[index + 1:]:
+                        if following[0:2] == ("sync", 4):
+                            break
+                        if following[0] == "mma":
+                            early_prefetches += 1
+                            break
+            if mode == "pipeline" and name in (
+                    "multi_rectangle", "multiple_activation_rectangles",
+                    "cross_batch_single_tile_many_m"):
+                assert early_prefetches > 0, (name, "prefetch delayed to last MMA")
             timeline = json.loads((out / "timeline.json").read_text())
             assert timeline["dropped_events"] == 0, "timeline truncated"
             events = timeline["events"]
@@ -190,6 +212,7 @@ def main():
                 overlap += sum(max(0, min(y, v) - max(x, u)) for x, y in matrix for u, v in dma)
             rep = json.loads((out / "commands.json").read_text())
             modes[mode] = dict(total_cycles=max(c["end_cycle"] for c in rep["commands"]),
+                               prefetches_before_remaining_mma=early_prefetches,
                                core_blocks=len(blocks), async_weight_loads=async_loads, event_waits=waits,
                                ldma_matrix_overlap_cycles=overlap, independent_reference_exact=True,
                                input_image_sha256=image_hash, output_sha256=hashlib.sha256(actual.tobytes()).hexdigest(),
@@ -200,7 +223,11 @@ def main():
         assert modes["serial"]["mma_slices"] == modes["pipeline"]["mma_slices"]
         if pipeline:
             assert modes["pipeline"]["ldma_matrix_overlap_cycles"] > 0, name
-            assert modes["pipeline"]["core_blocks"] < modes["serial"]["core_blocks"], name
+            if name.startswith("cross_batch_single_tile"):
+                # One-tile blocks retain LDMA/MMA overlap without batching blocks.
+                assert modes["pipeline"]["core_blocks"] <= modes["serial"]["core_blocks"], name
+            else:
+                assert modes["pipeline"]["core_blocks"] < modes["serial"]["core_blocks"], name
         else:
             assert (case / "serial/program.bin").read_bytes() == (case / "pipeline/program.bin").read_bytes()
         results[name] = dict(shape=dict(m=m, n=n, k=k), results=modes,

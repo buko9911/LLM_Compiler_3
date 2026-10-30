@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <tuple>
 
 using namespace mlir;
 using namespace mlir::hybrid;
@@ -67,6 +68,8 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
                         const std::vector<pim::Primitive> &pimCommands, const TargetSpec &spec,
                         plena::ProgramBuilder &program, LP6Extra &extra, bool weightPrefetch, int pimActivationCores,
                         std::vector<int> &exit, int &logicalCores, json::Array &report, std::string &err) {
+  program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
+  program.commandSchedule = spec.npu.commandSchedule;
   int parallelActivationPhases = 0;
   for (Operation &op : step.getBody().front()) {
     auto call = dyn_cast<func::CallOp>(op);
@@ -112,13 +115,134 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       return false;
     }
     json::Array streams;
-    for (const auto &s : stats.weightStreams)
-      streams.push_back(json::Object{{"tile_bytes", s.tileBytes}, {"iterations", s.iterations},
+    for (const auto &s : stats.weightStreams) {
+      json::Object stream{{"tile_bytes", s.tileBytes}, {"iterations", s.iterations},
           {"slots", s.slots}, {"batch_tiles", s.batch}, {"prefetch", s.prefetch},
-          {"cross_batch", s.crossBatch}, {"reason", s.reason}});
+          {"cross_batch", s.crossBatch}, {"reason", s.reason}};
+      if (spec.npu.weightStreamRotateSlots) stream["initial_slot"] = s.initialSlot;
+      if (spec.npu.weightStreamEarlyRelease) stream["release_on_load"] = s.prefetch;
+      streams.push_back(std::move(stream));
+    }
     json::Object phaseReport{{"phase", name}, {"kind", "npu"}, {"core_words", stats.coreWords},
         {"commands", stats.commands}, {"l1_peak", stats.l1Peak}, {"cores", stats.cores},
         {"l2_staging_bytes_per_core", stats.l2StagingPerCore}, {"weight_streams", std::move(streams)}};
+    if (spec.npu.gdmaLookahead)
+      phaseReport["gdma_admission"] = json::Object{{"lookahead", spec.npu.gdmaLookahead},
+          {"scope", "logical_core_within_phase"}, {"true_dependencies_preserved", true}};
+    if (spec.npu.commandSchedule)
+      phaseReport["command_schedule"] = json::Object{
+          {"commands", int64_t(program.lastSchedule.commands)},
+          {"reordered", int64_t(program.lastSchedule.reordered)},
+          {"redundant_edges_removed", int64_t(program.lastSchedule.redundantEdges)},
+          {"encoding_fallback", program.lastSchedule.encodingFallback},
+          {"priority", "first_consumer_instruction_depth"},
+          {"timing_prediction", false}, {"hardware_changed", false}};
+    if (spec.npu.transferSchedule || spec.npu.stagingEarlyRelease || spec.npu.memoryDependencySchedule) {
+      auto count = [&](StringRef key) {
+        auto value = callee->getAttrOfType<IntegerAttr>(key);
+        return value ? value.getInt() : int64_t(0);
+      };
+      phaseReport["dependency_schedule"] = json::Object{
+          {"transfer_motion", spec.npu.transferSchedule},
+          {"candidates", count("hyb.transfer_schedule_candidates")},
+          {"copies_moved", count("hyb.transfer_schedule_moved")},
+          {"operations_crossed", count("hyb.transfer_schedule_crossed")},
+          {"already_scheduled_copies", count("hyb.transfer_schedule_owned")},
+          {"staging_release_cuts", stats.stagingReleaseCuts},
+          {"matrix_dma_range_guards", spec.npu.memoryDependencySchedule},
+          {"extra_sram_bytes", 0}, {"arithmetic_order_preserved", true}};
+    }
+    if (spec.npu.elementwiseDistribution) {
+      auto count = [&](StringRef key) {
+        auto value = callee->getAttrOfType<IntegerAttr>(key);
+        return value ? value.getInt() : int64_t(0);
+      };
+      phaseReport["elementwise_distribution"] = json::Object{
+          {"groups", count("hyb.elementwise_distributions")},
+          {"candidates", count("hyb.elementwise_candidates")},
+          {"below_threshold", count("hyb.elementwise_small")},
+          {"unsupported", count("hyb.elementwise_unsupported")},
+          {"capacity_rejected", count("hyb.elementwise_capacity")},
+          {"indivisible", count("hyb.elementwise_indivisible")},
+          {"min_elements", spec.npu.distributeMinElements},
+          {"per_element_arithmetic_preserved", true}};
+    }
+    if (spec.npu.vectorScalarReuse || spec.npu.vectorChunkPipeline) {
+      phaseReport["vector_schedule"] = json::Object{
+          {"scalar_reuse_enabled", spec.npu.vectorScalarReuse},
+          {"chunk_pipeline_enabled", spec.npu.vectorChunkPipeline},
+          {"scalar_reciprocals_hoisted", stats.vectorScalarReciprocals},
+          {"scalar_reciprocal_reuses", stats.vectorScalarReuses},
+          {"pipeline_groups", stats.vectorPipelineGroups},
+          {"pipelined_chunks", stats.vectorPipelinedChunks},
+          {"legacy_fp16_rounding_preserved", true},
+          {"additional_hardware_registers", 0}};
+    }
+    if (spec.npu.activationResidency) {
+      auto count = callee->getAttrOfType<IntegerAttr>("hyb.activation_residency_private_results");
+      phaseReport["activation_residency"] = json::Object{
+          {"private_result_destinations", count ? count.getInt() : 0},
+          {"cross_phase_dram_abi_preserved", true}};
+    }
+    if (spec.npu.projectionFusion) {
+      auto count = callee->getAttrOfType<IntegerAttr>("hyb.projection_fusions");
+      phaseReport["projection_fusion"] = json::Object{{"groups",count ? count.getInt() : 0},
+                                                       {"runtime_weight_packing",false}};
+    }
+    if (spec.npu.inputTilePipeline) {
+      auto groups = callee->getAttrOfType<IntegerAttr>("hyb.input_pipeline_groups");
+      auto tiles = callee->getAttrOfType<IntegerAttr>("hyb.input_pipeline_tiles");
+      phaseReport["input_tile_pipeline"] = json::Object{
+          {"groups", groups ? groups.getInt() : 0}, {"tiles", tiles ? tiles.getInt() : 0},
+          {"columns", spec.npu.inputTileColumns}, {"extra_l1_allocation_bytes", 0},
+          {"async_input_loads", spec.npu.asyncInputLoads}};
+    }
+    if (spec.npu.matmulRhsPacking || spec.npu.matmulTransposeOutput) {
+      auto count = callee->getAttrOfType<IntegerAttr>("hyb.matmul_rhs_packings");
+      auto swaps = callee->getAttrOfType<IntegerAttr>("hyb.matmul_output_transposes");
+      phaseReport["matmul_rhs_packing"] = json::Object{
+          {"applied", count ? count.getInt() : 0}, {"runtime_l1_packing", true},
+          {"transpose_output", swaps ? swaps.getInt() : 0}};
+    }
+    if (spec.npu.attentionFusion) {
+      json::Object counts;
+      if (auto attr = callee->getAttrOfType<DictionaryAttr>("hyb.attention_fusion"))
+        for (NamedAttribute field : attr)
+          if (auto value = dyn_cast<IntegerAttr>(field.getValue()))
+            counts[field.getName().str()] = value.getInt();
+      phaseReport["attention_fusion"] = std::move(counts);
+    }
+    if (spec.npu.flashAttention) {
+      json::Object report{{"flash_decoding", spec.npu.flashDecoding},
+          {"kv_slicing", spec.npu.flashKvSlicing},
+          {"query_tile", spec.npu.attentionQueryTile}, {"key_tile", spec.npu.attentionKeyTile},
+          {"splits", spec.npu.attentionSplits}, {"online_state", "fp32"}};
+      if (auto attr = callee->getAttrOfType<DictionaryAttr>("hyb.flash_attention"))
+        for (NamedAttribute field : attr) {
+          if (auto value = dyn_cast<IntegerAttr>(field.getValue()))
+            report[field.getName().str()] = value.getInt();
+          else if (auto value = dyn_cast<StringAttr>(field.getValue()))
+            report[field.getName().str()] = value.getValue().str();
+        }
+      phaseReport["flash_attention"] = std::move(report);
+    }
+    for (auto [enabled, key, attribute] : {
+        std::tuple{spec.npu.matrixInitElision, "matrix_init_elision", "hyb.matrix_init_elisions"},
+        std::tuple{spec.npu.gemvEpilogueFusion, "gemv_epilogue_fusion", "hyb.gemv_epilogue_fusions"}})
+      if (enabled) {
+        auto count = callee->getAttrOfType<IntegerAttr>(attribute);
+        phaseReport[key] = json::Object{{"applied", count ? count.getInt() : 0}};
+      }
+    if (spec.npu.overlapDequantGemv)
+      phaseReport["dequant_gemv_overlap"] = json::Object{{"applied_pairs", stats.overlapPairs},
+          {"mma_windows_with_chunks", stats.overlapChunks}, {"physical_storage_checked", true},
+          {"chunk_elements", spec.npu.overlapDequantChunkElements}};
+    if (spec.npu.asyncOutputStores)
+      phaseReport["async_output_stores"] = json::Object{
+          {"issued", stats.asyncOutputStores},
+          {"vector_overlap_enabled", spec.npu.asyncOutputStoreVectorOverlap},
+          {"stores_with_vector_work_before_wait", stats.outputStoresWithVectorWork},
+          {"max_outstanding_per_core", 1}, {"wait_before_block_exit", true}};
     if (auto kernel = callee->getAttrOfType<StringAttr>("hyb.npu_kernel")) {
       phaseReport["kernel"] = kernel.getValue().str();
       auto plan = callee->getAttrOfType<StringAttr>("hyb.packet_plan");

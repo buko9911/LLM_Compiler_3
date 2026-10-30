@@ -277,6 +277,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       int64_t bytes;
       SmallVector<int64_t> shape;
       uint64_t addr = 0;
+      ArrayAttr segments;
     };
     std::vector<W> weights;
     std::map<std::pair<std::string, std::string>, size_t> weightIndex;
@@ -288,7 +289,8 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       auto t = cast<ShapedType>(w.getType());
       int64_t eb = std::max<int64_t>(1, t.getElementTypeBitWidth() / 8);
       weightIndex[key] = weights.size();
-      weights.push_back({key.first, key.second, t.getNumElements() * eb, SmallVector<int64_t>(t.getShape())});
+      weights.push_back({key.first, key.second, t.getNumElements() * eb, SmallVector<int64_t>(t.getShape()),
+                         0, w->getAttrOfType<ArrayAttr>("hyb.weight_segments")});
     });
     if (fixedStorage) {
       std::set<std::string> scaleNames;
@@ -335,9 +337,40 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                                            b.getNamedAttr("bytes", b.getI64IntegerAttr(info.bytes))}));
     }
     llvm::json::Array wjson;
-    for (const W &w : weights)
-      wjson.push_back(llvm::json::Object{{"name", w.name}, {"layout", w.layout}, {"addr", int64_t(w.addr)},
-                                         {"bytes", w.bytes}, {"shape", llvm::json::Array(w.shape)}});
+    for (const W &w : weights) {
+      if (!w.segments) {
+        wjson.push_back(llvm::json::Object{{"name", w.name}, {"layout", w.layout}, {"addr", int64_t(w.addr)},
+                                           {"bytes", w.bytes}, {"shape", llvm::json::Array(w.shape)}});
+        continue;
+      }
+      // Virtual concatenation: allocate one tensor but write each checkpoint
+      // matrix into its own disjoint subrange. No runtime gather or duplicate.
+      bool scale = w.layout == "row_scale";
+      if ((scale && w.shape.size() != 1) || (!scale && (w.layout != "npu_nk32" ||
+          w.shape.size() != 3 || w.shape[2] != 32))) {
+        module.emitError("invalid fused weight layout"); return signalPassFailure();
+      }
+      uint64_t cursor = w.addr;
+      for (Attribute attr : w.segments) {
+        auto segment = dyn_cast<DictionaryAttr>(attr);
+        auto name = segment ? segment.getAs<StringAttr>("name") : StringAttr();
+        auto rows = segment ? segment.getAs<IntegerAttr>("rows") : IntegerAttr();
+        if (!name || !rows || rows.getInt() <= 0 || rows.getInt() % 32) {
+          module.emitError("invalid fused weight segment"); return signalPassFailure();
+        }
+        int64_t n = rows.getInt(), bytes = scale ? n*4 : n*w.shape[1];
+        if (uint64_t(bytes) > w.addr + w.bytes - cursor) {
+          module.emitError("fused weight segment exceeds allocation"); return signalPassFailure();
+        }
+        SmallVector<int64_t> shape = scale ? SmallVector<int64_t>{n} : SmallVector<int64_t>{n/32,w.shape[1],32};
+        wjson.push_back(llvm::json::Object{{"name", name.str()}, {"layout", w.layout}, {"addr", int64_t(cursor)},
+                                           {"bytes", bytes}, {"shape", llvm::json::Array(shape)}});
+        cursor += bytes;
+      }
+      if (cursor != w.addr + w.bytes) {
+        module.emitError("fused weight segments do not cover allocation"); return signalPassFailure();
+      }
+    }
     if (!importedStorage) {
       program.kernelRow = int64_t((npuWeightEnd + program.rowBytes() - 1) / program.rowBytes()) + 1;
     } else if (npuWeightEnd > uint64_t(program.kernelRow) * uint64_t(program.rowBytes())) {

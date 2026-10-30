@@ -17,6 +17,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "DriverImage.h"
+#include <cstdlib>
 #include "DriverPackage.h"
 #include "DriverProgram.h"
 #include "DriverStorage.h"
@@ -68,6 +69,9 @@ static cl::opt<int> pimActivationCores("pim-activation-cores",
     cl::init(1));
 static cl::opt<bool> weightPrefetch("npu-weight-prefetch",
     cl::desc("overlap streamed GEMV weight LDMA with matrix compute (false for serial A/B)"), cl::init(true));
+static cl::opt<std::string> npuPhaseSplit("npu-phase-split",
+    cl::desc("layer (default) | none: keep adjacent NPU ops in one phase; none requires --force=npu"),
+    cl::init("layer"));
 static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
     cl::desc("research PIM weight-row ping-pong: 0 off, 1 default lead 12, 2..63 lead"), cl::init(0));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
@@ -86,6 +90,11 @@ double seconds(std::chrono::steady_clock::time_point t0) {
 
 /// Combinations of the experimental PIM options that the driver supports.
 bool checkOptions(bool fixedStorage) {
+  if ((npuPhaseSplit != "layer" && npuPhaseSplit != "none") ||
+      (npuPhaseSplit == "none" && (forceTarget != "npu" || !mapOverrides.empty() || !packetNpu.empty()))) {
+    llvm::errs() << "--npu-phase-split must be layer or none; none requires --force=npu, no --map and no packet kernel\n";
+    return false;
+  }
   if ((pimActivationCores != 1 && pimActivationCores != 4) ||
       (pimActivationCores == 4 &&
        (forceTarget != "pim" || !mapOverrides.empty() || !packetNpu.empty()))) {
@@ -106,6 +115,34 @@ bool checkOptions(bool fixedStorage) {
     return false;
   }
   return true;
+}
+
+/// Keep scheduling in tensor IR, then establish storage ownership, then lower memory.
+/// In particular, CSE must not run between destination privatization and bufferization:
+/// merging those tensor.empty values would reintroduce the DRAM activation spills.
+std::string decodePipeline(const std::string &overrideOpt) {
+  const std::string tensor =
+      "hyb-annotate{manifest=" + manifestFile + "}," +
+      "func.func(hyb-simplify,canonicalize,cse,hyb-raise-linear,canonicalize,hyb-quantize,cse,hyb-fold-transpose,"
+      "canonicalize),hyb-storage-f16,";
+  const std::string placement =
+      "hyb-partition{spec=" + specFile + " report=" + outDir + "/partition.json" +
+      (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "}," +
+      "func.func(hyb-lower-npu-gemv),hyb-outline-phases{npu-split=" + npuPhaseSplit + "},canonicalize,";
+  const std::string fusion =
+      "hyb-npu-projection-fusion{spec=" + specFile + "},hyb-npu-flash-attention{spec=" + specFile + "},hyb-npu-attention-fusion{spec=" + specFile +
+      "},hyb-npu-gemv-epilogue{spec=" + specFile + "},hyb-npu-tile{spec=" + specFile +
+      "},hyb-npu-elementwise-distribute{spec=" + specFile + "},cse,canonicalize,";
+  const std::string ownership =
+      "hyb-private-phase-results,hyb-npu-activation-residency{spec=" + specFile + "},"
+      "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
+      "buffer-results-to-out-params{hoist-static-allocs},canonicalize,cse,";
+  const std::string memory =
+      "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) + "},"
+      "loop-invariant-code-motion,hyb-npu-place,hyb-npu-promote,hyb-npu-matrix-init{spec=" + specFile +
+      "},hyb-npu-matmul-layout{spec=" + specFile + "},hyb-npu-input-pipeline{spec=" + specFile + "},hyb-npu-overlap{spec=" + specFile +
+      "},hyb-npu-transfer-schedule{spec=" + specFile + "},hyb-npu-memplan{spec=" + specFile + "}";
+  return tensor + placement + fusion + ownership + memory;
 }
 
 } // namespace
@@ -158,11 +195,30 @@ int compileDecode(int argc, char **argv) {
   module->getOperation()->walk([&](Operation *op) {
     for (StringRef name : {"hyb.pim_weight_storage_requested", "hyb.pim_weight_storage_import",
                           "hyb.pim_packet_npu_requested", "hyb.npu_packet", "hyb.npu_kernel",
-                          "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan"})
+                          "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan",
+                          "hyb.overlap_id", "hyb.overlap_pairs",
+                          "hyb.input_pipeline_copy", "hyb.input_pipeline_tile",
+                          "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
+                          "hyb.transfer_scheduled", "hyb.transfer_schedule_moved",
+                          "hyb.transfer_schedule_crossed", "hyb.transfer_schedule_candidates",
+                          "hyb.transfer_schedule_owned", "hyb.schedule_origin", "hyb.schedule_barrier",
+                          "hyb.schedule_origin_count", "hyb.schedule_origin_schema",
+                          "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
+                          "hyb.elementwise_original_shape",
+                          "hyb.shared_copy_staging",
+                          "hyb.elementwise_candidates", "hyb.elementwise_small", "hyb.elementwise_unsupported",
+                          "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
+                          "hyb.matmul_rhs_pack", "hyb.matmul_rhs_packed", "hyb.matmul_rhs_packings",
+                          "hyb.matmul_transpose_output", "hyb.matmul_output_transposes", "hyb.matmul_transpose_scratch",
+                          "hyb.weight_segments", "hyb.projection_fusions",
+                          "hyb.elide_matrix_init", "hyb.matrix_init_elisions", "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions",
+                          "hyb.activation_residency_private_results", "hyb.attention_fusion",
+                          "hyb.attention_fused", "hyb.flash_attention", "hyb.flash_tile",
+                          "hyb.flash_decoding", "hyb.flash_math", "hyb.flash_merge"})
       reservedStorageAttr |= op->hasAttr(name);
   });
   if (reservedStorageAttr) {
-    llvm::errs() << "reserved PIM weight storage IR attributes are driver-owned; use the CLI with a frontend graph\n";
+    llvm::errs() << "reserved compiler IR attributes are driver-owned; use the CLI with a frontend graph\n";
     return 1;
   }
   if (fixedStorage) module->getOperation()->setAttr("hyb.pim_weight_storage_requested", UnitAttr::get(&ctx));
@@ -174,22 +230,18 @@ int compileDecode(int argc, char **argv) {
 
   std::string overrideOpt;
   for (const std::string &m : mapOverrides) overrideOpt += (overrideOpt.empty() ? " overrides=" : ";") + m;
-  std::string pipeline =
-      "hyb-annotate{manifest=" + manifestFile + "}," +
-      "func.func(hyb-simplify,canonicalize,cse,hyb-raise-linear,canonicalize,hyb-quantize,cse,hyb-fold-transpose,"
-      "canonicalize),hyb-storage-f16,func.func(hyb-group-linear),hyb-partition{spec=" + specFile + " report=" +
-      outDir + "/partition.json" + (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "}," +
-      "func.func(hyb-lower-npu-gemv),hyb-outline-phases,canonicalize,hyb-npu-tile{spec=" + specFile + "},cse,canonicalize,"
-      "hyb-private-phase-results,"
-      "one-shot-bufferize{bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map},"
-      "buffer-results-to-out-params{hoist-static-allocs},canonicalize,cse,hyb-plan-lp6{spec=" + specFile +
-      " bankset-pingpong=" + std::to_string(banksetPingPong) + "},"
-      "loop-invariant-code-motion,hyb-npu-place,hyb-npu-promote,hyb-npu-memplan{spec=" + specFile + "}";
+  std::string pipeline = decodePipeline(overrideOpt);
   PassManager pm(&ctx);
   if (failed(parsePassPipeline(pipeline, pm, llvm::errs()))) return 1;
   if (failed(pm.run(*module))) {
     llvm::errs() << "pipeline failed\n";
     return 1;
+  }
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(outDir + "/pipeline.txt", ec);
+    if (ec) { llvm::errs() << ec.message() << '\n'; return 1; }
+    os << "builtin.module(" << pipeline << ")\n";
   }
   {
     std::error_code ec;
@@ -236,6 +288,7 @@ int compileDecode(int argc, char **argv) {
 
   // ---- NPU / PIM phases in program order, one program --------------------------------------
   plena::ProgramBuilder program;
+  program.traceOperations = std::getenv("HYBRID_PROFILE_OPERATIONS") != nullptr;
   driver::setPimKernel(program, prog, fixedStorage, pimCommandCount);
   std::vector<int> exit;           // records the next phase follows
   int logicalCores = 1;

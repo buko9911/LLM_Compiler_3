@@ -5,8 +5,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include <algorithm>
+#include <functional>
 #include <set>
 
 namespace mlir::hybrid::codegen {
@@ -67,10 +69,11 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
     runElems *= d.shape[dim];
     ++inner;
   }
-  if (inner == 0) {
-    err = "copy without a contiguous innermost dim";
-    return failure();
-  }
+  // A one-column tail can lose its unit innermost dimension above, leaving
+  // a strided vector (for example K[:, 64:65] from a 65-column matrix).
+  // One scalar is still a contiguous DMA row. With inner == 0 the existing
+  // 2-D lowering uses runElems=1, rows=last_dim and each side's real stride.
+  // This copies exactly the requested elements, including the gather cost.
   uint32_t runBytes = uint32_t(runElems * d.eb);
   if (auto it = streamSlot.find(op); it != streamSlot.end()) {
     if (inner != rank || d.space != kL1) {
@@ -100,31 +103,91 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
     err = terr;
     return failure();
   }
+  if (in.spec->npu.stagingEarlyRelease && s.space == kLP6 && d.space == kL1) {
+    // A normal buffer-copy boundary has no live vector/scalar/SA value: other
+    // lowerings store their results to L1 before returning. Never place this
+    // cut inside a reduction, row loop, or event-1 weight prefetch. The stream,
+    // prefetched, and PIM paths above return before reaching this point.
+    // Register L2 reads against this load-only completion, so future GDMA
+    // overwrites need not wait for unrelated compute in the next block.
+    flush();
+    ++stagingReleaseCuts;
+  }
   return success();
 }
 
 // ---- compute ops ----------------------------------------------------------------------------
-std::pair<uint64_t, uint64_t> Codegen::rangeOf(const View &v, uint64_t base) {
-  int64_t lastOff = 0;
-  for (size_t i = 0; i < v.shape.size(); ++i) lastOff += (v.shape[i] - 1) * v.strides[i];
-  return {base, base + uint64_t((lastOff + 1) * v.eb)};
-}
-
 bool Codegen::isMatmulInit(Operation *user, Value out) {
-  if (isa<linalg::MatmulOp, linalg::BatchMatmulOp>(user) || user->hasAttr("hyb.npu_gemv"))
-    return cast<linalg::LinalgOp>(user).getDpsInits()[0] == out;
-  return false;
+  if (!isa<linalg::MatmulOp, linalg::BatchMatmulOp>(user) && !user->hasAttr("hyb.npu_gemv")) return false;
+  auto matrix = dyn_cast<linalg::LinalgOp>(user);
+  // INIT replaces the accumulator, but it does not initialize matrix inputs.
+  // When the destination is also an input, that read needs the actual zero
+  // bytes. Aliases reached through views already prevent fill elision because
+  // the view itself is a non-matrix user of the filled buffer.
+  return matrix && matrix.getNumDpsInits() == 1 && matrix.getDpsInits()[0] == out &&
+         llvm::none_of(matrix.getDpsInputs(), [&](Value input) { return input == out; });
 }
 
-LogicalResult Codegen::checkZeroInit(const View &c, std::string &err) {
-  auto r = rangeOf(c, addr(c));
-  auto it = zeroed.find(r);
-  if (it == zeroed.end()) {
-    err = "matmul accumulator must be zero-filled right before (the SA overwrites it)";
-    return failure();
-  }
-  zeroed.erase(it);
-  return success();
+LogicalResult Codegen::checkZeroInit(linalg::LinalgOp operation, std::string &err) {
+  // CSE may hoist a zero-filled tensor and bufferization then copies that
+  // template into each matrix destination. Prove the logical initialization
+  // through those copies instead of remembering physical address ranges:
+  // addresses can be recycled and a later write can invalidate such a record.
+  auto rootOf = [&](Value value) {
+    while (Operation *op = value.getDefiningOp()) {
+      if (!isViewOp(op)) break;
+      value = op->getOperand(0);
+    }
+    return value;
+  };
+  std::function<bool(Operation *, Value)> writes = [&](Operation *op, Value root) {
+    if (isViewOp(op) || isa<memref::AllocOp>(op)) return false;
+    if (auto copy = dyn_cast<memref::CopyOp>(op)) return rootOf(copy.getTarget()) == root;
+    if (auto dps = dyn_cast<DestinationStyleOpInterface>(op))
+      return llvm::any_of(dps.getDpsInits(), [&](Value value) { return rootOf(value) == root; });
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (Operation &nested : block)
+          if (writes(&nested, root)) return true;
+    // Unknown consumers of this allocation are potential writes. In
+    // particular, never infer zero across an opaque call or deallocation.
+    return llvm::any_of(op->getOperands(), [&](Value value) {
+      return isa<MemRefType>(value.getType()) && rootOf(value) == root;
+    });
+  };
+  std::function<bool(Value, Operation *, unsigned)> zeroBefore =
+      [&](Value value, Operation *before, unsigned depth) {
+    if (!depth) return false;
+    Value root = rootOf(value);
+    if (!root.getDefiningOp<memref::AllocOp>()) return false;
+    for (;;) {
+      for (Operation *previous = before->getPrevNode(); previous; previous = previous->getPrevNode()) {
+        if (previous == root.getDefiningOp()) return false;
+        if (!writes(previous, root)) continue;
+        if (auto fill = dyn_cast<linalg::FillOp>(previous)) {
+          Value destination = fill.getOutputs()[0];
+          return (destination == value || destination == root) &&
+                 constValue(fill.getInputs()[0]) == std::optional<double>(0.0);
+        }
+        if (auto copy = dyn_cast<memref::CopyOp>(previous)) {
+          Value destination = copy.getTarget();
+          return (destination == value || destination == root) &&
+                 zeroBefore(copy.getSource(), copy, depth - 1);
+        }
+        return false;
+      }
+      Operation *parent = before->getParentOp();
+      if (!isa<scf::ForOp, scf::ForallOp>(parent)) return false;
+      // Crossing a loop boundary is valid only for an invariant zero
+      // template. A write later in the loop may precede this read on its next
+      // iteration (or on another parallel worker).
+      if (writes(parent, root)) return false;
+      before = parent;
+    }
+  };
+  if (zeroBefore(operation.getDpsInits()[0], operation, 32)) return success();
+  err = "matmul accumulator requires a proven zero fill or zero-template copy without intervening writes";
+  return failure();
 }
 
 LogicalResult Codegen::lowerFill(linalg::FillOp f, std::string &err) {
@@ -136,10 +199,16 @@ LogicalResult Codegen::lowerFill(linalg::FillOp f, std::string &err) {
   }
   FailureOr<View> v = viewOf(out, err);
   if (failed(v)) return failure();
-  if (*c == 0.0 && llvm::any_of(out.getUsers(), [&](Operation *u) { return isMatmulInit(u, out); })) {
-    zeroed.insert(rangeOf(*v, addr(*v)));
-    return success();
-  }
+  // hyb-npu-matrix-init proves that the first consumer fully replaces this
+  // private destination with an ISA INIT. The logical fill remains in IR so
+  // checkZeroInit and later memory planning retain the arithmetic contract.
+  if (f->hasAttr("hyb.elide_matrix_init")) return success();
+  // A shared zero template may also initialize online state through copies.
+  // Those reads need real bytes, even if one later matrix uses the template
+  // directly. Only an exclusively matrix-init fill can be elided.
+  if (*c == 0.0 && llvm::all_of(out.getUsers(), [&](Operation *u) {
+        return u == f.getOperation() || isMatmulInit(u, out);
+      })) return success();
   int dt = dtypeOf(v->et);
   int64_t slot = vectorConst(*c, dt);
   uint32_t loadF = dt == DT_F16 ? 1 : dt == DT_F32 ? 3 : dt == DT_I8 ? 5 : 7;
@@ -177,7 +246,7 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
     err = "matmul operands must be f16";
     return failure();
   }
-  if (failed(checkZeroInit(*C, err))) return failure();
+  if (failed(checkZeroInit(mm, err))) return failure();
   auto maps = mm.getIndexingMapsArray();
   int nb = batched ? 1 : 0;
   AffineMap bm = maps[1];
@@ -201,8 +270,8 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
           int64_t mm_ = std::min<int64_t>(32, M - m0), nn = std::min<int64_t>(32, N - n0);
           load(7, uint32_t(addr(*B, bo + n0)));
           load(8, uint32_t(addr(*A, ao + m0 * A->strides[nb])));
-          rec(matrixLoad(7, uint32_t(K), uint32_t(nn), uint32_t(bRow), 3));
-          rec(matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(aRow), 7));
+          matrixInputs(matrixLoad(7, uint32_t(K), uint32_t(nn), uint32_t(bRow), 3),
+                       matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(aRow), 7));
           mma(K, 3);
           load(9, uint32_t(addr(*C, co + m0 * C->strides[nb] + n0)));
           rec(matrixWriteout(9, uint32_t(mm_), uint32_t(nn), uint32_t(cRow), woF));
@@ -214,8 +283,8 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
           int64_t nn = std::min<int64_t>(32, N - n0);
           load(7, uint32_t(addr(*A, ao + m * A->strides[nb])));
           load(8, uint32_t(addr(*B, bo + n0 * B->strides[nb])));
-          rec(matrixLoad(7, uint32_t(K), 1, 2, 3));
-          rec(matrixLoad(8, uint32_t(nn), uint32_t(K), uint32_t(bRow), 7));
+          matrixInputs(matrixLoad(7, uint32_t(K), 1, 2, 3),
+                       matrixLoad(8, uint32_t(nn), uint32_t(K), uint32_t(bRow), 7));
           mma(K, 3);
           load(9, uint32_t(addr(*C, co + m * C->strides[nb] + n0)));
           rec(matrixWriteout(9, uint32_t(nn), 1, uint32_t(C->eb), woF));
@@ -236,19 +305,32 @@ LogicalResult Codegen::lowerGemv(linalg::GenericOp g, std::string &err) {
     err = "GEMV operands not in the MMA layout";
     return failure();
   }
-  if (failed(checkZeroInit(*C, err))) return failure();
+  if (failed(checkZeroInit(g, err))) return failure();
   for (int64_t j = 0; j < NB; ++j)
     for (int64_t m0 = 0; m0 < M; m0 += 32) {
       int64_t mm_ = std::min<int64_t>(32, M - m0);
       load(7, uint32_t(addr(*W, j * W->strides[0])));
       load(8, uint32_t(addr(*Q, m0 * Q->strides[0])));
-      rec(matrixLoad(7, uint32_t(K), 32, 32, 1));
-      rec(matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(Q->strides[0]), 5));
+      matrixInputs(matrixLoad(7, uint32_t(K), 32, 32, 1),
+                   matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(Q->strides[0]), 5));
       mma(K, 1);
-      if (nextWeight && nextWeight->gemv == g.getOperation() && j + 1 == NB && m0 + 32 >= M) {
+      // weightPipeline proved that the next ping/pong slot is disjoint from
+      // every current weight, activation and accumulator access. Issue after
+      // the first MMA, not the last: multi-column/multi-row tiles can hide the
+      // next transfer under all their remaining MMAs. Event 1 is retired by
+      // the loop consumer before the next iteration reuses it.
+      if (nextWeight && nextWeight->gemv == g.getOperation() && j == 0 && m0 == 0) {
         const auto p = *nextWeight;
         prefetchWeight(p.l1, p.l2, p.bytes);
         nextWeight.reset();
+      }
+      // Preserve the weight prefetch issue point; vector instructions must not
+      // delay the next tile's DMA merely to fill the current MMA window.
+      if (deferredDequant) {
+        int64_t before = deferredDequantCursor;
+        if (failed(emitDequantChunk(deferredDequant, deferredDequantCursor,
+                                   in.spec->npu.overlapDequantChunkElements, err))) return failure();
+        if (deferredDequantCursor > before) ++overlapChunks;
       }
       load(9, uint32_t(addr(*C, m0 * C->strides[0] + j * C->strides[1])));
       rec(matrixWriteout(9, uint32_t(mm_), 32, uint32_t(C->strides[0] * 4), 2));
@@ -309,19 +391,33 @@ void Codegen::reduceToScalar(uint64_t src, int64_t elements, uint32_t funct, uin
 }
 
 LogicalResult Codegen::lowerDequant(hyb::DequantOp d, std::string &err) {
+  int64_t cursor = 0;
+  return emitDequantChunk(d, cursor, INT64_MAX, err);
+}
+
+LogicalResult Codegen::emitDequantChunk(hyb::DequantOp d, int64_t &cursor, int64_t budget, std::string &err) {
+  // Deferred dequant chunks may be emitted inside another operation's MMA.
+  // Attribute their instructions to the dequant, without changing scheduling.
+  int previousSource = w.currentSource;
+  if (w.traceOperations) w.currentSource = sourceIds.lookup(d.getOperation());
+  auto restoreSource = llvm::scope_exit([&] { w.currentSource = previousSource; });
   FailureOr<View> A = viewOf(d.getAcc(), err), S = viewOf(d.getScale(), err), B = viewOf(d.getWscale(), err),
                   Y = viewOf(d.getInit(), err);
   if (failed(A) || failed(S) || failed(B) || failed(Y)) return failure();
   int64_t M = Y->shape[0], N = Y->shape[1];
-  for (int64_t m = 0; m < M; ++m) {
+  int64_t remaining = std::min(budget, M * N - cursor);
+  while (remaining > 0) {
+    int64_t m = cursor / N, first = cursor % N;
     sload(0, addr(*S, m * S->strides[0]));
     uint64_t src = addr(*A, m * A->strides[0]), dst = addr(*Y, m * Y->strides[0]);
-    for (int64_t s = 0; s < N; s += 16) {
-      setVL(uint32_t(std::min<int64_t>(16, N - s)));
+    for (int64_t s = first; s < N && remaining > 0;) {
+      int64_t count = std::min({int64_t(16), N - s, remaining});
+      setVL(uint32_t(count));
       vload(0, src + s * 4, 7);
       vload(1, addr(*B, s), 3);
       emit(rform(OP_V_CONV, 2, 0, 0, 1, 3));        // V_DEQUANT_I32_F16 v2 = v0 * s0 * v1
       vstore(dst + s * 2, 2, 2);
+      s += count; cursor += count; remaining -= count;
     }
   }
   return success();

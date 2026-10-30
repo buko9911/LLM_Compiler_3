@@ -24,6 +24,9 @@
 
 #include "CodegenImpl.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/AsmState.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/FormatVariadic.h"
 #include <cstring>
 
 using namespace mlir;
@@ -121,7 +124,14 @@ void Codegen::collectConstants(func::FuncOp fn) {
     if (auto g = dyn_cast<linalg::GenericOp>(op))
       g.getRegion().walk([&](Operation *b) {
         for (Value o : b->getOperands())
-          if (auto c = constValue(o)) scalarConst(float(*c));
+          if (auto c = constValue(o)) {
+            scalarConst(float(*c));
+            // Online attention uses the existing typed vector ISA. Constants
+            // have their actual element type; legacy generics keep the old
+            // pool and emitted program byte-for-byte.
+            if (g->hasAttr("hyb.flash_math"))
+              vectorConst(*c, o.getType().isInteger(1) ? DT_I8 : dtypeOf(o.getType()));
+          }
       });
     if (auto f = dyn_cast<linalg::FillOp>(op))
       if (auto c = constValue(f.getInputs()[0]))
@@ -134,6 +144,26 @@ void Codegen::collectConstants(func::FuncOp fn) {
 
 LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   func::FuncOp fn = func::FuncOp(in.phase);
+  if (w.traceOperations) {
+    AsmState state(fn, OpPrintingFlags().skipRegions());
+    fn.walk([&](Operation *op) {
+      if (op->hasTrait<OpTrait::IsTerminator>() || isPure(*op) || op == fn.getOperation()) return;
+      int id = int(w.sourceOperations.size());
+      sourceIds[op] = id;
+      std::string text, body;
+      llvm::raw_string_ostream os(text);
+      op->print(os, state);
+      for (Region &region : op->getRegions())
+        for (Block &block : region)
+          for (Operation &nested : block) body += nested.getName().getStringRef().str() + " ";
+      llvm::json::Object origin{
+          {"id", id}, {"phase", fn.getSymName().str()}, {"op", op->getName().getStringRef().str()},
+          {"ir", text}, {"body_ops", body}};
+      if (auto stable = op->getAttrOfType<IntegerAttr>("hyb.schedule_origin"))
+        origin["schedule_origin"] = stable.getInt();
+      w.sourceOperations.push_back(llvm::formatv("{0}", llvm::json::Value(std::move(origin))).str());
+    });
+  }
   if (failed(planParallelActivationFeed(fn, err))) return failure();
   cores = parallelActivationFeed ? 4 : 1;
   fn.walk([&](scf::ForallOp f) {
@@ -170,6 +200,15 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   stats.cores = cores;
   stats.l2StagingPerCore = window();
   stats.weightStreams = std::move(weightStreams);
+  stats.overlapPairs = overlapPairs;
+  stats.overlapChunks = overlapChunks;
+  stats.asyncOutputStores = asyncOutputStores;
+  stats.outputStoresWithVectorWork = outputStoresWithVectorWork;
+  stats.stagingReleaseCuts = stagingReleaseCuts;
+  stats.vectorScalarReciprocals = vectorScalarReciprocals;
+  stats.vectorScalarReuses = vectorScalarReuses;
+  stats.vectorPipelineGroups = vectorPipelineGroups;
+  stats.vectorPipelinedChunks = vectorPipelinedChunks;
   if (parallelActivationFeed) {
     stats.pimActivationCores = 4;
     stats.pimActivationPlanJson = parallelActivationPlanJSON();

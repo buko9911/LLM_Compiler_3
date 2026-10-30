@@ -15,10 +15,48 @@ LP6의 NPU/PIM 통합 컴파일러다. `main`의 Attention·VPU 스케줄링을 
 양자화 projection 그룹**을 PIM에 배치하며 attention·normalization·양자화/역양자화와 경계
 전송은 NPU에 남는다. 옵션을 생략하면 기존 비용 모델이 선택한다.
 
+NPU-only의 activation residency와 attention producer fusion은
+[`NPU_DECODE_PASSES.md`](../../docs/architecture/NPU_DECODE_PASSES.md)에 pass 순서·메모리 계약·확장 방법을 정리했다.
+`npu.activation_residency`, `npu.attention_fusion`은 각각 독립적으로 선택한다(기본 false).
+`npu.projection_fusion`은 QKV/Gate-Up을 실제로 하나의 contraction으로 합친다.
+`npu.weight_stream_early_release`는 기존 완료 이벤트로 L2 weight 슬롯을 먼저 반환한다.
+둘 다 기본 false이며 측정한 NPU-only 설정에서 선택한다.
+[수치 계약·배치·pass 정리](../../docs/architecture/NPU_PROJECTION_FUSION.md),
+[A/B 결과와 전체·op별 타임라인](../../research/npu_projection_audit/README.md).
+기존 `hyb-group-linear`의 그룹 식별은 `hyb-partition`으로 통합했다.
+`npu.matrix_init_elision`과 `npu.gemv_epilogue_fusion`은 각각 불필요한 VPU zero-store와
+GEMV INT32 결과의 L2 왕복을 줄인다. 두 옵션도 기본 false이며 shape별로 검증해 사용한다.
+pass의 안전 조건, prefetch 유지, staging 슬롯 선택 및 재현 방법은
+[`NPU_GEMV_SCHEDULE.md`](../../docs/architecture/NPU_GEMV_SCHEDULE.md)에 있다.
+`npu.async_output_stores`는 확정된 L1 주소를 검사해 출력 저장과 독립 VPU 작업을
+겹치는 codegen 스케줄링 옵션이다(기본 false). 같은 비동기 전송 직후 기다리는
+`npu.async_output_store_vector_overlap=false` 대조군으로 전송 경로의 효과와 중첩 효과를 구분한다.
+Decode의 online FlashAttention/Flash-Decoding은 별도 `hyb-npu-flash-attention` pass다.
+`npu.flash_attention`, `npu.flash_decoding`, query/key tile 및 split 설정과
+FP32 상태·FP16 SA operand의 수치 계약은
+[`NPU_FLASH_ATTENTION.md`](../../docs/architecture/NPU_FLASH_ATTENTION.md)에 정리했다.
+기존 materialized FP16 softmax와 byte 동일성을 전제로 켜지 않는다.
+`--npu-phase-split=none`은 명시적 `--force=npu`에서 phase 결합을 시험하며 SRAM/scoreboard 검사를 유지한다.
+실제 pipeline은 생성물의 `pipeline.txt`, 변환 수는 `io.json.phases`에서 확인한다.
+
 모든 경로는 `lib/Target/ISAv2.cpp`의 검증되는 ISA v2 인코더와 PIM primitive 인코딩을 공유한다.
 기존 `IsaV2.h`는 호환 include다. Decode의 explicit KV·메모리 공간·PIM scatter/gather 계약은
 graph와 달라 전용 NPU lowering을 유지한다. 따라서 main의 row scheduler를 모든 decode
 연산에 적용한 것은 아니다. Graph-hybrid의 NPU phase에는 새 NPU pass들을 적용한다.
+
+Decode의 SA/VPU overlap 후보는 target JSON의 `npu.overlap_dequant_gemv=true`로 활성화한다
+(기본 false). `hyb-npu-overlap`은 promote 뒤, memory planning 전에 독립적인 standalone
+L1 dequant와 뒤따르는 GEMV forall을 찾는다. 입력 복사는 원래 위치에 두고 네 operand의
+수명을 forall 전체로 늘린 뒤, home core의 MMA/writeout 사이에 dequant를 발행한다.
+`npu.overlap_dequant_chunk_elements`는 한 MMA 구간에 발행할 원소 수다. 기본값은 128이며
+16~1024 범위의 16 배수만 허용한다. 다음 weight의 prefetch를 발행한 뒤 chunk를 배치한다.
+남은 원소는 core join 전에 완료한다. 실제 물리 buffer가 겹치면 codegen이 거부한다.
+의존성이 있거나 분산 dequant/알 수 없는 연산인 경우 기존 순서를 유지한다. Q normalization과
+attention row pipeline까지 포괄하는 범용 scheduler는 아니다.
+`compiled.mlir`의 `hyb.overlap_pairs`는 pass 후보 수이고, `io.json.phases[].dequant_gemv_overlap`의
+`applied_pairs`·`mma_windows_with_chunks`가 실제 codegen 적용 수다. 실행 시간 개선과는 별개이므로
+출력 일치와 SA/VPU 타임라인을 함께 확인해야 한다. `test/Decode/npu_overlap.py`는 의존성 거부,
+출력 첫 사용을 포함한 수명 분리, SRAM 초과를 검사한다.
 
 ```sh
 # NPU prefill: python/npu/capture가 캡처한 tensor/linalg 그래프
@@ -541,3 +579,11 @@ ctest --test-dir build-target --output-on-failure
 ```
 
 LLVM/MLIR 패키지를 찾지 않으며 Target, Analysis, npu-asm과 단위 테스트만 빌드한다.
+
+공통 입력 DMA scheduling의 주소 의존성 규칙, 의미 변환 pass와의 구분 및 검증 결과는 [NPU_INPUT_SCHEDULING.md](../../docs/architecture/NPU_INPUT_SCHEDULING.md)를 참조한다.
+
+고정 형상 NPU-only 비교용 검증 설정은 [configs/baselines](configs/baselines/README.md)에 있다. 공통 input-copy pipeline 및 transpose-B layout pass의 지원 조건과 실행 순서는 [NPU_LAYER_SCHEDULING.md](../../docs/architecture/NPU_LAYER_SCHEDULING.md), 측정·선정 근거는 [레이어 baseline 보고서](../../research/npu_layer_baseline_audit/README.md)를 참조한다.
+
+후속 공통 의존성 처리에서는 buffer effect/alias에 따른 copy 재배치, 안전한 L2 staging 반환 경계, ISA 주소 범위에 따른 DMA·matrix 대기를 분리했다. 해당 측정과 모든 L2 명령 의존성을 자동 검사하는 도구는 [공통 의존성 실험 보고서](../../research/npu_dependency_schedule_audit/README.md)에 있다. 안전한 재배치가 항상 성능 이득을 보장하지 않으므로 회귀 후보도 함께 보존한다.
+
+현재 preset은 [VPU 스케줄링 비교](../../research/npu_vpu_schedule_audit/README.md)에 이어 [공통 command·주소 의존성 감사](../../research/npu_command_schedule_audit/README.md)까지 반영한 설정이다. M8은 `npu.command_schedule`을 활성화하고 M1은 기존 설정을 유지한다. 이 옵션은 실제 2D GDMA 범위, phase 전체의 명령 DAG 정렬과 증명된 중복 edge 제거를 담당한다. 큰 tile의 다음 weight prefetch는 공통 backend에서 첫 MMA 뒤로 앞당긴다. 기존 FP16 lowering 수치 계약과 하드웨어 용량은 유지한다. 전체/op별 HTML, 느려져서 채택하지 않은 후보, 남은 prefetch gate와 재현 명령도 보고서에 있다.

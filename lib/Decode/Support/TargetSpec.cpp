@@ -21,6 +21,10 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     return failure();
   }
   llvm::json::Object *root = parsed->getAsObject();
+  if (!root) {
+    error = "target spec must be a JSON object";
+    return failure();
+  }
   auto num = [](llvm::json::Object *o, llvm::StringRef k, auto &dst) {
     if (!o) return;
     if (auto v = o->getNumber(k)) dst = static_cast<std::remove_reference_t<decltype(dst)>>(*v);
@@ -43,6 +47,94 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   if (n)
     if (auto v = n->getBoolean("weight_prefetch_cross_batch")) s.npu.weightPrefetchCrossBatch = *v;
   num(n, "gemv_tile_bytes", s.npu.gemvTileBytes); num(n, "completion_event_slots", s.npu.completionEventSlots); num(n, "distribute_min_elements", s.npu.distributeMinElements);
+  num(n, "dequant_min_elements", s.npu.dequantMinElements);
+  auto booleanOption = [&](llvm::StringRef key, bool &dst) {
+    if (!n || !n->get(key)) return true;
+    auto value = n->getBoolean(key);
+    if (!value) {
+      error = ("npu." + key + " must be a boolean").str();
+      return false;
+    }
+    dst = *value;
+    return true;
+  };
+  if (!booleanOption("activation_residency", s.npu.activationResidency) ||
+      !booleanOption("attention_fusion", s.npu.attentionFusion) ||
+      !booleanOption("gemv_epilogue_fusion", s.npu.gemvEpilogueFusion) ||
+      !booleanOption("projection_fusion", s.npu.projectionFusion) ||
+      !booleanOption("weight_stream_early_release", s.npu.weightStreamEarlyRelease) ||
+      !booleanOption("matrix_init_elision", s.npu.matrixInitElision) ||
+      !booleanOption("async_output_stores", s.npu.asyncOutputStores) ||
+      !booleanOption("async_input_loads", s.npu.asyncInputLoads) ||
+      !booleanOption("transfer_schedule", s.npu.transferSchedule) ||
+      !booleanOption("staging_early_release", s.npu.stagingEarlyRelease) ||
+      !booleanOption("memory_dependency_schedule", s.npu.memoryDependencySchedule) ||
+      !booleanOption("command_schedule", s.npu.commandSchedule) ||
+      !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
+      !booleanOption("vector_scalar_reuse", s.npu.vectorScalarReuse) ||
+      !booleanOption("vector_chunk_pipeline", s.npu.vectorChunkPipeline) ||
+      !booleanOption("input_tile_pipeline", s.npu.inputTilePipeline) ||
+      !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
+      !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
+      !booleanOption("async_input_load_overlap", s.npu.asyncInputLoadOverlap) ||
+      !booleanOption("weight_prefetch_compute_first", s.npu.weightPrefetchComputeFirst) ||
+      !booleanOption("async_output_store_vector_overlap", s.npu.asyncOutputStoreVectorOverlap) ||
+      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots) ||
+      !booleanOption("flash_attention", s.npu.flashAttention) ||
+      !booleanOption("flash_decoding", s.npu.flashDecoding) ||
+      !booleanOption("flash_kv_slicing", s.npu.flashKvSlicing))
+    return failure();
+  if (n && n->get("gdma_lookahead")) {
+    auto value = n->getInteger("gdma_lookahead");
+    if (!value || *value < 0 || *value > 1024) {
+      error = "npu.gdma_lookahead must be an integer in [0, 1024]";
+      return failure();
+    }
+    s.npu.gdmaLookahead = *value;
+  }
+  auto positiveIntegerOption = [&](llvm::StringRef key, int64_t &dst) {
+    if (!n || !n->get(key)) return true;
+    auto value = n->getInteger(key);
+    if (!value || *value <= 0 || *value > INT32_MAX) {
+      error = ("npu." + key + " must be a positive 32-bit integer").str();
+      return false;
+    }
+    dst = *value;
+    return true;
+  };
+  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns) ||
+      !positiveIntegerOption("attention_query_tile", s.npu.attentionQueryTile) ||
+      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile) ||
+      !positiveIntegerOption("attention_splits", s.npu.attentionSplits))
+    return failure();
+  if (s.npu.flashDecoding && (!s.npu.flashAttention || s.npu.attentionSplits < 2 ||
+                            s.npu.attentionSplits > s.npu.cores)) {
+    error = "npu.flash_decoding requires flash_attention and attention_splits in [2, cores]";
+    return failure();
+  }
+  if (!s.npu.flashDecoding && s.npu.attentionSplits != 1) {
+    error = "npu.attention_splits must be 1 when flash_decoding is disabled";
+    return failure();
+  }
+  if (s.npu.flashKvSlicing && !s.npu.flashAttention) {
+    error = "npu.flash_kv_slicing requires flash_attention";
+    return failure();
+  }
+  if (n)
+    if (auto v = n->getBoolean("overlap_dequant_gemv")) s.npu.overlapDequantGemv = *v;
+  if (n)
+    if (auto *v = n->get("overlap_dequant_chunk_elements")) {
+      auto elements = v->getAsInteger();
+      if (!elements || *elements < 16 || *elements > 1024 || *elements % 16) {
+        error = "npu.overlap_dequant_chunk_elements must be an integer multiple of 16 in [16, 1024]";
+        return failure();
+      }
+      s.npu.overlapDequantChunkElements = *elements;
+    }
+  if (s.npu.dequantMinElements < 0) {
+    error = "npu.dequant_min_elements must be nonnegative (0 inherits distribute_min_elements)";
+    return failure();
+  }
   if (llvm::json::Object *m = root->getObject("mapping")) {
     if (auto p = m->getString("policy")) s.mapping.policy = p->str();
     if (llvm::json::Object *o = m->getObject("overrides"))
@@ -55,10 +147,9 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.npu.cores <= 0 || s.npu.l2Bytes < 64 || s.npu.l2StagingPerCore < 0 ||
       s.npu.l2StagingPerCore % 64 || s.npu.l2StagingPerCore > s.npu.l2Bytes / s.npu.cores ||
-      s.npu.weightStreamMaxSlots < 0 || s.npu.weightPrefetchBatchTiles < 0 ||
-      s.npu.weightPrefetchBatchTiles == 1) {
+      s.npu.weightStreamMaxSlots < 0 || s.npu.weightPrefetchBatchTiles < 0) {
     error = "invalid NPU staging policy: positive cores/L2, staging=0 (auto) or a fitting 64-byte-aligned window, "
-            "nonnegative ring cap, batch tiles=0 (auto) or >=2 required";
+            "nonnegative ring cap and batch tiles (0 selects auto) required";
     return failure();
   }
   return s;

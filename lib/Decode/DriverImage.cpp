@@ -142,7 +142,8 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
   // per-row INT8 quantization of the checkpoint tensor.
   struct NpuWeight {
     std::string layout;
-    uint64_t addr;
+    uint64_t addr, bytes;
+    std::vector<int64_t> shape;
   };
   std::map<std::string, std::vector<NpuWeight>> npuWeights;
   std::map<std::string, std::pair<uint64_t, uint64_t>> scaleSlots;
@@ -150,8 +151,11 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
     if (auto wj = json::parse(wa.getValue()))
       for (const json::Value &v : *wj->getAsArray()) {
         const json::Object *o = v.getAsObject();
+        std::vector<int64_t> shape;
+        for (const auto &d : *o->getArray("shape")) shape.push_back(*d.getAsInteger());
         npuWeights[o->getString("name")->str()].push_back(
-            {o->getString("layout")->str(), uint64_t(*o->getInteger("addr"))});
+            {o->getString("layout")->str(), uint64_t(*o->getInteger("addr")),
+             uint64_t(*o->getInteger("bytes")),std::move(shape)});
         if (fixedStorage && o->getString("layout") == "row_scale")
           scaleSlots[o->getString("name")->str()] = {uint64_t(*o->getInteger("addr")), uint64_t(*o->getInteger("bytes"))};
       }
@@ -190,6 +194,8 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
     if (auto it = npuWeights.find(names[i]); it != npuWeights.end())
       for (const NpuWeight &nw : it->second) {
         if (nw.layout == "row_scale") {
+          if (nw.bytes != uint64_t(n)*4 || nw.shape != std::vector<int64_t>{n})
+            return fail("row_scale shape mismatch: " + names[i]);
           img.write(nw.addr, s.data(), s.size() * 4);
           if (storageWeight) {
             ::npu::decode::PimStorageDigest h;
@@ -199,6 +205,8 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
           }
         } else if (nw.layout == "npu_nk32") {
           if (n % 32) return fail("npu_nk32 needs N % 32 == 0: " + names[i]);
+          if (nw.bytes != uint64_t(n)*k || nw.shape != std::vector<int64_t>{n/32,k,32})
+            return fail("npu_nk32 shape mismatch: " + names[i]);
           // Block j = rows 32j..32j+31 as the [K, 32] MMA weight tile: T[k][c] = q[32j + c][k].
           std::vector<int8_t> blk(size_t(k * 32));
           for (int64_t j = 0; j < n / 32; ++j) {

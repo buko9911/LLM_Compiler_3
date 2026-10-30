@@ -2,6 +2,7 @@
 #include "npu/Target/IsaV2.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
@@ -53,12 +54,14 @@ void ProgramBuilder::ensureSegment() {
 void ProgramBuilder::append(uint32_t word) {
   ensureSegment();
   cur.push_back(word);
+  if (traceOperations) curSources.resize(cur.size(), currentSource);
   track(word);
 }
 
 void ProgramBuilder::appendRecord(const std::array<uint32_t, 4> &words) {
   ensureSegment();
   cur.insert(cur.end(), words.begin(), words.end());
+  if (traceOperations) curSources.resize(cur.size(), currentSource);
 }
 
 int ProgramBuilder::push(Command c) {
@@ -77,6 +80,7 @@ int ProgramBuilder::push(Command c) {
     c.deps = std::move(joined);
   }
   c.phase = phase;
+  c.source = currentSource;
   cmds.push_back(std::move(c));
   return int(cmds.size()) - 1;
 }
@@ -90,6 +94,11 @@ int ProgramBuilder::flushBlock(bool updateFrontier) {
   c.isaStart = int64_t(isa.size());
   c.isaCount = int64_t(cur.size());
   isa.insert(isa.end(), cur.begin(), cur.end());
+  if (traceOperations) {
+    assert(curSources.size() == cur.size());
+    isaSources.insert(isaSources.end(), curSources.begin(), curSources.end());
+    curSources.clear();
+  }
   cur.clear();
   int id = push(std::move(c));
   segDeps.reset();
@@ -108,12 +117,14 @@ void ProgramBuilder::beginPhase(const std::string &name, std::vector<int> entry)
   phaseNames.push_back(name);
   phase = int(phaseNames.size()) - 1;
   phaseStart = cmds.size();
+  phaseGdmas.clear();
   base = entry;
   frontier = std::move(entry);
 }
 
 std::vector<int> ProgramBuilder::endPhase() {
   flushBlock();
+  lastSchedule = {};
   size_t end = cmds.size();
   if (end == phaseStart) return base;
   std::vector<bool> used(end - phaseStart, false);
@@ -134,6 +145,10 @@ std::vector<int> ProgramBuilder::endPhase() {
     }
     sinks = std::move(joined);
   }
+  if (commandSchedule) schedulePhase();
+  // The phase's final join follows every record, so a topological ordering
+  // leaves it last. External references to the phase exit therefore stay valid.
+  assert(sinks.size() == 1 && size_t(sinks[0]) == cmds.size() - 1);
   frontier = sinks;
   base = sinks;
   return sinks;
@@ -145,6 +160,7 @@ int ProgramBuilder::pimRecord(const std::string &name, std::vector<int> deps, co
   phaseNames.push_back(name);
   phase = int(phaseNames.size()) - 1;
   phaseStart = cmds.size();
+  phaseGdmas.clear();
   base = deps;
   Command c;
   c.kind = Kind::Pim;
@@ -171,7 +187,24 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
   c.lp6Stride = lp6Stride ? lp6Stride : bytes;
   c.l2Stride = l2Stride ? l2Stride : bytes;
   reserveL2(l2, uint64_t(rows - 1) * c.l2Stride + bytes);
-  return push(std::move(c));
+  // Bound each logical core with N completion chains: its GDMA i follows
+  // its GDMA i-N, so at most N of its loads/stores can be in flight. Core
+  // streams are emitted consecutively; a single lexical history would make
+  // the first DMA of core 1 wait for the last tiles of core 0 and serialize
+  // otherwise independent cores. Aggregate admission is at most N * cores.
+  // These resource edges supplement true memory hazards. The predecessor is
+  // already appended, so an added edge cannot introduce a command DAG cycle.
+  if (gdmaLookahead) {
+    const auto &history = phaseGdmas[logicalCore];
+    if (history.size() >= gdmaLookahead) {
+      c.deps.push_back(history[history.size() - gdmaLookahead]);
+      std::sort(c.deps.begin(), c.deps.end());
+      c.deps.erase(std::unique(c.deps.begin(), c.deps.end()), c.deps.end());
+    }
+  }
+  int id = push(std::move(c));
+  if (gdmaLookahead) phaseGdmas[logicalCore].push_back(id);
+  return id;
 }
 
 int ProgramBuilder::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t bytes, uint32_t rows, uint32_t lp6Stride,
@@ -204,6 +237,7 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
   // ISA ver 2.0: every core block is lowered from the builder stream; a command's completion
   // event is its ordinal.
   std::vector<uint32_t> out(isa2::kHeaderWords, 0);
+  llvm::json::Array sourceRanges, sourceCommands;
   int64_t coreCount = 0;
   auto bad = [](const std::string &what, size_t id) {
     llvm::errs() << "program.bin: command " << id << ": " << what << "\n";
@@ -211,6 +245,8 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
   };
   for (size_t id = 0; id < cmds.size(); ++id) {
     const Command &c = cmds[id];
+    if (traceOperations)
+      sourceCommands.push_back(llvm::json::Object{{"command", int64_t(id)}, {"source", c.source}});
     if (!depsFit(id, c.deps)) return bad("dependencies do not fit the ISA ver 2.0 record", id);
     const std::vector<uint32_t> deps(c.deps.begin(), c.deps.end());
     if (c.kind == Kind::Barrier) {
@@ -235,7 +271,8 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
         dump.write(reinterpret_cast<const char *>(&n), 4);
         dump.write(reinterpret_cast<const char *>(in.data()), std::streamsize(in.size() * 4));
       }
-      auto lowered = isa2::lowerCoreBlock(in);
+      std::vector<size_t> sourceWords;
+      auto lowered = isa2::lowerCoreBlock(in, traceOperations ? &sourceWords : nullptr);
       if (!lowered) return bad(lowered.error, id);
       body = std::move(lowered.value);
       if (!fits(body.size(), 24) || c.logicalCore < 0 || c.logicalCore >= int(isa2::kCoreAny))
@@ -244,6 +281,16 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
       auto record = isa2::coreBeginRecord(uint32_t(id), deps, uint32_t(body.size()), uint32_t(c.logicalCore), l1);
       if (!record) return bad(record.error, id);
       out.insert(out.end(), record.value.begin(), record.value.end());
+      if (traceOperations) {
+        assert(sourceWords.size() == body.size());
+        for (size_t b = 0, e; b < body.size(); b = e) {
+          int source = isaSources[size_t(c.isaStart) + sourceWords[b]];
+          for (e = b + 1; e < body.size() && isaSources[size_t(c.isaStart) + sourceWords[e]] == source; ++e) {}
+          sourceRanges.push_back(llvm::json::Object{
+              {"begin", int64_t(out.size() + b)}, {"end", int64_t(out.size() + e)},
+              {"source", source}, {"command", int64_t(id)}, {"core", c.logicalCore}});
+        }
+      }
       out.insert(out.end(), body.begin(), body.end());
       coreCount += int64_t(body.size());
       continue;
@@ -302,5 +349,19 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
   llvm::raw_fd_ostream js(dir + "/system.json", ec);
   if (ec) return false;
   js << llvm::formatv("{0:2}", llvm::json::Value(std::move(sys))) << "\n";
+  if (traceOperations) {
+    llvm::json::Array operations;
+    for (const auto &text : sourceOperations) {
+      auto value = llvm::json::parse(text);
+      if (!value) { llvm::consumeError(value.takeError()); return false; }
+      operations.push_back(std::move(*value));
+    }
+    llvm::raw_fd_ostream sourceFile(dir + "/operation_map.json", ec);
+    if (ec) return false;
+    sourceFile << llvm::formatv("{0:2}", llvm::json::Value(llvm::json::Object{
+        {"schema", "lp6.compiler.operation_map.v1"}, {"pc_unit", "absolute_program_word"},
+        {"operations", std::move(operations)}, {"pc_ranges", std::move(sourceRanges)},
+        {"commands", std::move(sourceCommands)}})) << "\n";
+  }
   return true;
 }

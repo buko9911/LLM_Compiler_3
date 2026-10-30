@@ -51,6 +51,49 @@ TEST(ISAv2, HardwareLoopKeepsRegisterWritesInside) {
                                    0x00000024u, 0x000000bfu, 0x000000ffu}));
 }
 
+TEST(ISAv2, TypedFp32GuardsAndCastsMatchSimulatorLowering) {
+  // EXP.F32, CMP_EQ.F32 -> I8, SELECT.F32, F32->F16, a seven-lane
+  // F16->F32 tail, and BCAST.F32. Golden words were independently obtained
+  // with transactional_emulator/tools/isa_v2.py::lower_core_block.
+  auto result = npu::isa2::lowerCoreBlock({
+      0x76u, 8, 1, 16, 0x4b6u, 13, 1, 16, 0x804f6u, 16, 1, 16,
+      0xd36u, 27, 1, 16, 0x1176u, 28, 0, 7, 0x15b6u, 18, 1, 7, 0x100003fu});
+  ASSERT_TRUE(bool(result)) << result.error;
+  EXPECT_EQ(result.value, std::vector<uint32_t>({
+      0x40e1u, 0x5230u, 0x49370u, 0x804d430u, 0x400d0431u,
+      0x1ce1u, 0x40115031u, 0x1594b0u, 0xffu}));
+  EXPECT_TRUE(bool(npu::isa2::verifyCoreWords(result.value)));
+}
+
+TEST(ISAv2, TypedRecordsRejectInvalidTypesAndRegisterOverflow) {
+  for (const auto &record : std::vector<std::vector<uint32_t>>{
+           {0x36, 8, 4, 16},   // Unknown dtype.
+           {0x36, 41, 1, 16},  // Unknown operation.
+           {0x36, 8, 2, 16},   // EXP on I8.
+           {0x36, 21, 1, 16},  // AND on FP32.
+           {0x36, 8, 1, 0},    // Empty vector.
+           {0x36, 8, 1, 17},   // FP32 source exceeds 512 bits.
+           {0x36, 28, 0, 17},  // F16 -> FP32 result exceeds 512 bits.
+           {0x400036, 8, 1, 16}}) { // Reserved builder header bits.
+    auto result = npu::isa2::lowerCoreBlock(record);
+    EXPECT_FALSE(bool(result));
+    EXPECT_FALSE(result.error.empty());
+  }
+}
+
+TEST(ISAv2, DiagnosticSourceMapPreservesEncodingAndMergedMmaOrigin) {
+  std::vector<uint32_t> builder{0x3bu | (1u << 22),
+                                0x3bu | (1u << 22) | (1u << 26),
+                                0x3bu | (3u << 22)};
+  std::vector<size_t> sources{99};
+  auto plain = npu::isa2::lowerCoreBlock(builder);
+  auto mapped = npu::isa2::lowerCoreBlock(builder, &sources);
+  ASSERT_TRUE(bool(plain));
+  ASSERT_TRUE(bool(mapped));
+  EXPECT_EQ(mapped.value, plain.value);
+  EXPECT_EQ(sources, std::vector<size_t>({0, 2}));
+}
+
 TEST(ISAv2, RecordsMatchSimulatorEncoders) {
   auto gdma = npu::isa2::gdmaRecord(true, 5, {1, 3}, 0x123456, 0x2000, 256, 4, 1024, 256);
   ASSERT_TRUE(bool(gdma)) << gdma.error;

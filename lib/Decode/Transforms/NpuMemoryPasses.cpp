@@ -234,6 +234,22 @@ struct Promoter {
           c.getSourceMutable().assign(e.l1);
           break;
         }
+      // Shared results of a distributed producer can feed a strided assembly
+      // (e.g. tensor.insert_slice after bufferization). There is no L2 -> L2
+      // copy instruction. Express its actual two DMA transfers through a
+      // private L1 buffer before memory planning, retaining both logical copy
+      // layouts. This is not hidden backend scratch or a new DMA resource.
+      if (spaceOf(c.getSource().getType()) == kL2 && spaceOf(c.getTarget().getType()) == kL2 &&
+          cast<MemRefType>(c.getSource().getType()).hasStaticShape()) {
+        OpBuilder b(c);
+        Value staging = allocL1(b, c.getLoc(), c.getSource());
+        auto read = memref::CopyOp::create(b, c.getLoc(), c.getSource(), staging);
+        auto marker = b.getUnitAttr();
+        staging.getDefiningOp()->setAttr("hyb.shared_copy_staging", marker);
+        read->setAttr("hyb.shared_copy_staging", marker);
+        c->setAttr("hyb.shared_copy_staging", marker);
+        c.getSourceMutable().assign(staging);
+      }
     }
     llvm::erase_if(cache, [&](const Entry &e) { return written.contains(e.root); });
   }
@@ -357,6 +373,10 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
       end[op] = e;
     });
     std::vector<Buf> bufs;
+    DenseMap<int64_t, Operation *> overlapLoops;
+    fn.walk([&](scf::ForallOp f) {
+      if (auto id = f->getAttrOfType<IntegerAttr>("hyb.overlap_id")) overlapLoops[id.getInt()] = f;
+    });
     fn.walk([&](memref::AllocOp a) {
       int64_t space = spaceOf(a.getType());
       if (space != kL1 && space != kL2) return;
@@ -375,6 +395,15 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
           if (isa<scf::ForOp, scf::ForallOp>(p) && !p->isAncestor(a)) anchor = p;
         b.first = std::min(b.first, pos[anchor]);
         b.last = std::max(b.last, end[anchor]);
+        // Deferred arithmetic executes in this forall's MMA windows, including
+        // its output's first write. Alloc position alone is not a live use.
+        if (auto id = u->getAttrOfType<IntegerAttr>("hyb.overlap_id"); id && isa<hyb::DequantOp>(u)) {
+          auto it = overlapLoops.find(id.getInt());
+          if (it != overlapLoops.end()) {
+            b.first = std::min(b.first, pos[it->second]);
+            b.last = std::max(b.last, end[it->second]);
+          }
+        }
       });
       if (b.last < 0) {
         b.first = b.last = pos[a];

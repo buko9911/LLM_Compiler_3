@@ -61,11 +61,6 @@ def HybStorageF16 : Pass<"hyb-storage-f16", "ModuleOp"> {
   let dependentDialects = ["arith::ArithDialect", "linalg::LinalgDialect", "tensor::TensorDialect"];
 }
 
-def HybGroupLinear : Pass<"hyb-group-linear", "func::FuncOp"> {
-  let summary = "Group qmatmuls that read the same quantized input (q/k/v, gate/up)";
-  let dependentDialects = ["hyb::HybDialect"];
-}
-
 //===----------------------------------------------------------------------===//
 // [B] Partition, phases, global memory.
 //===----------------------------------------------------------------------===//
@@ -123,6 +118,97 @@ def HybNpuTile : Pass<"hyb-npu-tile", "ModuleOp"> {
   let dependentDialects = ["scf::SCFDialect", "tensor::TensorDialect", "affine::AffineDialect", "arith::ArithDialect"];
 }
 
+def HybNpuFlashAttention : Pass<"hyb-npu-flash-attention", "ModuleOp"> {
+  let summary = "Tile attention with online softmax and optional parallel KV splits";
+  let description = [{
+    Run after storage-f16 and phase outlining, before ordinary NPU tiling.
+    Keep only Q/K tiles and FP32 running maximum, sum and output state on chip.
+    Flash-Decoding computes independent KV splits and stably merges their states.
+    This opt-in changes the softmax rounding contract; it is not a bit-identical
+    replacement for the materialized FP16 path. Unsupported attention is diagnosed.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
+}
+
+def HybNpuProjectionFusion : Pass<"hyb-npu-projection-fusion", "ModuleOp"> {
+  let summary = "Fuse same-input NPU projections into one concatenated contraction";
+  let description = [{
+    After phase outlining, fuse compatible INT8 GEMV/dequant chains. Image placement
+    concatenates their original NK32 blocks and row scales without runtime packing.
+    One contraction reads the shared activation; FP16 result slices retain the ABI.
+    Group annotations used for NPU/PIM partitioning are not an execution fusion.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["hyb::HybDialect", "tensor::TensorDialect", "linalg::LinalgDialect",
+                           "arith::ArithDialect"];
+}
+
+def HybNpuGemvEpilogue : Pass<"hyb-npu-gemv-epilogue", "ModuleOp"> {
+  let summary = "Fuse a private INT32 GEMV tile and its FP16 dequantization on the producer core";
+  let description = [{
+    Before ordinary NPU tiling, distribute single-consumer GEMV/dequant chains by
+    output columns and stream weight tiles inside each core. Keep the existing
+    quantization arithmetic and publish only FP16 tiles. Unsupported graphs keep
+    their original schedule. The normal memory planner enforces SRAM capacity.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["hyb::HybDialect", "tensor::TensorDialect", "linalg::LinalgDialect",
+                           "arith::ArithDialect", "scf::SCFDialect", "affine::AffineDialect"];
+}
+
+def HybNpuMatrixInit : Pass<"hyb-npu-matrix-init", "ModuleOp"> {
+  let summary = "Prove which private zero fills are subsumed by a matrix INIT";
+  let description = [{
+    After L1 promotion, mark a zero fill only when a complete matrix INIT is its
+    first use and all other users follow that INIT in the same block. Keep the
+    logical fill in IR for initialization proofs; codegen omits its physical VPU
+    stores. Reject escapes, aliases before INIT, partial writes and nonzero fills.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+}
+
+def HybNpuAttentionFusion : Pass<"hyb-npu-attention-fusion", "ModuleOp"> {
+  let summary = "Normalize attention reshapes to preserve head-local QK/softmax/PV fusion";
+  let description = [{
+    Runs before hyb-npu-tile. Preserve arithmetic, FP16 storage boundaries and the
+    complete key-axis softmax reduction while exposing compatible producer shapes.
+    Unsupported shapes retain their original graph. This is not online softmax.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
+}
+
+def HybNpuElementwiseDistribute : Pass<"hyb-npu-elementwise-distribute", "ModuleOp"> {
+  let summary = "Distribute independent static elementwise tensors over existing NPU cores";
+  let description = [{
+    Run after ordinary NPU tiling and before bufferization. Only top-level pure
+    all-parallel FP16 generic operations with identity output and projected input
+    maps participate. Preserve each scalar body and its vector chunk boundaries.
+    No reduction, attention recurrence, or operator-name pattern is rewritten.
+    Normal placement and promotion emit private L1 input tiles and shared L2
+    publication, and the existing memory planner enforces actual SRAM capacity.
+    Opt-in via npu.elementwise_distribution; distribute_min_elements bounds size.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
+}
+
+def HybNpuActivationResidency : Pass<"hyb-npu-activation-residency", "ModuleOp"> {
+  let summary = "Separate dense NPU phase results from local activation destinations";
+  let description = [{
+    CSE may let phase-local activations share the tensor.empty of an escaping output.
+    Privatize that output destination so bufferization leaves local activations local;
+    placement then assigns shared activations to L2. Run after final tensor CSE and
+    immediately before bufferization. Preserve the external DRAM ABI and arithmetic.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["tensor::TensorDialect", "func::FuncDialect"];
+}
+
 def HybPrivatePhaseResults : Pass<"hyb-private-phase-results", "ModuleOp"> {
   let summary = "Give NPU phase results that a PIM phase reads a tensor.empty of their own";
   let description = [{
@@ -171,6 +257,49 @@ def HybNpuPromote : Pass<"hyb-npu-promote", "ModuleOp"> {
     back once at the end of the region or before another access needs the data. Read-only
     operands of an scf.for that do not depend on the loop are copied once before the loop.
   }];
+}
+
+def HybNpuMatmulLayout : Pass<"hyb-npu-matmul-layout", "ModuleOp"> {
+  let summary = "Pack transposed FP16 RHS operands to expose full SA output tiles";
+  let description = [{
+    After promotion, materialize a fresh L1 transpose for canonical transpose-B
+    matmul/batchmatmul. Preserve K order, input values and accumulator type.
+    Reject single-row, dynamic, unsupported maps and conservative SRAM overflow.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "memref::MemRefDialect", "scf::SCFDialect"];
+}
+
+def HybNpuInputPipeline : Pass<"hyb-npu-input-pipeline", "ModuleOp"> {
+  let summary = "Pipeline private L2 input copies with full-K matrix tiles";
+  let description = [{
+    After promotion and zero-init proof, partition an immediately consumed private
+    L2-to-L1 B copy and FP16 matmul along batch/N, preserving full K and rounding.
+    One tile is prefetched ahead using disjoint slices of the existing allocation.
+    Common backend address/event scheduling enforces readiness. Unsupported maps,
+    sharing, aliases and dynamic shapes retain their original operations.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "memref::MemRefDialect", "arith::ArithDialect"];
+}
+
+def HybNpuOverlap : Pass<"hyb-npu-overlap", "ModuleOp"> {
+  let summary = "Schedule independent L1 dequant inside subsequent GEMV windows before memory planning";
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+}
+
+def HybNpuTransferSchedule : Pass<"hyb-npu-transfer-schedule", "ModuleOp"> {
+  let summary = "Hoist independent input copies using SSA and memory-effect dependencies";
+  let description = [{
+    Before memory planning, move input copies across independent declared memory
+    effects, never across the previous input transfer, unknown effects or control
+    regions. Preserve source versions, target readers/writers and SSA dominance.
+    A static private destination allocation may move with its copy so memory
+    planning sees the complete extended lifetime. No compute-name recognition,
+    arithmetic rewrite, partial-transfer readiness or row tiling is performed.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["memref::MemRefDialect", "func::FuncDialect"];
 }
 
 def HybNpuMemPlan : Pass<"hyb-npu-memplan", "ModuleOp"> {

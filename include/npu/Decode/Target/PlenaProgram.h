@@ -38,10 +38,26 @@ public:
     uint32_t rowBytes = 0, rows = 1, lp6Stride = 0, l2Stride = 0;
     int64_t pimFirst = 0, pimCount = 0;   // Kind::Pim: indices into pimPrimitives
     int phase = 0;                        // index into phaseNames (symbol prefix)
+    int source = -1;                      // optional diagnostic origin, never encoded
   };
 
   int logicalCore = 0;
   std::vector<int> frontier;
+  // Sidecar-only source attribution. It must never change instruction emission.
+  bool traceOperations = false;
+  int currentSource = -1;
+  /// Optional compiler admission window over each core's phase-local GDMA commands.
+  /// Zero preserves unrestricted issue. Set before beginPhase; loads and stores
+  /// share a core's window. Aggregate admission is bounded by N * logical cores;
+  /// histories are separate because core streams are emitted sequentially.
+  uint32_t gdmaLookahead = 0;
+  bool commandSchedule = false;
+  struct ScheduleStats {
+    uint64_t commands = 0, reordered = 0, redundantEdges = 0;
+    bool encodingFallback = false;
+  };
+  ScheduleStats lastSchedule;
+  std::vector<std::string> sourceOperations;
 
   /// Starts a phase: fresh GP / control state, and every record of the phase follows `entry`.
   void beginPhase(const std::string &name, std::vector<int> entry);
@@ -73,14 +89,17 @@ public:
 
   int64_t coreWords() const { return int64_t(isa.size() + cur.size()); }
   int numCommands() const { return int(cmds.size()); }
+  uint32_t gpValue(unsigned reg) const { return gp.at(reg); }
 
 private:
   void ensureSegment();
   void track(uint32_t word);
   int push(Command c);
+  void schedulePhase();
 
   std::vector<Command> cmds;
   std::vector<uint32_t> isa, cur;
+  std::vector<int> isaSources, curSources;
   std::vector<::npu::pim::Primitive> pimPrimitives;
   std::optional<std::vector<int>> segDeps;
   std::array<uint32_t, 16> gp{};
@@ -90,6 +109,7 @@ private:
   std::vector<std::string> phaseNames{"main"};
   int phase = 0;
   size_t phaseStart = 0;
+  std::map<int, std::vector<int>> phaseGdmas; // logical core -> DMA admission history
   std::vector<int> base;                  // the current phase's entry
 };
 
@@ -106,7 +126,9 @@ enum Op : uint32_t {
   OP_V_CONV = 0x3d, OP_C_WAIT = 0x3f
 };
 enum TypedOp : uint32_t {
-  T_ADD = 0, T_SUB = 1, T_MUL = 2, T_MAX = 4, T_MIN = 5, T_NEG = 6, T_ABS = 7, T_MOV = 17, T_SLICE = 19,
+  T_ADD = 0, T_SUB = 1, T_MUL = 2, T_MAX = 4, T_MIN = 5, T_NEG = 6, T_ABS = 7,
+  T_EXP = 8, T_RCP = 9, T_SQRT = 10, T_RSQRT = 11,
+  T_CMP_EQ = 13, T_CMP_LT = 14, T_CMP_LE = 15, T_SELECT = 16, T_MOV = 17, T_BCAST = 18, T_SLICE = 19,
   T_AND = 21, T_SHL = 24, T_SHR_L = 25, T_SHR = 26, T_CAST_F16 = 27, T_CAST_F32 = 28, T_CAST_I8 = 29,
   T_CAST_I32 = 30, T_SPLAT = 31, T_BITCAST = 40
 };

@@ -45,8 +45,14 @@ struct NpuPhaseStats {
     int64_t tileBytes, iterations, slots, batch;
     bool prefetch, crossBatch;
     std::string reason;
+    int64_t initialSlot = 0;
   };
   std::vector<WeightStream> weightStreams;
+  int64_t overlapPairs = 0, overlapChunks = 0;
+  int64_t asyncOutputStores = 0, outputStoresWithVectorWork = 0;
+  int64_t stagingReleaseCuts = 0;
+  int64_t vectorScalarReciprocals = 0, vectorScalarReuses = 0;
+  int64_t vectorPipelineGroups = 0, vectorPipelinedChunks = 0;
 };
 
 /// Lowers one NPU phase (after hyb-npu-place / -promote / -memplan) into the records of the step

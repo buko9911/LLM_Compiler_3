@@ -39,7 +39,14 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
     auto tokensAttr = module->getAttrOfType<IntegerAttr>("hyb.tokens");
     int64_t M = tokensAttr ? tokensAttr.getInt() : 1;
     std::map<int64_t, SmallVector<hyb::QMatmulOp>> groups;
-    module.walk([&](hyb::QMatmulOp op) { groups[op.getGroup().value_or(-1)].push_back(op); });
+    // Grouping is part of partitioning, not an execution-fusion pass. Derive
+    // IDs from SSA inputs across the module (function-local counters collide).
+    DenseMap<Value,int64_t> groupOf;
+    module.walk([&](hyb::QMatmulOp op) {
+      auto [it, inserted] = groupOf.try_emplace(op.getInput(),groupOf.size());
+      op.setGroupAttr(IntegerAttr::get(IntegerType::get(&getContext(),64),it->second));
+      groups[it->second].push_back(op);
+    });
     llvm::json::Array table;
     Builder b(&getContext());
     int pim = 0, npu = 0;
