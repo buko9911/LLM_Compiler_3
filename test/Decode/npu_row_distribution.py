@@ -74,7 +74,9 @@ def main():
         "rmsnorm_quant": ({}, {}, [2], 4),
         "norm_only": ({"quant": False}, {}, [1], 4),
         "shared_norm": ({"share_norm": True}, {}, [1, 0], 4),
-        "row_divisor": ({"rows": 6, "columns": 256}, {"distribute_min_elements": 1}, [2], 3),
+        # Tiny shapes exercise the rewrite with no split cost; the cost rule itself is below.
+        "row_divisor": ({"rows": 6, "columns": 256}, {"distribute_min_elements": 1, "core_split_us": 0}, [2], 3),
+        "not_worth_splitting": ({"rows": 4, "columns": 64}, {"distribute_min_elements": 1}, [], None),
         "one_row": ({"rows": 1}, {}, [], None),
         "small": ({"rows": 8, "columns": 64}, {}, [], None),
         "off": ({}, {"row_distribution": False}, [], None),

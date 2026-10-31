@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
@@ -125,6 +126,28 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
                                   d.getWeightAttr()).getResult(0);
   }
 
+  /// The fewest equal column chunks whose per-core partition (`bytesFor(blocks per core)`) fits L1;
+  /// 0 if even one block per core does not fit. The chunks run one after the other, each over all
+  /// cores, so an output with more rows (M) is cut into more chunks instead of leaving the core.
+  /// Records the choice and its numbers.
+  template <typename BytesFor>
+  int64_t columnChunks(hyb::DequantOp d, StringRef what, int64_t perCore, BytesFor bytesFor,
+                       const TargetSpec &target) {
+    int64_t chunks = 0;
+    for (int64_t c = 1; c <= perCore && !chunks; ++c)
+      if (perCore % c == 0 && bytesFor(perCore / c) <= target.npu.l1Bytes) chunks = c;
+    auto fn = d->getParentOfType<func::FuncOp>();
+    std::string label;
+    llvm::raw_string_ostream os(label);
+    os << what << ' ' << d.getWeightAttr() << ' ' << d.getInit().getType();
+    std::string choice = !chunks ? "not fused (one block per core does not fit L1)"
+                         : chunks == 1 ? "whole partition per core" : std::to_string(chunks) + " column chunks";
+    cost::recordDecision(fn, "GEMV partition in L1", label, choice,
+                         {{"partition_kib", double(bytesFor(perCore)) / 1024.0},
+                          {"l1_kib", double(target.npu.l1Bytes) / 1024.0}, {"chunks", double(chunks)}});
+    return chunks;
+  }
+
   /// npu.pair_gate_up: dequant(fused[a;b]) used only as [:, :n/2] and [:, n/2:] by one
   /// all-parallel identity-map generic. Core c computes columns [c w, (c + 1) w) of both halves
   /// and the generic on them.
@@ -139,61 +162,110 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
       auto rows = cast<DictionaryAttr>(s).getAs<IntegerAttr>("rows");
       if (!rows || rows.getInt() != half) return false;
     }
-    // The two halves, each a full-row slice used once by the same generic.
+    // The two halves, each a full-row slice read only by the same generic. With one row (M = 1)
+    // canonicalization collapses the halves and the generic to rank 1; the generic is then rebuilt
+    // on [1, columns] below, so both forms lower to the same per-core program.
     tensor::ExtractSliceOp parts[2];
+    tensor::CollapseShapeOp flat[2];
+    Value halves[2];
     for (Operation *user : d->getUsers()) {
       auto s = dyn_cast<tensor::ExtractSliceOp>(user);
       if (!s || !s.hasUnitStride() || !s->hasOneUse() || s.getStaticSizes() != ArrayRef<int64_t>({ch->m, half}))
         return false;
       auto offsets = s.getStaticOffsets();
       if (offsets[0] != 0 || (offsets[1] != 0 && offsets[1] != half)) return false;
-      tensor::ExtractSliceOp &slot = parts[offsets[1] ? 1 : 0];
-      if (slot) return false;
-      slot = s;
+      int h = offsets[1] ? 1 : 0;
+      if (parts[h]) return false;
+      parts[h] = s;
+      halves[h] = s.getResult();
+      if (auto c = dyn_cast<tensor::CollapseShapeOp>(*s->getUsers().begin()); c && ch->m == 1 &&
+          c.getResultType().getRank() == 1) {
+        flat[h] = c;
+        halves[h] = c.getResult();
+      }
     }
     if (!parts[0] || !parts[1]) return false;
-    auto op = dyn_cast<linalg::GenericOp>(*parts[0]->getUsers().begin());
-    if (!op || op != dyn_cast<linalg::GenericOp>(*parts[1]->getUsers().begin()) || op->getBlock() != d->getBlock() ||
-        op.getNumDpsInputs() != 2 || op.getNumDpsInits() != 1 || op.getNumReductionLoops() ||
-        !op.hasPureTensorSemantics() || !op.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
+    auto op = dyn_cast<linalg::GenericOp>(*halves[0].getUsers().begin());
+    int64_t rank = cast<RankedTensorType>(halves[0].getType()).getRank();
+    auto readOnlyBy = [&](Value v) {
+      return llvm::all_of(v.getUses(), [&](OpOperand &u) { return u.getOwner() == op && op.isDpsInput(&u); });
+    };
+    if (!op || !readOnlyBy(halves[0]) || !readOnlyBy(halves[1]) || op->getBlock() != d->getBlock() ||
+        op.getNumDpsInits() != 1 || op.getNumReductionLoops() || !op.hasPureTensorSemantics() ||
+        !op.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
+        !llvm::all_of(op.getDpsInputs(), [&](Value v) { return v == halves[0] || v == halves[1]; }) ||
         !llvm::all_of(op.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }) ||
-        op.getResult(0).getType() != RankedTensorType::get({ch->m, half}, Float16Type::get(&getContext())))
+        op.getResult(0).getType() != halves[0].getType() ||
+        !cast<RankedTensorType>(op.getResult(0).getType()).getElementType().isF16())
       return false;
-    int64_t cores = largestDivisorAtMost(halfBlocks, target.npu.cores), part = halfBlocks / cores,
-            columns = part * 32;
-    int64_t tile = largestDivisorAtMost(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (ch->k * 32)));
+    int64_t cores = largestDivisorAtMost(halfBlocks, target.npu.cores), perCore = halfBlocks / cores;
     // Both partitions (INT32 + FP16 each), the op's output, the input and the weight tiles.
-    int64_t bytes = 2 * ch->m * columns * 6 + ch->m * columns * 2 + 2 * columns * 4 + ch->m * ch->k + ch->m * 4 +
-                    2 * tile * ch->k * 32 + 2 * ch->m * tile * 32 * 4 + target.npu.l1ReservedBytes + 4096;
-    if (bytes > target.npu.l1Bytes) return false;
+    auto bytesFor = [&](int64_t part) {
+      int64_t columns = part * 32;
+      int64_t tile = largestDivisorAtMost(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (ch->k * 32)));
+      return 2 * ch->m * columns * 6 + ch->m * columns * 2 + 2 * columns * 4 + ch->m * ch->k + ch->m * 4 +
+             2 * tile * ch->k * 32 + 2 * ch->m * tile * 32 * 4 + target.npu.l1ReservedBytes + 4096;
+    };
+    int64_t chunks = columnChunks(d, "gate/up pair", perCore, bytesFor, target);
+    if (!chunks) return false;
+    int64_t part = perCore / chunks, columns = part * 32;
 
     OpBuilder builder(op);
     Location loc = op.getLoc();
-    auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{op.getDpsInits()[0]},
-                                      std::nullopt);
-    loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
-    loop->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
-    loop->setAttr("hyb.gemv_pair", builder.getUnitAttr());
-    builder.setInsertionPointToStart(loop.getBody());
-    auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
-    Value base = arith::MulIOp::create(builder, loc, loop.getInductionVar(0), index(part));
-    Value first = localGemv(builder, loc, d, *ch, base, part);
-    Value second = localGemv(builder, loc, d, *ch,
-                             arith::AddIOp::create(builder, loc, base, index(halfBlocks)), part);
-    Value output = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{ch->m, columns}, builder.getF16Type());
-    IRMapping mapping;
-    mapping.map(parts[0].getResult(), first);
-    mapping.map(parts[1].getResult(), second);
-    mapping.map(op.getDpsInits()[0], output);
-    auto local = cast<linalg::GenericOp>(builder.clone(*op.getOperation(), mapping));
-    local.getResult(0).setType(output.getType());
-    OpFoldResult z = builder.getIndexAttr(0);
-    Value startColumn = arith::MulIOp::create(builder, loc, base, index(32));
-    builder.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
-    tensor::ParallelInsertSliceOp::create(builder, loc, local.getResult(0), loop.getRegionOutArgs()[0],
-        SmallVector<OpFoldResult>{z, startColumn}, attrs(builder, {ch->m, columns}), attrs(builder, {1, 1}));
-    op.getResult(0).replaceAllUsesWith(loop.getResult(0));
+    Value shared = rank == 2 ? op.getDpsInits()[0]
+                             : tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{1, half}, builder.getF16Type())
+                                   .getResult();
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+      builder.setInsertionPoint(op);
+      auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{shared}, std::nullopt);
+      loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
+      loop->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
+      loop->setAttr("hyb.gemv_pair", builder.getUnitAttr());
+      builder.setInsertionPointToStart(loop.getBody());
+      auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
+      Value base = arith::AddIOp::create(builder, loc,
+          arith::MulIOp::create(builder, loc, loop.getInductionVar(0), index(part)), index(chunk * cores * part));
+      Value first = localGemv(builder, loc, d, *ch, base, part);
+      Value second = localGemv(builder, loc, d, *ch,
+                               arith::AddIOp::create(builder, loc, base, index(halfBlocks)), part);
+      Value output = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{ch->m, columns}, builder.getF16Type());
+      linalg::GenericOp local;
+      if (rank == 2) {
+        IRMapping mapping;
+        mapping.map(halves[0], first);
+        mapping.map(halves[1], second);
+        mapping.map(op.getDpsInits()[0], output);
+        local = cast<linalg::GenericOp>(builder.clone(*op.getOperation(), mapping));
+        local.getResult(0).setType(output.getType());
+      } else {
+        // The same elementwise body on [1, columns].
+        SmallVector<Value> inputs;
+        for (Value v : op.getDpsInputs()) inputs.push_back(v == halves[0] ? first : second);
+        AffineMap id = builder.getMultiDimIdentityMap(2);
+        local = linalg::GenericOp::create(builder, loc, TypeRange{output.getType()}, inputs, ValueRange{output},
+            SmallVector<AffineMap>(inputs.size() + 1, id),
+            SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel));
+        IRMapping mapping;
+        op.getRegion().cloneInto(&local.getRegion(), mapping);
+        for (NamedAttribute a : op->getDiscardableAttrs()) local->setAttr(a.getName(), a.getValue());
+      }
+      OpFoldResult z = builder.getIndexAttr(0);
+      Value startColumn = arith::MulIOp::create(builder, loc, base, index(32));
+      builder.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
+      tensor::ParallelInsertSliceOp::create(builder, loc, local.getResult(0), loop.getRegionOutArgs()[0],
+          SmallVector<OpFoldResult>{z, startColumn}, attrs(builder, {ch->m, columns}), attrs(builder, {1, 1}));
+      shared = loop.getResult(0);
+    }
+    Value result = shared;
+    if (rank != 2) {
+      builder.setInsertionPoint(op);
+      result = tensor::CollapseShapeOp::create(builder, loc, op.getResult(0).getType(), result,
+                                               SmallVector<ReassociationIndices>{{0, 1}});
+    }
+    op.getResult(0).replaceAllUsesWith(result);
     op.erase();
+    for (tensor::CollapseShapeOp c : flat)
+      if (c) c.erase();
     parts[0].erase();
     parts[1].erase();
     d.erase();
@@ -208,45 +280,55 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
     linalg::GenericOp g = ch->gemv;
     tensor::CollapseShapeOp collapse = ch->collapse;
     linalg::FillOp fill = ch->fill;
-    int64_t m = ch->m, k = ch->k, nb = ch->nb, n = ch->n;
-    int64_t cores = largestDivisorAtMost(nb, target.npu.cores), part = nb / cores, columns = part * 32;
-    // A whole column partition is kept local. Conservative admission; the
-    // authoritative liveness planner still accounts for surrounding buffers.
-    int64_t tile = largestDivisorAtMost(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (k * 32)));
-    int64_t bytes = m * columns * 6 + columns * 4 + m * k + m * 4 + 2 * tile * k * 32 +
-                    2 * m * tile * 32 * 4 + target.npu.l1ReservedBytes + 4096;
-    if (bytes > target.npu.l1Bytes) return false;
+    int64_t m = ch->m, k = ch->k, nb = ch->nb;
+    int64_t cores = largestDivisorAtMost(nb, target.npu.cores), perCore = nb / cores;
+    // A core keeps its column partition local (INT32 and FP16) through the dequant.
+    auto bytesFor = [&](int64_t part) {
+      int64_t columns = part * 32;
+      int64_t tile = largestDivisorAtMost(part, std::max<int64_t>(1, target.npu.gemvTileBytes / (k * 32)));
+      return m * columns * 6 + columns * 4 + m * k + m * 4 + 2 * tile * k * 32 + 2 * m * tile * 32 * 4 +
+             target.npu.l1ReservedBytes + 4096;
+    };
+    int64_t chunks = columnChunks(d, "GEMV", perCore, bytesFor, target);
+    if (!chunks) return false;
+    int64_t part = perCore / chunks, columns = part * 32;
 
     OpBuilder builder(d);
     Location loc = d.getLoc();
-    auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{d.getInit()}, std::nullopt);
-    loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
-    loop->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
-    builder.setInsertionPointToStart(loop.getBody());
-    auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
-    Value base = arith::MulIOp::create(builder, loc, loop.getInductionVar(0), index(part));
-    Value startColumn = arith::MulIOp::create(builder, loc, base, index(32));
-    OpFoldResult z = builder.getIndexAttr(0);
-    Value weights = slice(builder, loc, g.getDpsInputs()[1], {base, z, z}, {part, k, 32});
-    Value scale = slice(builder, loc, d.getWscale(), {startColumn}, {columns});
-    Value empty = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, part, 32}, builder.getI32Type());
-    Value init = linalg::FillOp::create(builder, loc, fill.getInputs()[0], empty).getResult(0);
-    IRMapping mapping;
-    mapping.map(g.getDpsInputs()[1], weights);
-    mapping.map(g.getDpsInits()[0], init);
-    auto local = cast<linalg::GenericOp>(builder.clone(*g.getOperation(), mapping));
-    local.getResult(0).setType(init.getType());
-    local->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
-    Value acc = tensor::CollapseShapeOp::create(builder, loc,
-        RankedTensorType::get({m, columns}, builder.getI32Type()), local.getResult(0),
-        SmallVector<ReassociationIndices>{{0}, {1, 2}});
-    Value output = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, columns}, builder.getF16Type());
-    auto deq = hyb::DequantOp::create(builder, loc, TypeRange{output.getType()}, acc, d.getScale(), scale,
-                                    output, d.getWeightAttr());
-    builder.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
-    tensor::ParallelInsertSliceOp::create(builder, loc, deq.getResult(0), loop.getRegionOutArgs()[0],
-        SmallVector<OpFoldResult>{z, startColumn}, attrs(builder, {m, columns}), attrs(builder, {1, 1}));
-    d.getResult(0).replaceAllUsesWith(loop.getResult(0));
+    Value out = d.getInit();
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+      builder.setInsertionPoint(d);
+      auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{out}, std::nullopt);
+      loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
+      loop->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
+      builder.setInsertionPointToStart(loop.getBody());
+      auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
+      Value base = arith::AddIOp::create(builder, loc,
+          arith::MulIOp::create(builder, loc, loop.getInductionVar(0), index(part)), index(chunk * cores * part));
+      Value startColumn = arith::MulIOp::create(builder, loc, base, index(32));
+      OpFoldResult z = builder.getIndexAttr(0);
+      Value weights = slice(builder, loc, g.getDpsInputs()[1], {base, z, z}, {part, k, 32});
+      Value scale = slice(builder, loc, d.getWscale(), {startColumn}, {columns});
+      Value empty = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, part, 32}, builder.getI32Type());
+      Value init = linalg::FillOp::create(builder, loc, fill.getInputs()[0], empty).getResult(0);
+      IRMapping mapping;
+      mapping.map(g.getDpsInputs()[1], weights);
+      mapping.map(g.getDpsInits()[0], init);
+      auto local = cast<linalg::GenericOp>(builder.clone(*g.getOperation(), mapping));
+      local.getResult(0).setType(init.getType());
+      local->setAttr("hyb.gemv_epilogue", builder.getUnitAttr());
+      Value acc = tensor::CollapseShapeOp::create(builder, loc,
+          RankedTensorType::get({m, columns}, builder.getI32Type()), local.getResult(0),
+          SmallVector<ReassociationIndices>{{0}, {1, 2}});
+      Value output = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, columns}, builder.getF16Type());
+      auto deq = hyb::DequantOp::create(builder, loc, TypeRange{output.getType()}, acc, d.getScale(), scale,
+                                      output, d.getWeightAttr());
+      builder.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
+      tensor::ParallelInsertSliceOp::create(builder, loc, deq.getResult(0), loop.getRegionOutArgs()[0],
+          SmallVector<OpFoldResult>{z, startColumn}, attrs(builder, {m, columns}), attrs(builder, {1, 1}));
+      out = loop.getResult(0);
+    }
+    d.getResult(0).replaceAllUsesWith(out);
     d.erase();
     collapse.erase();
     g.erase();

@@ -9,9 +9,14 @@
 // from a row reduction (RMSNorm, q/k norm). Their single-use row-wise producers (the reduction,
 // its zero fill, the normalization) are fused into the same core loop, so a core reads its rows
 // once and no intermediate goes through L2.
+//
+// Whether an op (or a row chain) is split is a cost comparison, never a step kind: one core's VPU
+// time for it (NpuCost.h, from its shape and body) against the time `cores` cores save and the
+// fixed cost of a split (npu.core_split_us). Every choice is recorded in hyb.decisions.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -31,6 +36,35 @@ using namespace mlir::hybrid;
 
 namespace {
 constexpr llvm::StringLiteral marker = "hyb.elementwise_distributed";
+
+/// One core's VPU cycles for an op of this pass: a generic over its loop nest, hyb.quant over its
+/// input, a transpose as a layout copy (fills cost nothing here).
+double oneCoreCycles(Operation *op, const TargetSpec &target) {
+  if (auto g = dyn_cast<linalg::GenericOp>(op)) return cost::genericCycles(target.npu, g);
+  auto elements = [](Value v) { return double(cast<ShapedType>(v.getType()).getNumElements()); };
+  if (auto q = dyn_cast<hyb::QuantOp>(op)) return elements(q->getOperand(0)) * cost::quantCyclesPerElement(target.npu);
+  if (auto t = dyn_cast<linalg::TransposeOp>(op))
+    return elements(t.getInit()) *
+           cost::copyCyclesPerElement(target.npu, cast<ShapedType>(t.getInit().getType()).getElementTypeBitWidth() / 8);
+  return 0;
+}
+
+/// The split rule: split when `cores` cores save more than the fixed cost of a split (and the op has
+/// at least npu.distribute_min_elements elements, a floor kept for experiments; 0 by default).
+/// Records the choice and its numbers.
+bool splitDecision(func::FuncOp fn, Operation *op, StringRef kind, double cycles, int64_t cores,
+                   const TargetSpec &target) {
+  const auto &npu = target.npu;
+  int64_t elements = cast<ShapedType>(op->getResult(0).getType()).getNumElements();
+  bool split = cost::splitPays(npu, cycles, cores) && elements >= npu.distributeMinElements;
+  std::string label;
+  llvm::raw_string_ostream os(label);
+  os << op->getName().getStringRef() << ' ' << op->getResult(0).getType();
+  cost::recordDecision(fn, kind, label, split ? "split" : "one core",
+                       {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(npu)},
+                        {"saving_us", cost::splitSavingUs(npu, cycles, cores)}, {"split_cost_us", npu.coreSplitUs}});
+  return split;
+}
 
 bool supported(linalg::GenericOp op, func::FuncOp fn) {
   if (op->getBlock() != &fn.front() || !op.hasPureTensorSemantics() ||
@@ -231,12 +265,14 @@ LogicalResult distributeRows(func::FuncOp fn, const TargetSpec &target, IRRewrit
   for (Operation *root : llvm::reverse(roots)) {
     if (root->getBlock() != &fn.front() || root->use_empty()) continue;     // fused into a later chain
     auto type = dyn_cast<RankedTensorType>(root->getResult(0).getType());
-    if (!type || !type.hasStaticShape() || type.getRank() < 2 ||
-        type.getNumElements() < target.npu.distributeMinElements)
-      continue;
+    if (!type || !type.hasStaticShape() || type.getRank() < 2) continue;
     int64_t cores = largestDivisorAtMost(type.getDimSize(0), target.npu.cores);
+    if (cores < 2) continue;
     llvm::SetVector<Operation *> chain = rowProducers(root, fn);
-    if (cores < 2 || !chainFits(root, chain, cores, target)) continue;
+    double cycles = oneCoreCycles(root, target);
+    for (Operation *op : chain) cycles += oneCoreCycles(op, target);
+    if (!splitDecision(fn, root, "split rows", cycles, cores, target) || !chainFits(root, chain, cores, target))
+      continue;
     root->setAttr(marker, rewriter.getUnitAttr());
     root->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
     for (Operation *op : chain)
@@ -301,9 +337,12 @@ struct HybNpuElementwiseDistributePass
         if (!supported(generic, fn)) { ++unsupported; continue; }
         ++candidates;
         auto type = cast<RankedTensorType>(generic.getResult(0).getType());
-        if (type.getNumElements() < target->npu.distributeMinElements) { ++small; continue; }
         auto part = partition(generic, target->npu.cores);
         if (!part) { ++indivisible; continue; }
+        if (!splitDecision(fn, generic, "split", oneCoreCycles(generic, *target), part->cores, *target)) {
+          ++small;
+          continue;
+        }
         if (!fitsLocalTile(generic, *part, *target)) { ++capacity; continue; }
         scf::SCFTilingOptions options;
         options.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
@@ -338,13 +377,13 @@ struct HybNpuElementwiseDistributePass
       for (linalg::TransposeOp t : layouts) {
         auto type = dyn_cast<RankedTensorType>(t->getResult(0).getType());
         if (!t.hasPureTensorSemantics() || !type || !type.hasStaticShape() || !type.getElementType().isF16() ||
-            type.getNumElements() < target->npu.distributeMinElements ||
             !t.getInit().getDefiningOp<tensor::EmptyOp>())
           continue;
         int64_t cores = largestDivisorAtMost(type.getDimSize(0), target->npu.cores);
         uint64_t tileBytes = 2 * uint64_t(type.getNumElements()) * 2 / uint64_t(std::max<int64_t>(cores, 1));
         if (cores < 2 || target->npu.l1Bytes <= target->npu.l1ReservedBytes ||
-            tileBytes > uint64_t(target->npu.l1Bytes - target->npu.l1ReservedBytes))
+            tileBytes > uint64_t(target->npu.l1Bytes - target->npu.l1ReservedBytes) ||
+            !splitDecision(fn, t, "split transpose", oneCoreCycles(t, *target), cores, *target))
           continue;
         scf::SCFTilingOptions options;
         options.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);

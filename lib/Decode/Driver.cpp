@@ -152,6 +152,8 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.input_pipeline_copy", "hyb.input_pipeline_tile", "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
     // hyb-npu-epilogue-pipeline
     "hyb.epilogue_pipeline", "hyb.epilogue_pipelines", "hyb.epilogue_consumer", "hyb.epilogue_consumers",
+    // NpuCost.h: choices and their numbers
+    "hyb.decisions",
 };
 
 /// The MLIR pass pipeline, in five stages. Each stage hands the next one a more concrete program:

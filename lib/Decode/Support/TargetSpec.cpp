@@ -33,6 +33,19 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(n, "clock_mhz", s.npu.clockMHz); num(n, "cores", s.npu.cores); num(n, "sa_rows", s.npu.saRows);
   num(n, "sa_cols", s.npu.saCols); num(n, "l1_bytes", s.npu.l1Bytes); num(n, "l2_bytes", s.npu.l2Bytes);
   num(n, "lp6_read_gbps", s.npu.lp6ReadGBps); num(n, "gemv_fixed_us", s.npu.gemvFixedUs);
+  num(n, "l1_read_bytes_per_cycle", s.npu.l1ReadBytesPerCycle);
+  num(n, "l1_write_bytes_per_cycle", s.npu.l1WriteBytesPerCycle);
+  num(n, "mma_k_per_cycle", s.npu.mmaKPerCycle); num(n, "mma_pipeline_cycles", s.npu.mmaPipelineCycles);
+  num(n, "vector_lanes", s.npu.vectorLanes); num(n, "vector_exp_per_cycle", s.npu.vectorExpPerCycle);
+  num(n, "vector_rcp_per_cycle", s.npu.vectorRcpPerCycle); num(n, "vector_sqrt_per_cycle", s.npu.vectorSqrtPerCycle);
+  num(n, "gdma_read_gbps", s.npu.gdmaReadGBps); num(n, "core_split_us", s.npu.coreSplitUs);
+  if (s.npu.l1ReadBytesPerCycle <= 0 || s.npu.l1WriteBytesPerCycle <= 0 || s.npu.mmaKPerCycle <= 0 ||
+      s.npu.mmaPipelineCycles < 0 || s.npu.vectorLanes <= 0 || s.npu.vectorExpPerCycle <= 0 ||
+      s.npu.vectorRcpPerCycle <= 0 || s.npu.vectorSqrtPerCycle <= 0 || !(s.npu.gdmaReadGBps > 0) ||
+      !(s.npu.coreSplitUs >= 0)) {
+    error = "npu timing values must be positive (core_split_us non-negative)";
+    return failure();
+  }
   num(p, "clock_mhz", s.pim.clockMHz); num(p, "pus", s.pim.pus); num(p, "lanes", s.pim.lanes);
   num(p, "channels", s.pim.channels); num(p, "ranks", s.pim.ranks); num(p, "partitions", s.pim.partitions);
   num(p, "nlld_ck", s.pim.nlldCK); num(p, "efficiency", s.pim.efficiency); num(p, "phase_fixed_us", s.pim.phaseFixedUs);

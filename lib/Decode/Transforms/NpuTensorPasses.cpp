@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/SCF/Transforms/TileUsingInterface.h"
@@ -224,11 +225,22 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
     for (hyb::DequantOp d : deqs) {
       auto t = cast<ShapedType>(d.getInit().getType());
       int64_t N = t.getDimSize(1);
-      const int64_t threshold = target.npu.dequantMinElements > 0
-          ? target.npu.dequantMinElements : target.npu.distributeMinElements;
-      if (t.getNumElements() < threshold) continue;
       int64_t cores = largestDivisorAtMost(N / 32, target.npu.cores);
       if (cores < 2) continue;
+      // The split rule of NpuCost.h; npu.dequant_min_elements (0: npu.distribute_min_elements) is a
+      // floor kept for experiments.
+      const int64_t floor = target.npu.dequantMinElements > 0
+          ? target.npu.dequantMinElements : target.npu.distributeMinElements;
+      double cycles = double(t.getNumElements()) * cost::dequantCyclesPerElement(target.npu);
+      bool split = cost::splitPays(target.npu, cycles, cores) && t.getNumElements() >= floor;
+      std::string label;
+      llvm::raw_string_ostream os(label);
+      os << "hyb.dequant " << d.getInit().getType();
+      cost::recordDecision(fn, "split dequant", label, split ? "split" : "one core",
+                           {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(target.npu)},
+                            {"saving_us", cost::splitSavingUs(target.npu, cycles, cores)},
+                            {"split_cost_us", target.npu.coreSplitUs}});
+      if (!split) continue;
       scf::SCFTilingOptions opts;
       opts.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
       opts.setNumThreads(indexAttrs(rewriter, {0, cores}));

@@ -23,6 +23,22 @@ struct TargetSpec {
     // Cost model of hyb-partition: sustained LP6 read bandwidth and a fixed cost per GEMV.
     double lp6ReadGBps = 19.0, gemvFixedUs = 2.0;
 
+    // ---- timing of the NPU itself (NpuCost.h; the simulator's model, docs/architecture/NPU_SIMULATOR.md) --
+    // The passes compare these costs to choose between equivalent programs; every choice is a function
+    // of the tensor shapes and these numbers, never of the step kind.
+    int64_t l1ReadBytesPerCycle = 128;     // L1: 32 banks x 4 B read ports (one shared by M_LD and V_LD)
+    int64_t l1WriteBytesPerCycle = 128;    // and 32 x 4 B write ports
+    int64_t mmaKPerCycle = 2;              // INT8 MACs per PE per cycle: a 32-deep K piece feeds in 16 cycles
+    int64_t mmaPipelineCycles = 2;         // INT8 pipeline latency; a chain drains in rows + cols - 3 + this
+    int64_t vectorLanes = 16;              // 32-bit lanes: FP32 elements per cycle of a lane ALU op
+    int64_t vectorExpPerCycle = 4;         // shared SFUs: EXP, reciprocal, (r)sqrt elements per cycle
+    int64_t vectorRcpPerCycle = 2, vectorSqrtPerCycle = 2;
+    // Sustained LP6 -> L2 read of all cores together: a program's GDMA reads replayed without compute.
+    double gdmaReadGBps = 92.9;
+    // Fixed cost of running one op on several cores instead of one (dispatch, the cross-core events
+    // and the per-core copies of its operands): measured, see npu.core_split_us in the target files.
+    double coreSplitUs = 0.5;
+
     // ---- memory plan (hyb-npu-memplan, backend) ---------------------------------------------------
     // L1 [4 KiB, 4 KiB + l1Reserved) holds the backend's constant pool and scratch.
     // L2 [0, cores x l2StagingPerCore) holds each core's LP6 <-> L1 staging window; zero sizes the
@@ -30,10 +46,12 @@ struct TargetSpec {
     int64_t l1ReservedBytes = 256 << 10, l2StagingPerCore = 512 << 10;
 
     // ---- tiling (hyb-npu-tile and the passes that size tiles) ------------------------------------
-    // Weight bytes per GEMV loop tile; ops smaller than distributeMinElements stay on one core.
-    int64_t gemvTileBytes = 128 << 10, distributeMinElements = 16384;
-    // Dequant distribution threshold; zero inherits distributeMinElements.
-    int64_t dequantMinElements = 0;
+    // Weight bytes per GEMV loop tile (at least one SA column block: K x saCols bytes).
+    int64_t gemvTileBytes = 128 << 10;
+    // Whether an op is split over the cores is a cost comparison (NpuCost.h, coreSplitUs). These
+    // are only floors for experiments: ops with fewer elements stay on one core (0: no floor;
+    // dequantMinElements 0 inherits distributeMinElements).
+    int64_t distributeMinElements = 0, dequantMinElements = 0;
 
     // ---- GEMV weight streaming (backend, CodegenLoops.cpp) -----------------------------------------
     // Ring slots in the L2 staging window; zero removes the cap (capacity and trip count still bound it).
@@ -55,9 +73,9 @@ struct TargetSpec {
     // op (SiLU(gate) * up) is split so each core computes the same columns of both halves and
     // applies that op itself; neither half goes through L2.
     bool pairGateUp = false;
-    // hyb-npu-epilogue-pipeline: that op also runs tile by tile behind the second GEMV. It helps
-    // when the GEMV waits for weights (verify); with many rows the extra L1 traffic slows the SA
-    // operand loads (prefill), so it is separate.
+    // hyb-npu-epilogue-pipeline: that op may also run tile by tile behind the second GEMV. It is
+    // placed there only when the loop waits for weights (NpuCost.h): a core issues in order, so in
+    // a compute-bound loop VPU work between tiles delays the next tile's MMA.
     bool pairConsumerPipeline = false;
     bool elementwiseDistribution = false;  // hyb-npu-elementwise-distribute
     // hyb-npu-elementwise-distribute also splits token-row work over the cores: hyb.quant and
@@ -69,7 +87,7 @@ struct TargetSpec {
     // hyb-npu-rope: a rotate-half RoPE becomes two half-width generics on a per-core range of heads,
     // written straight into the head-major layout when that transpose is its only user.
     bool ropeSplit = false;
-    // Only RoPE tensors with at least this many elements (a small one is cheaper on one core).
+    // Applied when splitting pays (NpuCost.h); ropeSplitMinElements is a floor for experiments.
     int64_t ropeSplitMinElements = 0;
     bool activationResidency = false;      // hyb-npu-activation-residency
     bool matrixInitElision = false;        // hyb-npu-matrix-init

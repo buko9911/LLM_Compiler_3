@@ -103,6 +103,21 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
         {"groups", count("hyb.input_pipeline_groups")}, {"tiles", count("hyb.input_pipeline_tiles")},
         {"columns", spec.npu.inputTileColumns}, {"async_input_loads", spec.npu.asyncInputLoads}};
 
+  // Choices made by comparing costs (NpuCost.h), with the numbers behind each.
+  if (auto decisions = phase->getAttrOfType<ArrayAttr>("hyb.decisions")) {
+    json::Array list;
+    for (Attribute a : decisions) {
+      json::Object entry;
+      for (NamedAttribute f : cast<DictionaryAttr>(a)) {
+        if (auto v = dyn_cast<StringAttr>(f.getValue())) entry[f.getName().str()] = v.getValue().str();
+        else if (auto v = dyn_cast<FloatAttr>(f.getValue())) entry[f.getName().str()] = v.getValueAsDouble();
+        else if (auto v = dyn_cast<IntegerAttr>(f.getValue())) entry[f.getName().str()] = v.getInt();
+      }
+      list.push_back(std::move(entry));
+    }
+    report["decisions"] = std::move(list);
+  }
+
   // Backend scheduling.
   if (spec.npu.asyncOutputStores)
     report["async_output_stores"] = json::Object{

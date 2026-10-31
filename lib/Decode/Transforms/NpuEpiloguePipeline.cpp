@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
@@ -104,16 +105,21 @@ std::optional<Candidate> match(scf::ForallOp forall, scf::ForOp loop) {
 }
 
 /// The all-parallel identity-map 2-D generic right after the second dequant that reads both
-/// dequant outputs (and nothing else) and writes a fresh L1 buffer of the same shape: it can run
-/// on each finished tile's rows and columns.
+/// dequant outputs (and nothing else; an output may be read twice) and writes a fresh L1 buffer
+/// of the same shape: it can run on each finished tile's rows and columns.
 linalg::GenericOp pairConsumer(hyb::DequantOp first, hyb::DequantOp second) {
   auto g = dyn_cast_or_null<linalg::GenericOp>(second->getNextNode());
-  if (!g || g.getNumDpsInputs() != 2 || g.getNumDpsInits() != 1 || g.getNumLoops() != 2 ||
+  if (!g || g.getNumDpsInputs() < 2 || g.getNumDpsInits() != 1 || g.getNumLoops() != 2 ||
       g.getNumReductionLoops() || !llvm::all_of(g.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
     return {};
   Value a = viewRoot(first.getInit()), b = viewRoot(second.getInit());
-  Value in0 = viewRoot(g.getDpsInputs()[0]), in1 = viewRoot(g.getDpsInputs()[1]);
-  if (!((in0 == a && in1 == b) || (in0 == b && in1 == a))) return {};
+  bool readsA = false, readsB = false;
+  for (Value in : g.getDpsInputs()) {
+    Value root = viewRoot(in);
+    if (root != a && root != b) return {};
+    (root == a ? readsA : readsB) = true;
+  }
+  if (!readsA || !readsB) return {};
   auto out = g.getDpsInits()[0];
   auto shape = cast<MemRefType>(out.getType()).getShape();
   for (Value v : g->getOperands())
@@ -124,6 +130,40 @@ linalg::GenericOp pairConsumer(hyb::DequantOp first, hyb::DequantOp second) {
   auto alloc = viewRoot(out).getDefiningOp<memref::AllocOp>();
   if (!alloc || alloc->getBlock() != g->getBlock()) return {};
   return g;
+}
+
+/// Whether the gate/up consumer should run tile by tile inside the up GEMV loop. A core issues its
+/// instructions in order, so VPU work placed between two tiles delays the next tile's operand load
+/// and MMA. Per tile (NpuCost.h): the weight stream time of the tile against the SA time (operand
+/// loads + MMA chain) plus the dequant already placed there. When the stream is longer (the loop
+/// waits for weights), the consumer goes inside: up to the slack it is hidden, beyond it it costs
+/// no more than after the loop. When the SA side is longer, the loop is compute bound and the
+/// consumer stays after it (inside, every tile would wait for it). Measured on Qwen3-4B one-layer
+/// fixtures: inside is faster at M = 8 and 16, after at M = 32 and 64.
+bool consumerFits(func::FuncOp fn, scf::ForOp loop, linalg::GenericOp consumer, int64_t cores,
+                  const TargetSpec &target) {
+  linalg::GenericOp gemv;
+  loop.walk([&](linalg::GenericOp g) {
+    if (g->hasAttr("hyb.npu_gemv")) gemv = g;
+  });
+  if (!gemv) return false;
+  SmallVector<int64_t> dom = gemv.getStaticLoopRanges();      // (m, blocks, 32, k) of one tile
+  const int64_t m = dom[0], columns = dom[1] * dom[2], k = dom[3];
+  const auto &npu = target.npu;
+  const double stream = cost::streamCycles(npu, columns * k, cores);
+  const double compute = cost::gemvTileCycles(npu, m, k, columns);
+  const double dequant = double(m * columns) * cost::dequantCyclesPerElement(npu);
+  const double work = double(m * columns) * cost::vectorCyclesPerElement(npu, consumer);
+  const double slack = stream - compute - dequant;
+  bool inside = slack >= 0;
+  std::string label;
+  llvm::raw_string_ostream os(label);
+  os << "gate/up consumer, tile " << m << "x" << columns << " k " << k;
+  const double us = cost::cyclesPerUs(npu);
+  cost::recordDecision(fn, "consumer per tile", label, inside ? "inside the GEMV loop" : "after the loop",
+                       {{"stream_us", stream / us}, {"sa_us", compute / us}, {"dequant_us", dequant / us},
+                        {"consumer_us", work / us}, {"slack_us", slack / us}});
+  return inside;
 }
 
 struct HybNpuEpiloguePipelinePass
@@ -159,8 +199,10 @@ struct HybNpuEpiloguePipelinePass
           ++count;
         }
         // Gate/up pair: the op on both halves runs tile by tile behind the second GEMV as well.
+        int64_t cores = f->hasAttr("hyb.cores") ? f->getAttrOfType<IntegerAttr>("hyb.cores").getInt() : 1;
         if (target->npu.pairConsumerPipeline && f->hasAttr("hyb.gemv_pair") && pipelined.size() == 2)
-          if (auto consumer = pairConsumer(pipelined[0], pipelined[1])) {
+          if (auto consumer = pairConsumer(pipelined[0], pipelined[1]);
+              consumer && consumerFits(fn, loops.back(), consumer, cores, *target)) {
             consumer->setAttr("hyb.epilogue_consumer", pipelined[1]->getAttr("hyb.epilogue_pipeline"));
             ++consumers;
           }

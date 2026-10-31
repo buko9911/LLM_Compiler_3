@@ -397,9 +397,19 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
         if (at + size <= s) break;
         at = std::max(at, e);
       }
-      if (at + size > limit)
-        return fn.emitError() << (b.space == kL1 ? "L1" : "L2") << " overflow: needs " << at + size << " bytes, limit "
-                              << limit;
+      if (at + size > limit) {
+        // Name the largest buffers live with this one, so the overflow can be traced to its ops.
+        std::vector<const Buf *> live = {&b};
+        for (size_t j : placed)
+          if (bufs[j].space == b.space && !(bufs[j].last < b.first || bufs[j].first > b.last)) live.push_back(&bufs[j]);
+        std::sort(live.begin(), live.end(),
+                  [](const Buf *x, const Buf *y) { return x->bytes * x->slots > y->bytes * y->slots; });
+        auto diag = fn.emitError() << (b.space == kL1 ? "L1" : "L2") << " overflow: needs " << at + size
+                                   << " bytes, limit " << limit << "; largest live buffers:";
+        for (size_t k = 0; k < live.size() && k < 6; ++k)
+          diag << " " << Value(const_cast<Buf *>(live[k])->alloc.getResult()).getType() << (live[k]->slots > 1 ? " x2" : "") << ";";
+        return diag;
+      }
       b.offset = at;
       peak[b.space] = std::max(peak[b.space], at + size);
       placed.push_back(i);

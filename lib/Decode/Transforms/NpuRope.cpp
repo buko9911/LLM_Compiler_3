@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 
 namespace mlir::hybrid {
@@ -199,6 +200,27 @@ void rewrite(Rope &r, int64_t coreLimit) {
   r.negation.erase();
 }
 
+/// The split rule of NpuCost.h on the work the rewrite distributes: the RoPE generic, the negation,
+/// the rotate-half concat and (when folded) the head-major transpose, all on one core otherwise.
+/// npu.rope_split_min_elements is a floor kept for experiments (0 by default).
+bool pays(func::FuncOp fn, const Rope &r, const TargetSpec &target) {
+  auto x = cast<RankedTensorType>(r.x.getType());
+  const double elements = double(x.getNumElements());
+  const double copy = elements * cost::copyCyclesPerElement(target.npu, 2);
+  double cycles = cost::genericCycles(target.npu, r.rope) + cost::genericCycles(target.npu, r.negation) + copy;
+  if (r.transpose) cycles += copy;
+  int64_t cores = largestDivisorAtMost(x.getDimSize(1), target.npu.cores);
+  bool split = cost::splitPays(target.npu, cycles, cores) && x.getNumElements() >= target.npu.ropeSplitMinElements;
+  std::string label;
+  llvm::raw_string_ostream os(label);
+  os << "rope " << r.x.getType();
+  cost::recordDecision(fn, "split rope", label, split ? "split" : "one core",
+                       {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(target.npu)},
+                        {"saving_us", cost::splitSavingUs(target.npu, cycles, cores)},
+                        {"split_cost_us", target.npu.coreSplitUs}});
+  return split;
+}
+
 struct HybNpuRopePass : mlir::hybrid::impl::HybNpuRopeBase<HybNpuRopePass> {
   using Base::Base;
   void runOnOperation() override {
@@ -209,9 +231,7 @@ struct HybNpuRopePass : mlir::hybrid::impl::HybNpuRopeBase<HybNpuRopePass> {
       SmallVector<Rope> found;
       for (Operation &op : fn.front())
         if (auto g = dyn_cast<linalg::GenericOp>(op))
-          if (auto r = match(g);
-              r && cast<RankedTensorType>(r->x.getType()).getNumElements() >= target->npu.ropeSplitMinElements)
-            found.push_back(*r);
+          if (auto r = match(g); r && pays(fn, *r, *target)) found.push_back(*r);
       for (Rope &r : found) rewrite(r, target->npu.cores);
       fn->setAttr("hyb.rope_splits", IntegerAttr::get(IntegerType::get(&getContext(), 64), int64_t(found.size())));
     }
