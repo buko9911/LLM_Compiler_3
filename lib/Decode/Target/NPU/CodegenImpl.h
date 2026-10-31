@@ -320,9 +320,15 @@ private:
   struct PendingDequant {
     hyb::DequantOp dequant;
     int64_t col0, cols, row = 0;
+    linalg::GenericOp consumer;    // hyb.epilogue_consumer: applied to the same rows and columns
   };
   std::optional<PendingDequant> pendingDequant;
   DenseMap<Operation *, int64_t> dequantTail;
+  /// Columns of an epilogue consumer still to emit at the op itself (the pipelined loop did the rest).
+  DenseMap<Operation *, int64_t> consumerTail;
+  /// An identity-map 2-D generic on rows [row0, row0 + rows) and columns [col0, col0 + cols) only.
+  LogicalResult lowerGenericBlock(linalg::GenericOp g, int64_t row0, int64_t rows, int64_t col0, int64_t cols,
+                                  std::string &err);
   LogicalResult emitPendingDequant(int64_t done, int64_t total, std::string &err);
   void transfer2d(int64_t ss, int64_t ds, uint64_t src, uint64_t dst, uint32_t runBytes, uint32_t rows,
                   uint32_t sStride, uint32_t dStride, std::string &err);

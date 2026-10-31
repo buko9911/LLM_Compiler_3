@@ -50,6 +50,11 @@ add_test(NAME decode-elementwise-distribution COMMAND "${Python3_EXECUTABLE}"
   --output "${CMAKE_CURRENT_BINARY_DIR}/elementwise-distribution")
 set_tests_properties(decode-elementwise-distribution PROPERTIES LABELS compiler)
 
+add_test(NAME decode-prefill-layout COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/npu_prefill_layout.py" --optimizer $<TARGET_FILE:npu-opt>
+  --output "${CMAKE_CURRENT_BINARY_DIR}/prefill-layout")
+set_tests_properties(decode-prefill-layout PROPERTIES LABELS compiler)
+
 add_test(NAME decode-row-distribution COMMAND "${Python3_EXECUTABLE}"
   "${CMAKE_CURRENT_SOURCE_DIR}/npu_row_distribution.py" --optimizer $<TARGET_FILE:npu-opt>
   --output "${CMAKE_CURRENT_BINARY_DIR}/row-distribution")

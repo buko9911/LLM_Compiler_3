@@ -328,6 +328,43 @@ struct HybNpuElementwiseDistributePass
         rewriter.replaceOp(generic, result->replacements);
         ++count;
       }
+      // npu.distribute_transposes: a top-level FP16 transpose (a strided copy) over the cores by
+      // its leading output axis; each core moves its own output rows.
+      int64_t transposes = 0;
+      SmallVector<linalg::TransposeOp> layouts;
+      if (target->npu.distributeTransposes)
+        for (Operation &op : fn.front())
+          if (auto t = dyn_cast<linalg::TransposeOp>(op)) layouts.push_back(t);
+      for (linalg::TransposeOp t : layouts) {
+        auto type = dyn_cast<RankedTensorType>(t->getResult(0).getType());
+        if (!t.hasPureTensorSemantics() || !type || !type.hasStaticShape() || !type.getElementType().isF16() ||
+            type.getNumElements() < target->npu.distributeMinElements ||
+            !t.getInit().getDefiningOp<tensor::EmptyOp>())
+          continue;
+        int64_t cores = largestDivisorAtMost(type.getDimSize(0), target->npu.cores);
+        uint64_t tileBytes = 2 * uint64_t(type.getNumElements()) * 2 / uint64_t(std::max<int64_t>(cores, 1));
+        if (cores < 2 || target->npu.l1Bytes <= target->npu.l1ReservedBytes ||
+            tileBytes > uint64_t(target->npu.l1Bytes - target->npu.l1ReservedBytes))
+          continue;
+        scf::SCFTilingOptions options;
+        options.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+        SmallVector<OpFoldResult> threads(type.getRank(), rewriter.getIndexAttr(0));
+        threads[0] = rewriter.getIndexAttr(cores);
+        options.setNumThreads(threads);
+        rewriter.setInsertionPoint(t);
+        auto result = scf::tileUsingSCF(rewriter, cast<TilingInterface>(t.getOperation()), options);
+        if (failed(result) || result->loops.size() != 1) {
+          t.emitError("cannot distribute the transpose");
+          return signalPassFailure();
+        }
+        auto loop = result->loops.front();
+        loop->setAttr("hyb.cores", rewriter.getI64IntegerAttr(cores));
+        loop->setAttr(marker, rewriter.getUnitAttr());
+        loop->setAttr("hyb.elementwise_axis", rewriter.getI64IntegerAttr(0));
+        loop->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
+        rewriter.replaceOp(t, result->replacements);
+        ++transposes;
+      }
       RewritePatternSet cleanup(&getContext());
       tensor::populateFoldTensorEmptyPatterns(cleanup);
       for (Dialect *dialect : getContext().getLoadedDialects()) dialect->getCanonicalizationPatterns(cleanup);
@@ -345,6 +382,7 @@ struct HybNpuElementwiseDistributePass
         record("hyb.row_distributions", rowChains);
         record("hyb.row_fused", rowFused);
       }
+      if (target->npu.distributeTransposes) record("hyb.transposes_distributed", transposes);
     }
   }
 };

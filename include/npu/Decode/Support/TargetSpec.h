@@ -51,10 +51,26 @@ struct TargetSpec {
     bool projectionFusion = false;         // hyb-npu-projection-fusion
     bool attentionFusion = false;          // hyb-npu-attention-fusion
     bool gemvEpilogueFusion = false;       // hyb-npu-gemv-epilogue
+    // hyb-npu-gemv-epilogue: a two-segment fused GEMV (gate;up) whose halves feed one elementwise
+    // op (SiLU(gate) * up) is split so each core computes the same columns of both halves and
+    // applies that op itself; neither half goes through L2.
+    bool pairGateUp = false;
+    // hyb-npu-epilogue-pipeline: that op also runs tile by tile behind the second GEMV. It helps
+    // when the GEMV waits for weights (verify); with many rows the extra L1 traffic slows the SA
+    // operand loads (prefill), so it is separate.
+    bool pairConsumerPipeline = false;
     bool elementwiseDistribution = false;  // hyb-npu-elementwise-distribute
     // hyb-npu-elementwise-distribute also splits token-row work over the cores: hyb.quant and
     // row reductions (RMSNorm, q/k norm), with their single-use row-wise producers fused.
     bool rowDistribution = false;
+    // hyb-npu-elementwise-distribute also splits top-level FP16 transposes over the cores by their
+    // leading output axis (the V and attention-output layouts around attention).
+    bool distributeTransposes = false;
+    // hyb-npu-rope: a rotate-half RoPE becomes two half-width generics on a per-core range of heads,
+    // written straight into the head-major layout when that transpose is its only user.
+    bool ropeSplit = false;
+    // Only RoPE tensors with at least this many elements (a small one is cheaper on one core).
+    int64_t ropeSplitMinElements = 0;
     bool activationResidency = false;      // hyb-npu-activation-residency
     bool matrixInitElision = false;        // hyb-npu-matrix-init
     bool matmulRhsPacking = false;         // hyb-npu-matmul-layout: pack the transposed RHS

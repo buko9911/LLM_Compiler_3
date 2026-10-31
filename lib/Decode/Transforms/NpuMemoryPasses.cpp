@@ -363,6 +363,9 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
         b.last = std::max(b.last, end[anchor]);
         if (Attribute id = u->getAttr("hyb.epilogue_pipeline"); id && pipelineLoops.count(id))
           b.first = std::min(b.first, pos[pipelineLoops[id]]);
+        // An epilogue consumer also runs tile by tile inside that loop.
+        if (Attribute id = u->getAttr("hyb.epilogue_consumer"); id && pipelineLoops.count(id))
+          b.first = std::min(b.first, pos[pipelineLoops[id]]);
       });
       if (b.last < 0) {
         b.first = b.last = pos[a];

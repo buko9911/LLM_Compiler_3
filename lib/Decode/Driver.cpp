@@ -131,12 +131,14 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     // hyb-npu-attention-fusion
     "hyb.attention_fusion", "hyb.attention_fused",
     // hyb-npu-gemv-epilogue
-    "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions",
+    "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions", "hyb.gemv_pair",
     // hyb-npu-elementwise-distribute
     "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
     "hyb.elementwise_original_shape", "hyb.elementwise_candidates", "hyb.elementwise_small",
     "hyb.elementwise_unsupported", "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
-    "hyb.row_chain", "hyb.row_distributions", "hyb.row_fused",
+    "hyb.row_chain", "hyb.row_distributions", "hyb.row_fused", "hyb.transposes_distributed",
+    // hyb-npu-rope
+    "hyb.rope_split", "hyb.rope_splits",
     // hyb-npu-activation-residency
     "hyb.activation_residency_private_results",
     // hyb-npu-promote
@@ -149,7 +151,7 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     // hyb-npu-input-pipeline
     "hyb.input_pipeline_copy", "hyb.input_pipeline_tile", "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
     // hyb-npu-epilogue-pipeline
-    "hyb.epilogue_pipeline", "hyb.epilogue_pipelines",
+    "hyb.epilogue_pipeline", "hyb.epilogue_pipelines", "hyb.epilogue_consumer", "hyb.epilogue_consumers",
 };
 
 /// The MLIR pass pipeline, in five stages. Each stage hands the next one a more concrete program:
@@ -174,6 +176,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
   // 3. Fusion and tiling (tensor level): fuse first, then distribute over cores and tile for L1.
   const std::string fusion =
       "hyb-npu-projection-fusion" + spec + ","                // q/k/v and gate/up -> one GEMV each
+      "hyb-npu-rope" + spec + ","                             // rotate-half RoPE per core, head-major
       "hyb-npu-flash-attention" + spec + ","                  // online-softmax attention (opt-in)
       "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
       "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core

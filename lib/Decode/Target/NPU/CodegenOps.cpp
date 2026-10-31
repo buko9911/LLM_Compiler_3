@@ -6,6 +6,7 @@
 
 #include "CodegenImpl.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/IR/IRMapping.h"
 #include <algorithm>
 #include <functional>
 #include <set>
@@ -341,6 +342,13 @@ LogicalResult Codegen::emitPendingDequant(int64_t done, int64_t total, std::stri
   int64_t due = rows * done / total;              // rows owed after `done` of `total` MMAs
   if (due > p.row) {
     if (failed(lowerDequant(p.dequant, err, p.row, due - p.row, p.col0, p.cols))) return failure();
+    if (p.consumer) {
+      int previousSource = w.currentSource;
+      if (w.traceOperations) w.currentSource = sourceIds.lookup(p.consumer.getOperation());
+      LogicalResult r = lowerGenericBlock(p.consumer, p.row, due - p.row, p.col0, p.cols, err);
+      w.currentSource = previousSource;
+      if (failed(r)) return failure();
+    }
     p.row = due;
   }
   if (p.row == rows) pendingDequant.reset();
@@ -486,14 +494,42 @@ LogicalResult Codegen::lowerDequant(hyb::DequantOp d, std::string &err, int64_t 
   return success();
 }
 
+LogicalResult Codegen::lowerGenericBlock(linalg::GenericOp g, int64_t row0, int64_t rows, int64_t col0,
+                                         int64_t cols, std::string &err) {
+  // The block as views of the same buffers, lowered by the ordinary generic path and removed again.
+  OpBuilder b(g);
+  Location loc = g.getLoc();
+  SmallVector<Operation *> temporary;
+  IRMapping mapping;
+  for (Value v : g->getOperands()) {
+    auto view = memref::SubViewOp::create(b, loc, v,
+        SmallVector<OpFoldResult>{b.getIndexAttr(row0), b.getIndexAttr(col0)},
+        SmallVector<OpFoldResult>{b.getIndexAttr(rows), b.getIndexAttr(cols)},
+        SmallVector<OpFoldResult>{b.getIndexAttr(1), b.getIndexAttr(1)});
+    mapping.map(v, view.getResult());
+    temporary.push_back(view);
+  }
+  auto block = cast<linalg::GenericOp>(b.clone(*g.getOperation(), mapping));
+  block->removeAttr("hyb.epilogue_consumer");
+  temporary.push_back(block);
+  LogicalResult r = lowerGeneric(block, err);
+  for (Operation *op : llvm::reverse(temporary)) op->erase();
+  return r;
+}
+
 LogicalResult Codegen::lower(Operation *op, std::string &err) {
   for (Value o : op->getOperands())
     if (isa<MemRefType>(o.getType()) && spaceOf(o.getType()) != kL1) {
       err = "compute op with an operand outside L1 (run hyb-npu-promote)";
       return failure();
     }
-  if (auto g = dyn_cast<linalg::GenericOp>(op))
+  if (auto g = dyn_cast<linalg::GenericOp>(op)) {
+    if (auto tail = consumerTail.find(op); tail != consumerTail.end()) {
+      auto shape = cast<ShapedType>(g.getDpsInits()[0].getType()).getShape();
+      return lowerGenericBlock(g, 0, shape[0], tail->second, shape[1] - tail->second, err);
+    }
     return g->hasAttr("hyb.npu_gemv") ? lowerGemv(g, err) : lowerGeneric(g, err);
+  }
   if (auto f = dyn_cast<linalg::FillOp>(op)) return lowerFill(f, err);
   if (isa<linalg::MatmulOp, linalg::BatchMatmulOp>(op)) return lowerMatmul(cast<linalg::LinalgOp>(op), err);
   if (auto t = dyn_cast<linalg::TransposeOp>(op)) return lowerCopy(op, t.getInput(), t.getInit(), t.getPermutation(), err);

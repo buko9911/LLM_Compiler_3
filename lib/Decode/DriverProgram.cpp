@@ -84,6 +84,12 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
         {"capacity_rejected", count("hyb.elementwise_capacity")},
         {"indivisible", count("hyb.elementwise_indivisible")},
         {"min_elements", spec.npu.distributeMinElements}};
+  if (spec.npu.elementwiseDistribution && spec.npu.distributeTransposes)
+    (*report["elementwise_distribution"].getAsObject())["transposes"] = count("hyb.transposes_distributed");
+  if (spec.npu.ropeSplit) report["rope_split"] = json::Object{{"applied", count("hyb.rope_splits")}};
+  if (spec.npu.pairGateUp)
+    report["gate_up_pair"] = json::Object{{"consumer_pipeline", spec.npu.pairConsumerPipeline},
+                                          {"consumers_pipelined", count("hyb.epilogue_consumers")}};
   if (spec.npu.activationResidency)
     report["activation_residency"] =
         json::Object{{"private_result_destinations", count("hyb.activation_residency_private_results")}};

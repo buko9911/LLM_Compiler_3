@@ -45,15 +45,8 @@ bool writesRoot(Operation *op, Value root) {
   return writes;
 }
 
-std::optional<Candidate> match(scf::ForallOp forall) {
+std::optional<Candidate> match(scf::ForallOp forall, scf::ForOp loop) {
   Block &body = forall.getRegion().front();
-  scf::ForOp loop;
-  for (Operation &op : body)
-    if (auto f = dyn_cast<scf::ForOp>(op); f && f->hasAttr("hyb.stream")) {
-      if (loop) return std::nullopt;     // one streamed GEMV per core body
-      loop = f;
-    }
-  if (!loop) return std::nullopt;
   linalg::GenericOp gemv;
   loop.walk([&](linalg::GenericOp g) {
     if (g->hasAttr("hyb.npu_gemv")) gemv = g;
@@ -95,8 +88,9 @@ std::optional<Candidate> match(scf::ForallOp forall) {
     if (writesRoot(loop, viewRoot(copy.getSource()))) return std::nullopt;
     auto alloc = target.getDefiningOp<memref::AllocOp>();
     if (!alloc || alloc->getBlock() != &body) return std::nullopt;
+    // Other dequants of the body (the second GEMV of a gate/up pair) may read the same scale copy.
     for (Operation *user : alloc->getUsers())
-      if (user != copy && user != dequant && !isViewOp(user)) return std::nullopt;
+      if (user != copy && user != dequant && !isViewOp(user) && !isa<hyb::DequantOp>(user)) return std::nullopt;
     c.hoist.push_back(alloc);
     c.hoist.push_back(copy);
   }
@@ -109,6 +103,29 @@ std::optional<Candidate> match(scf::ForallOp forall) {
   return c;
 }
 
+/// The all-parallel identity-map 2-D generic right after the second dequant that reads both
+/// dequant outputs (and nothing else) and writes a fresh L1 buffer of the same shape: it can run
+/// on each finished tile's rows and columns.
+linalg::GenericOp pairConsumer(hyb::DequantOp first, hyb::DequantOp second) {
+  auto g = dyn_cast_or_null<linalg::GenericOp>(second->getNextNode());
+  if (!g || g.getNumDpsInputs() != 2 || g.getNumDpsInits() != 1 || g.getNumLoops() != 2 ||
+      g.getNumReductionLoops() || !llvm::all_of(g.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
+    return {};
+  Value a = viewRoot(first.getInit()), b = viewRoot(second.getInit());
+  Value in0 = viewRoot(g.getDpsInputs()[0]), in1 = viewRoot(g.getDpsInputs()[1]);
+  if (!((in0 == a && in1 == b) || (in0 == b && in1 == a))) return {};
+  auto out = g.getDpsInits()[0];
+  auto shape = cast<MemRefType>(out.getType()).getShape();
+  for (Value v : g->getOperands())
+    if (cast<MemRefType>(v.getType()).getMemorySpaceAsInt() != 1 ||
+        cast<MemRefType>(v.getType()).getShape() != shape)
+      return {};
+  if (cast<MemRefType>(second.getInit().getType()).getShape() != shape) return {};
+  auto alloc = viewRoot(out).getDefiningOp<memref::AllocOp>();
+  if (!alloc || alloc->getBlock() != g->getBlock()) return {};
+  return g;
+}
+
 struct HybNpuEpiloguePipelinePass
     : mlir::hybrid::impl::HybNpuEpiloguePipelineBase<HybNpuEpiloguePipelinePass> {
   using Base::Base;
@@ -119,21 +136,37 @@ struct HybNpuEpiloguePipelinePass
     Builder b(&getContext());
     int64_t id = 0;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
-      int64_t count = 0;
+      int64_t count = 0, consumers = 0;
       SmallVector<scf::ForallOp> foralls;
       fn.walk([&](scf::ForallOp f) {
         if (f->hasAttr("hyb.gemv_epilogue")) foralls.push_back(f);
       });
       for (scf::ForallOp f : foralls) {
-        auto c = match(f);
-        if (!c) continue;
-        for (Operation *op : c->hoist) op->moveBefore(c->loop);
-        c->loop->setAttr("hyb.epilogue_pipeline", b.getI64IntegerAttr(id));
-        c->dequant->setAttr("hyb.epilogue_pipeline", b.getI64IntegerAttr(id));
-        ++id;
-        ++count;
+        // Every streamed GEMV of the core body (two for a gate/up pair) with the dequant after it.
+        SmallVector<scf::ForOp> loops;
+        for (Operation &op : f.getRegion().front())
+          if (auto loop = dyn_cast<scf::ForOp>(op); loop && loop->hasAttr("hyb.stream")) loops.push_back(loop);
+        if (loops.size() > 1 && !f->hasAttr("hyb.gemv_pair")) continue;
+        SmallVector<hyb::DequantOp> pipelined;
+        for (scf::ForOp loop : loops) {
+          auto c = match(f, loop);
+          if (!c) continue;
+          for (Operation *op : c->hoist) op->moveBefore(c->loop);
+          c->loop->setAttr("hyb.epilogue_pipeline", b.getI64IntegerAttr(id));
+          c->dequant->setAttr("hyb.epilogue_pipeline", b.getI64IntegerAttr(id));
+          pipelined.push_back(c->dequant);
+          ++id;
+          ++count;
+        }
+        // Gate/up pair: the op on both halves runs tile by tile behind the second GEMV as well.
+        if (target->npu.pairConsumerPipeline && f->hasAttr("hyb.gemv_pair") && pipelined.size() == 2)
+          if (auto consumer = pairConsumer(pipelined[0], pipelined[1])) {
+            consumer->setAttr("hyb.epilogue_consumer", pipelined[1]->getAttr("hyb.epilogue_pipeline"));
+            ++consumers;
+          }
       }
       fn->setAttr("hyb.epilogue_pipelines", b.getI64IntegerAttr(count));
+      if (consumers) fn->setAttr("hyb.epilogue_consumers", b.getI64IntegerAttr(consumers));
     }
   }
 };

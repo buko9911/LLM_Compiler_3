@@ -75,6 +75,10 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("staging_misc_fit_rings", s.npu.stagingMiscFitRings) ||
       !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
       !booleanOption("row_distribution", s.npu.rowDistribution) ||
+      !booleanOption("distribute_transposes", s.npu.distributeTransposes) ||
+      !booleanOption("rope_split", s.npu.ropeSplit) ||
+      !booleanOption("pair_gate_up", s.npu.pairGateUp) ||
+      !booleanOption("pair_consumer_pipeline", s.npu.pairConsumerPipeline) ||
       !booleanOption("vector_scalar_reuse", s.npu.vectorScalarReuse) ||
       !booleanOption("vector_chunk_pipeline", s.npu.vectorChunkPipeline) ||
       !booleanOption("quant_fused_max", s.npu.quantFusedMax) ||
@@ -89,6 +93,14 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("flash_decoding", s.npu.flashDecoding) ||
       !booleanOption("flash_kv_slicing", s.npu.flashKvSlicing))
     return failure();
+  if (n && n->get("rope_split_min_elements")) {
+    auto value = n->getInteger("rope_split_min_elements");
+    if (!value || *value < 0) {
+      error = "npu.rope_split_min_elements must be a non-negative integer";
+      return failure();
+    }
+    s.npu.ropeSplitMinElements = *value;
+  }
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");
     if (!value || *value < 0 || *value > 1024) {

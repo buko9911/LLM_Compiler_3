@@ -118,8 +118,8 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 모두 기본 false(꺼짐)다. `configs/baselines/`의 세 설정(1토큰 decode `qwen3_4b_m1_c512.json`, 8토큰 verify
 `qwen3_4b_m8_c512.json`, 64토큰 prefill `qwen3_4b_prefill64.json`)은 Qwen3-4B에서 측정으로 골랐고, 2026-10-31부터
-`npu.*` 스위치가 셋 모두 같다(아래 표의 "켬"). 36층 전체는 `--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는
-`../../docs/research/NPU_ONLY_BASELINE.md`에 있다.
+`npu.*` 스위치가 셋 모두 같다(아래 표의 "켬"). 예외는 `pair_consumer_pipeline`으로 prefill만 끈다. 36층 전체는
+`--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`에 있다.
 
 | 키 | 담당 | 세 설정 |
 |---|---|:-:|
@@ -138,6 +138,10 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `cross_phase_prefetch` | 다음 phase GDMA load가 barrier 대신 같은 주소의 앞 접근만 기다림 | 켬 |
 | `quant_fused_max`, `vector_loops` | codegen: quant max를 register에서, 반복 VPU 묶음을 hardware loop로 | 켬 |
 | `command_schedule` | system command 재배열 | 켬 |
+| `rope_split` (+ `rope_split_min_elements` 정수) | pass `hyb-npu-rope`: rotate-half RoPE를 head 축으로 코어에 나눈 반쪽 generic 둘로, 뒤 전치는 head 단위 출력에 접음 | 켬, 65536 |
+| `distribute_transposes` | `hyb-npu-elementwise-distribute`: 맨 위 FP16 전치를 코어에 나눔 | 켬 |
+| `pair_gate_up` | `hyb-npu-gemv-epilogue`: gate·up 두 반쪽의 같은 열을 한 코어가 계산하고 SiLU×up까지 | 켬 |
+| `pair_consumer_pipeline` | `hyb-npu-epilogue-pipeline`: 짝지은 루프에서 SiLU×up을 up 타일마다 dequant 뒤에 | 켬(prefill만 끔) |
 
 정수 옵션(`gemv_tile_bytes`, `distribute_min_elements`, `dequant_min_elements`, `l2_staging_bytes_per_core`,
 `weight_stream_max_slots`, `weight_prefetch_batch_tiles`, `input_tile_columns`)과 하드웨어 값은
@@ -152,7 +156,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `npu-lit` | `npu-opt` lit 테스트 |
 | `pim-layout` | PIM 배치 |
 | `decode-driver` | CLI 경로와 오류 |
-| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-flash-attention`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution`, `decode-row-distribution` | pass별 IR 회귀 |
+| `decode-memplan`, `decode-gemv-optimizations`, `decode-projection-fusion`, `decode-flash-attention`, `decode-activation-residency`, `decode-attention-fusion`, `decode-input-pipeline`, `decode-matmul-layout`, `decode-elementwise-distribution`, `decode-row-distribution`, `decode-prefill-layout` | pass별 IR 회귀 |
 | `decode-frontend` | export한 그래프를 HF 모델과 비교(simulator 설정 필요) |
 | `decode-runtime-backend` | runtime의 DRAM backend 선택 |
 

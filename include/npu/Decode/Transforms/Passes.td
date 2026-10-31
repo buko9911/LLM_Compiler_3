@@ -138,6 +138,22 @@ def HybNpuFlashAttention : Pass<"hyb-npu-flash-attention", "ModuleOp"> {
                            "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
 }
 
+def HybNpuRope : Pass<"hyb-npu-rope", "ModuleOp"> {
+  let summary = "Rotate-half RoPE per core on half-width rows, head-major output (npu.rope_split)";
+  let description = [{
+    The exported RoPE is x * cos + concat(-x[..., D/2:], x[..., :D/2]) * sin. The concatenation
+    becomes an L2 buffer assembled by single-core copies, and the [1, 0, 2] transpose into the
+    head-major attention layout another single-core pass. Each output half needs only the two
+    halves of x (lo = x_lo cos_lo - x_hi sin_lo, hi = x_hi cos_hi + x_lo sin_hi, the same
+    floating-point operations), so both halves become generics over a per-core range of heads that
+    write the head-major layout directly when that transpose is the only user.
+    Not applied to modules with PIM phases.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect"];
+}
+
 def HybNpuAttentionFusion : Pass<"hyb-npu-attention-fusion", "ModuleOp"> {
   let summary = "Keep each head's QK, mask, softmax and PV on one core (npu.attention_fusion)";
   let description = [{
