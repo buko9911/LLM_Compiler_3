@@ -202,7 +202,6 @@ void rewrite(Rope &r, int64_t coreLimit) {
 
 /// The split rule of NpuCost.h on the work the rewrite distributes: the RoPE generic, the negation,
 /// the rotate-half concat and (when folded) the head-major transpose, all on one core otherwise.
-/// npu.rope_split_min_elements is a floor kept for experiments (0 by default).
 bool pays(func::FuncOp fn, const Rope &r, const TargetSpec &target) {
   auto x = cast<RankedTensorType>(r.x.getType());
   const double elements = double(x.getNumElements());
@@ -210,7 +209,7 @@ bool pays(func::FuncOp fn, const Rope &r, const TargetSpec &target) {
   double cycles = cost::genericCycles(target.npu, r.rope) + cost::genericCycles(target.npu, r.negation) + copy;
   if (r.transpose) cycles += copy;
   int64_t cores = largestDivisorAtMost(x.getDimSize(1), target.npu.cores);
-  bool split = cost::splitPays(target.npu, cycles, cores) && x.getNumElements() >= target.npu.ropeSplitMinElements;
+  bool split = cost::splitPays(target.npu, cycles, cores);
   std::string label;
   llvm::raw_string_ostream os(label);
   os << "rope " << r.x.getType();
@@ -226,7 +225,7 @@ struct HybNpuRopePass : mlir::hybrid::impl::HybNpuRopeBase<HybNpuRopePass> {
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.ropeSplit || hasPimPhase(getOperation())) return;
+    if (hasPimPhase(getOperation())) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<Rope> found;
       for (Operation &op : fn.front())

@@ -50,11 +50,6 @@ bool isFree(Operation *op) {
 struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlinePhasesPass> {
   using Base::Base;
   void runOnOperation() override {
-    if (npuSplit != "layer" && npuSplit != "none") {
-      getOperation().emitError("npu-split must be layer or none");
-      signalPassFailure();
-      return;
-    }
     ModuleOp module = getOperation();
     func::FuncOp step = getStepFunction(module);
     Block &body = step.getBody().front();
@@ -103,7 +98,7 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
       int64_t g = kind == "pim" ? cast<hyb::QMatmulOp>(op).getGroup().value_or(-1) : -1;
       std::optional<int64_t> layer;
       if (auto w = op.getAttrOfType<StringAttr>("hyb.npu_gemv")) layer = layerOf(w.getValue());
-      bool split = npuSplit == "layer" && layer && !segments.empty() && segments.back().kind == "npu" &&
+      bool split = layer && !segments.empty() && segments.back().kind == "npu" &&
                    segments.back().gemvLayer && *segments.back().gemvLayer != *layer;
       if (segments.empty() || segments.back().kind != kind || segments.back().group != g || split ||
           packetKernel || segments.back().packetKernel)

@@ -75,11 +75,10 @@ def main():
         "norm_only": ({"quant": False}, {}, [1], 4),
         "shared_norm": ({"share_norm": True}, {}, [1, 0], 4),
         # Tiny shapes exercise the rewrite with no split cost; the cost rule itself is below.
-        "row_divisor": ({"rows": 6, "columns": 256}, {"distribute_min_elements": 1, "core_split_us": 0}, [2], 3),
-        "not_worth_splitting": ({"rows": 4, "columns": 64}, {"distribute_min_elements": 1}, [], None),
+        "row_divisor": ({"rows": 6, "columns": 256}, {"core_split_us": 0}, [2], 3),
+        "not_worth_splitting": ({"rows": 4, "columns": 64}, {}, [], None),
         "one_row": ({"rows": 1}, {}, [], None),
         "small": ({"rows": 8, "columns": 64}, {}, [], None),
-        "off": ({}, {"row_distribution": False}, [], None),
         "pim": ({"phase": "pim"}, {}, [], None),
     }
     results = {}
@@ -87,7 +86,6 @@ def main():
         src = out / f"{name}.mlir"
         src.write_text(source(**kwargs))
         spec = json.loads((root / "configs/target.json").read_text())
-        spec["npu"].update(elementwise_distribution=True, row_distribution=True)
         spec["npu"].update(options)
         target = out / f"{name}.json"
         target.write_text(json.dumps(spec))
@@ -109,7 +107,7 @@ def main():
             again = subprocess.run([command[0], "-", flag], input=run.stdout, text=True, capture_output=True)
             assert again.returncode == 0, (name, again.stderr)
             assert again.stdout.count("scf.forall (") == run.stdout.count("scf.forall ("), (name, "double distribution")
-        elif "row_distribution" not in options and kwargs.get("phase") != "pim":
+        elif kwargs.get("phase") != "pim":
             assert "hyb.row_distributions = 0 : i64" in run.stdout, name
         results[name] = dict(passed=True, chains=found)
     (out / "summary.json").write_text(json.dumps(results, indent=2) + "\n")

@@ -126,7 +126,6 @@ LogicalResult makePlan(const NpuPhaseInput &in, Plan &plan, std::string &error) 
   auto kernel = in.phase->getAttrOfType<StringAttr>("hyb.npu_kernel");
   if (!kernel || kernel.getValue() != "pim_packet_g4")
     return fail(error, "phase is not explicitly selected for pim_packet_g4");
-  if (!in.weightPrefetch) return fail(error, "the fixed packet schedule requires weight prefetch");
   if (phase.getBody().getBlocks().size() != 1)
     return fail(error, "only a single-block qmatmul phase is supported");
   hyb::QMatmulOp operation;

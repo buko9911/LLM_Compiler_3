@@ -43,7 +43,6 @@ def main():
     checks = {}
     cases = [
         ('qkv',source(),{},1,1),
-        ('off',source(),{'projection_fusion':False},0,3),
         ('different_input',source(different_input=True),{},1,2),
         ('different_scale',source(different_scale=True),{},1,2),
         ('shared_accumulator',source(shared=True),{},1,2),
@@ -51,15 +50,15 @@ def main():
         ('different_math',source().replace('arith.muli','arith.addi'),{},0,3),
         ('pim',source().replace('hyb.phase="npu"','hyb.phase="pim"'),{},0,3),
         ('small_sram',source(),{'l1_bytes':270336},0,3),
-        # With gemv_epilogue_fusion a core partition that does not fit L1 is cut into column chunks,
+        # A core partition that does not fit L1 is cut into column chunks (hyb-npu-gemv-epilogue),
         # so only one SA column block per core must fit: 532480 B holds one block (530560 B) but not
         # the whole 160-column partition (537216 B); 516096 B holds neither.
-        ('chunked_epilogue',source(),{'gemv_epilogue_fusion':True,'l1_bytes':532480},1,1),
-        ('chunked_epilogue_too_small',source(),{'gemv_epilogue_fusion':True,'l1_bytes':516096},0,3),
+        ('chunked_epilogue',source(),{'l1_bytes':532480},1,1),
+        ('chunked_epilogue_too_small',source(),{'l1_bytes':516096},0,3),
     ]
     for name,text,options,groups,contractions in cases:
         sp=out/f'{name}.json'; src=out/f'{name}.mlir'
-        sp.write_text(json.dumps({'npu':{'projection_fusion':True,**options}}));src.write_text(text)
+        sp.write_text(json.dumps({'npu':options}));src.write_text(text)
         cmd=[str(a.optimizer.resolve()),str(src),f'--hyb-npu-projection-fusion=spec={sp.resolve()}',
              '--canonicalize','--verify-each']
         p=subprocess.run(cmd,text=True,capture_output=True)
@@ -73,11 +72,11 @@ def main():
             assert f'choice = "{choice}", kind = "fuse projections"' in p.stdout,(name,p.stdout)
         checks[name]={'groups':groups,'contractions':contractions}
     for key in ['projection_fusion','weight_stream_early_release']:
-        sp=out/'invalid.json';sp.write_text(json.dumps({'npu':{key:'true'}}))
+        sp=out/'invalid.json';sp.write_text(json.dumps({'npu':{key:True}}))
         p=subprocess.run([str(a.optimizer.resolve()),str(out/'qkv.mlir'),
             f'--hyb-npu-projection-fusion=spec={sp.resolve()}'],text=True,capture_output=True)
-        assert p.returncode and f'npu.{key} must be a boolean' in p.stderr
-        checks[key]={'invalid_type_rejected':True}
+        assert p.returncode and f'npu.{key} is not a target parameter' in p.stderr, p.stderr
+        checks[key]={'switch_rejected':True}
     # Input identity, not function-local numeric group annotations, determines
     # partition membership. Two functions must not accidentally share group 0.
     src=out/'partition.mlir'

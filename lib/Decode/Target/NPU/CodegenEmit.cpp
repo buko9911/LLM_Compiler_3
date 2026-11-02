@@ -186,10 +186,10 @@ SmallVector<Codegen::L2Range> Codegen::rowRanges(uint64_t base, uint64_t rowByte
   return ranges;
 }
 
-/// npu.cross_phase_prefetch: a GDMA may wait for records of earlier phases. An ISA dependency reaches
-/// 65,535 records back; the phase entry, which follows every earlier record, replaces older ones.
+/// A GDMA may wait for records of earlier phases (they are carried across the phase boundary). An
+/// ISA dependency reaches 65,535 records back; the phase entry, which follows every earlier record,
+/// replaces older ones.
 void Codegen::reachableDependencies(std::vector<int> &deps) const {
-  if (!in.spec->npu.crossPhasePrefetch) return;
   const int oldest = w.numCommands() - 60000;
   if (llvm::any_of(deps, [&](int d) { return d < oldest; })) {
     llvm::erase_if(deps, [&](int d) { return d < oldest; });
@@ -198,13 +198,11 @@ void Codegen::reachableDependencies(std::vector<int> &deps) const {
 }
 
 /// LP6 -> L2 (2-D). Waits for earlier stores to the LP6 range and every earlier access to
-/// the L2 range. With npu.cross_phase_prefetch the accesses include the previous NPU phases',
-/// so a load needs no phase barrier. `stream` marks a weight-stream ring load (npu.gdma_lookahead).
+/// the L2 range. The accesses include the previous NPU phases', so a load needs no phase barrier.
+/// `stream` marks a weight-stream ring load, the only GDMAs counted against npu.gdma_lookahead.
 int Codegen::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t rows, uint32_t lp6Stride,
                       uint32_t l2Stride, bool stream) {
-  uint64_t le = lp6 + uint64_t(rows - 1) * lp6Stride + rowBytes, l2e = l2 + uint64_t(rows - 1) * l2Stride + rowBytes;
-  auto l2Ranges = in.spec->npu.commandSchedule ? rowRanges(l2,rowBytes,rows,l2Stride) : SmallVector<L2Range>{{l2,l2e}};
-  auto lp6Ranges = in.spec->npu.commandSchedule ? rowRanges(lp6,rowBytes,rows,lp6Stride) : SmallVector<L2Range>{{lp6,le}};
+  auto l2Ranges = rowRanges(l2,rowBytes,rows,l2Stride), lp6Ranges = rowRanges(lp6,rowBytes,rows,lp6Stride);
   auto touches = [&](uint64_t s, uint64_t e, ArrayRef<L2Range> ranges) {
     return llvm::any_of(ranges,[&](auto r) { return overlaps(s,e,r.first,r.second); });
   };
@@ -221,8 +219,7 @@ int Codegen::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t row
   reachableDependencies(deps);
   std::sort(deps.begin(), deps.end());
   deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
-  int id = w.appendGdma(ProgramBuilder::Kind::GdmaLoad, deps, lp6, l2, rowBytes, rows, lp6Stride, l2Stride,
-                        stream || !in.spec->npu.gdmaLookaheadStreamsOnly);
+  int id = w.appendGdma(ProgramBuilder::Kind::GdmaLoad, deps, lp6, l2, rowBytes, rows, lp6Stride, l2Stride, stream);
   llvm::erase_if(l2acc, [&](const Acc &a) {
     return llvm::any_of(l2Ranges,[&](auto r) { return a.s >= r.first && a.e <= r.second; });
   });
@@ -234,15 +231,12 @@ int Codegen::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t row
 /// L2 -> LP6 (2-D). Waits for the writers of the L2 range and earlier accesses to the LP6 range.
 int Codegen::gdmaStore(uint64_t l2, uint64_t lp6, uint32_t rowBytes, uint32_t rows, uint32_t l2Stride,
                        uint32_t lp6Stride) {
-  uint64_t le = lp6 + uint64_t(rows - 1) * lp6Stride + rowBytes, l2e = l2 + uint64_t(rows - 1) * l2Stride + rowBytes;
-  auto l2Ranges = in.spec->npu.commandSchedule ? rowRanges(l2,rowBytes,rows,l2Stride) : SmallVector<L2Range>{{l2,l2e}};
-  auto lp6Ranges = in.spec->npu.commandSchedule ? rowRanges(lp6,rowBytes,rows,lp6Stride) : SmallVector<L2Range>{{lp6,le}};
+  auto l2Ranges = rowRanges(l2,rowBytes,rows,l2Stride), lp6Ranges = rowRanges(lp6,rowBytes,rows,lp6Stride);
   auto touches = [&](uint64_t s, uint64_t e, ArrayRef<L2Range> ranges) {
     return llvm::any_of(ranges,[&](auto r) { return overlaps(s,e,r.first,r.second); });
   };
   for (const Acc &a : l2acc)
-    if (a.id < 0 && a.core == curCore && touches(a.s,a.e,l2Ranges) &&
-        (!in.spec->npu.commandSchedule || a.k == CW)) {
+    if (a.id < 0 && a.core == curCore && touches(a.s,a.e,l2Ranges) && a.k == CW) {
       flush();
       break;
     }
@@ -254,8 +248,7 @@ int Codegen::gdmaStore(uint64_t l2, uint64_t lp6, uint32_t rowBytes, uint32_t ro
   reachableDependencies(deps);
   std::sort(deps.begin(), deps.end());
   deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
-  int id = w.appendGdma(ProgramBuilder::Kind::GdmaStore, deps, lp6, l2, rowBytes, rows, lp6Stride, l2Stride,
-                        !in.spec->npu.gdmaLookaheadStreamsOnly);
+  int id = w.appendGdma(ProgramBuilder::Kind::GdmaStore, deps, lp6, l2, rowBytes, rows, lp6Stride, l2Stride, false);
   for (auto [s,e] : l2Ranges) l2acc.push_back({s,e,id,curCore,GR});
   llvm::erase_if(lp6acc, [&](const LAcc &a) {
     return llvm::any_of(lp6Ranges,[&](auto r) { return a.s >= r.first && a.e <= r.second; });
@@ -271,7 +264,7 @@ void Codegen::coreDependencies(uint64_t s, uint64_t e, bool write, std::vector<i
     if (!overlaps(a.s, a.e, s, e) || a.id < 0) continue;
     // A core block follows the phase entry (its core's first block waits for it), which follows
     // every record of earlier phases.
-    if (in.spec->npu.crossPhasePrefetch && a.id < phaseFirstCommand) continue;
+    if (a.id < phaseFirstCommand) continue;
     bool other = a.core != curCore && (a.k == CW || a.k == CR);
     if (a.k == GW || (write && a.k == GR) || (other && (write || a.k == CW)))
       if (!satisfied[size_t(curCore)].count(a.id)) need.push_back(a.id);
@@ -300,8 +293,7 @@ void Codegen::ldma(uint64_t l1, uint64_t l2, uint32_t rowBytes, uint32_t rows, u
   waitInputLoad();
   waitOutputStore(); // single output slot; also protects same-core L2 readers
   coreAccess(rowRanges(l2, rowBytes, rows, toL1 ? srcStride : dstStride), !toL1);
-  bool async = !toL1 && in.spec->npu.asyncOutputStores;
-  bool inputAsync = toL1 && in.spec->npu.asyncInputLoads;
+  bool async = !toL1, inputAsync = toL1;
   if (rows == 1 || (srcStride == rowBytes && dstStride == rowBytes)) {
     setConfig(7, rowBytes * rows);
     load(1, uint32_t(l1));

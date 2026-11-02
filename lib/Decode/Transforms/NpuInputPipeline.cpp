@@ -160,7 +160,6 @@ struct HybNpuInputPipelinePass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.inputTilePipeline) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<memref::CopyOp> copies;
       fn.walk([&](memref::CopyOp copy) { copies.push_back(copy); });

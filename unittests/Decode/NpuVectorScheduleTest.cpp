@@ -18,15 +18,13 @@ using namespace mlir::hybrid;
 namespace {
 struct Emission { std::string bytes, error; NpuPhaseStats stats; };
 
-void emit(const std::string &source, bool reuse, bool pipeline, Emission &result, bool expectFailure = false) {
+void emit(const std::string &source, Emission &result, bool expectFailure = false) {
   DialectRegistry registry;
   registry.insert<arith::ArithDialect, func::FuncDialect, linalg::LinalgDialect, memref::MemRefDialect>();
   MLIRContext context(registry);
   auto module = parseSourceString<ModuleOp>(source, &context);
   ASSERT_TRUE(module);
   TargetSpec spec;
-  spec.npu.vectorScalarReuse = reuse;
-  spec.npu.vectorChunkPipeline = pipeline;
   plena::ProgramBuilder program;
   program.beginPhase("vector-schedule-test", {});
   NpuPhaseInput input;
@@ -76,34 +74,28 @@ std::string elementwise(int64_t destination, bool overlappingRows = false, bool 
 
 TEST(NpuVectorSchedule, SeparateBuffersAndExactInPlaceAreLegal) {
   for (int64_t address : {266240, 270336}) {
-    Emission off, on;
-    emit(elementwise(address), false, false, off);
-    emit(elementwise(address), false, true, on);
-    EXPECT_EQ(on.stats.vectorPipelineGroups, 2);
-    EXPECT_EQ(on.stats.vectorPipelinedChunks, 4);
-    EXPECT_NE(off.bytes, on.bytes);
+    Emission e;
+    emit(elementwise(address), e);
+    // The two rows run as one hardware loop, so its body (one group of two chunks) is emitted once.
+    EXPECT_EQ(e.stats.vectorPipelineGroups, 1);
+    EXPECT_EQ(e.stats.vectorPipelinedChunks, 2);
   }
 }
 
 TEST(NpuVectorSchedule, ShiftedPhysicalAliasesKeepOriginalOrder) {
   for (int64_t address : {266238, 266242}) {
-    Emission off, on;
-    emit(elementwise(address), false, false, off);
-    emit(elementwise(address), false, true, on);
-    EXPECT_EQ(on.stats.vectorPipelineGroups, 0);
-    EXPECT_EQ(off.bytes, on.bytes);
+    Emission e;
+    emit(elementwise(address), e);
+    EXPECT_EQ(e.stats.vectorPipelineGroups, 0);
   }
 }
 
 TEST(NpuVectorSchedule, OverlappingRowsAndAliasedBroadcastAreOpaque) {
   for (bool overlappingRows : {false, true}) {
     SCOPED_TRACE(overlappingRows ? "overlapping subview rows" : "aliased scalar broadcast");
-    Emission off, on;
-    auto source = elementwise(270336, overlappingRows, !overlappingRows);
-    emit(source, false, false, off);
-    emit(source, false, true, on);
-    EXPECT_EQ(on.stats.vectorPipelineGroups, 0);
-    EXPECT_EQ(off.bytes, on.bytes);
+    Emission e;
+    emit(elementwise(270336, overlappingRows, !overlappingRows), e);
+    EXPECT_EQ(e.stats.vectorPipelineGroups, 0);
   }
 }
 
@@ -114,19 +106,15 @@ TEST(NpuVectorSchedule, NonIdentityAllocationCannotSilentlyBecomeDense) {
   source.replace(source.find(before), before.size(), after);
   const std::string out = "outs(%y:memref<2x65xf16, 1>)";
   source.replace(source.find(out), out.size(), "outs(%y:memref<2x65xf16, strided<[32, 1]>, 1>)");
-  for (bool pipeline : {false, true}) {
-    Emission result;
-    emit(source, false, pipeline, result, true);
-    EXPECT_NE(result.error.find("non-identity allocation layout"), std::string::npos);
-  }
+  Emission result;
+  emit(source, result, true);
+  EXPECT_NE(result.error.find("non-identity allocation layout"), std::string::npos);
 }
 
 TEST(NpuVectorSchedule, ShortTailDoesNotInventAnAdditionalChunk) {
-  Emission off, on;
-  emit(elementwise(270336, false, false, 17), false, false, off);
-  emit(elementwise(270336, false, false, 17), true, true, on);
-  EXPECT_EQ(on.stats.vectorPipelineGroups, 0);
-  EXPECT_EQ(off.bytes, on.bytes);
+  Emission e;
+  emit(elementwise(270336, false, false, 17), e);
+  EXPECT_EQ(e.stats.vectorPipelineGroups, 0);
 }
 
 TEST(NpuVectorSchedule, FullScalarPoolFallsBackWithoutOverwritingLiveInputs) {
@@ -147,11 +135,9 @@ TEST(NpuVectorSchedule, FullScalarPoolFallsBackWithoutOverwritingLiveInputs) {
   for (int i = 0; i < 13; ++i)
     source += "%v" + std::to_string(i) + " = arith.divf " + (i ? "%v"+std::to_string(i-1) : "%wide") + ",%a" + std::to_string(i) + " : f32\n";
   source += "%result = arith.truncf %v12 : f32 to f16\nlinalg.yield %result : f16\n} return\n}}";
-  Emission off, on;
-  emit(source, false, false, off);
-  emit(source, true, true, on);
-  EXPECT_EQ(on.stats.vectorScalarReciprocals, 0);
-  EXPECT_EQ(on.stats.vectorPipelineGroups, 0);
-  EXPECT_EQ(off.bytes, on.bytes);
+  Emission e;
+  emit(source, e);
+  EXPECT_EQ(e.stats.vectorScalarReciprocals, 0);
+  EXPECT_EQ(e.stats.vectorPipelineGroups, 0);
 }
 } // namespace

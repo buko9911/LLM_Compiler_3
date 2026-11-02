@@ -132,14 +132,14 @@ def main():
 
     # hyb-npu-rope: (source, spec, rewritten, head-major output)
     rope_cases = {
-        "head_major": (rope_source(), dict(rope_split=True), True, True),
-        "token_major": (rope_source(transpose=False), dict(rope_split=True), True, False),
-        "add_order": (rope_source(body="r*s+x*c"), dict(rope_split=True), True, True),
-        "two_transposes": (rope_source(users=2), dict(rope_split=True), True, False),
-        "not_rope": (rope_source(body="x*c-r*s"), dict(rope_split=True), False, False),
-        "off": (rope_source(), dict(rope_split=False), False, False),
-        "below_threshold": (rope_source(), dict(rope_split=True, rope_split_min_elements=1 << 20), False, False),
-        "pim": (rope_source(phase="pim"), dict(rope_split=True), False, False),
+        "head_major": (rope_source(), dict(), True, True),
+        "token_major": (rope_source(transpose=False), dict(), True, False),
+        "add_order": (rope_source(body="r*s+x*c"), dict(), True, True),
+        "two_transposes": (rope_source(users=2), dict(), True, False),
+        "not_rope": (rope_source(body="x*c-r*s"), dict(), False, False),
+        # The split rule of NpuCost.h: splitting saves less than a split costs.
+        "split_does_not_pay": (rope_source(), dict(core_split_us=100.0), False, False),
+        "pim": (rope_source(phase="pim"), dict(), False, False),
     }
     for name, (text, options, rewritten, head_major) in rope_cases.items():
         got = run(opt, out, f"rope_{name}", text, [f"--hyb-npu-rope=spec={spec(out, name, **options)}"])
@@ -156,13 +156,12 @@ def main():
             assert "tensor.concat" in got and not re.findall(r"hyb\.rope_split(?!s)", got), (name, got)
         results[f"rope_{name}"] = dict(passed=True, rewritten=rewritten)
 
-    # npu.distribute_transposes inside hyb-npu-elementwise-distribute
+    # Transposes inside hyb-npu-elementwise-distribute (split by the cost rule)
     for name, rows, options, expected in [
-        ("transpose_split", 64, dict(distribute_transposes=True), 1),
-        ("transpose_off", 64, dict(distribute_transposes=False), 0),
-        ("transpose_small", 8, dict(distribute_transposes=True), 0),
+        ("transpose_split", 64, dict(), 1),
+        ("transpose_small", 8, dict(), 0),
     ]:
-        sp = spec(out, name, elementwise_distribution=True, distribute_min_elements=16384, **options)
+        sp = spec(out, name, **options)
         got = run(opt, out, name, transpose_source(rows=rows), [f"--hyb-npu-elementwise-distribute=spec={sp}"])
         assert got.count("scf.forall (") == expected, (name, got)
         if expected:
@@ -170,13 +169,12 @@ def main():
             assert re.search(r"linalg.transpose ins\(%\S+ : tensor<64x2x128xf16>\)", got), (name, got)
         results[name] = dict(passed=True, distributed=expected)
 
-    # npu.pair_gate_up: projection fusion, then the GEMV epilogue pairs the halves per core.
+    # Gate/up pairing: projection fusion, then the GEMV epilogue pairs the halves per core.
     for name, text, options, paired in [
-        ("pair", pair_source(), dict(pair_gate_up=True), True),
-        ("pair_off", pair_source(), dict(pair_gate_up=False), False),
-        ("pair_half_also_used", pair_source(extra_use=True), dict(pair_gate_up=True), False),
+        ("pair", pair_source(), dict(), True),
+        ("pair_half_also_used", pair_source(extra_use=True), dict(), False),
     ]:
-        sp = spec(out, name, projection_fusion=True, gemv_epilogue_fusion=True, **options)
+        sp = spec(out, name, **options)
         got = run(opt, out, name, text, [f"--hyb-npu-projection-fusion=spec={sp}", f"--hyb-npu-gemv-epilogue=spec={sp}"])
         loops = got.count("scf.forall (")
         assert loops == 1, (name, got)
@@ -193,8 +191,8 @@ def main():
         sp.write_text(json.dumps({"npu": {option: 1}}))
         p = subprocess.run([str(opt), str(out / "rope_head_major.mlir"), f"--hyb-npu-rope=spec={sp.resolve()}"],
                            text=True, capture_output=True)
-        assert p.returncode != 0 and option in p.stderr, (option, p.stderr)
-        results[f"invalid_{option}"] = dict(passed=True)
+        assert p.returncode != 0 and f"npu.{option} is not a target parameter" in p.stderr, (option, p.stderr)
+        results[f"switch_rejected_{option}"] = dict(passed=True)
     (out / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
     print(out)
 

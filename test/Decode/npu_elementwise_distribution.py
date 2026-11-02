@@ -83,21 +83,21 @@ def main():
     # (source args, spec overrides, expected distributed ops, partition axis/cores).
     cases = {
         "m8_rows": ({}, {}, 1, (0, 4)),
-        "m1_columns": ({"rows": 1}, {"distribute_min_elements": 4096, "core_split_us": 0}, 1, (1, 4)),
-        "m1_default_threshold": ({"rows": 1}, {}, 0, None),
+        "m1_columns": ({"rows": 1}, {"core_split_us": 0}, 1, (1, 4)),
+        # 9728 elements on one core take about 1.5 us, so four cores save more than core_split_us.
+        "m1_cost_rule": ({"rows": 1}, {}, 1, (1, 4)),
         "broadcast_columns": ({"broadcast": True}, {}, 1, (0, 4)),
         "transpose_read_rejected": ({"transposed_input": True}, {}, 0, None),
         "strided_view": ({"strided_input": True}, {}, 1, (0, 4)),
         "read_destination": ({"read_init": True}, {}, 0, None),
         "producer_consumer": ({"chain": True}, {}, 2, (0, 4)),
-        "row_divisor_tail": ({"rows": 6, "columns": 65}, {"distribute_min_elements": 1, "core_split_us": 0}, 1, (0, 3)),
-        "inner_divisor": ({"rows": 1, "columns": 96}, {"distribute_min_elements": 1, "core_split_us": 0}, 1, (1, 3)),
+        "row_divisor_tail": ({"rows": 6, "columns": 65}, {"core_split_us": 0}, 1, (0, 3)),
+        "inner_divisor": ({"rows": 1, "columns": 96}, {"core_split_us": 0}, 1, (1, 3)),
         # The cost rule (NpuCost.h): the same op stays on one core when splitting saves less than the
         # fixed cost of a split, and is split when the cost is lowered.
-        "cost_one_core": ({"rows": 1, "columns": 96}, {"distribute_min_elements": 1, "core_split_us": 0.5}, 0, None),
-        "cost_split": ({"rows": 1, "columns": 96}, {"distribute_min_elements": 1, "core_split_us": 0.001}, 1, (1, 3)),
-        "inner_unaligned": ({"rows": 1, "columns": 100}, {"distribute_min_elements": 1, "core_split_us": 0}, 0, None),
-        "disabled": ({}, {"elementwise_distribution": False}, 0, None),
+        "cost_one_core": ({"rows": 1, "columns": 96}, {"core_split_us": 0.5}, 0, None),
+        "cost_split": ({"rows": 1, "columns": 96}, {"core_split_us": 0.001}, 1, (1, 3)),
+        "inner_unaligned": ({"rows": 1, "columns": 100}, {"core_split_us": 0}, 0, None),
         "single_core": ({}, {"cores": 1}, 0, None),
         "small": ({"rows": 1, "columns": 32}, {}, 0, None),
         "capacity": ({}, {"l1_bytes": 262400}, 0, None),
@@ -116,7 +116,6 @@ def main():
         src = out / f"{name}.mlir"
         src.write_text(text)
         spec = json.loads((root / "configs/target.json").read_text())
-        spec["npu"].update(elementwise_distribution=True)
         spec["npu"].update(options)
         target = out / f"{name}.json"
         target.write_text(json.dumps(spec))
@@ -142,8 +141,9 @@ def main():
             assert again.stdout.count("scf.forall (") == expected, (name, "double distribution")
             assert f"hyb.elementwise_distributions = {expected} : i64" in again.stdout
         results[name] = dict(passed=True, distributions=actual)
+    # The optimizations have no switches: their former keys are rejected whatever their value.
     for option in ("elementwise_distribution", "vector_scalar_reuse", "vector_chunk_pipeline", "command_schedule"):
-        for invalid in (1, "true", None):
+        for invalid in (1, True, None):
             spec = json.loads((root / "configs/target.json").read_text())
             spec["npu"][option] = invalid
             target = out / "invalid.json"

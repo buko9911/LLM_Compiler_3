@@ -1,6 +1,6 @@
 //===- CommandSchedule.cpp - system command order of one NPU phase --------===//
 //
-// ProgramBuilder::schedulePhase (npu.command_schedule), run after the address-range dependencies
+// ProgramBuilder::schedulePhase, run after the address-range dependencies
 // of a phase are built:
 //   1. list-schedule the phase's commands in dependency order, preferring the command whose
 //      nearest core-block consumer has the smallest accumulated instruction depth (core blocks

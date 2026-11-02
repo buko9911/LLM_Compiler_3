@@ -83,9 +83,9 @@ def main():
     output = Path(tempfile.mkdtemp(prefix='run-', dir=args.output))
     results = {}
 
-    def check(name, source, option, enabled, expected, changes=None):
+    def check(name, source, option, expected, changes=None):
         target = json.loads((root/'configs/target.json').read_text())
-        target['npu'].update({option: enabled, **(changes or {})})
+        target['npu'].update(changes or {})
         sp, src = output/f'{name}.json', output/f'{name}.mlir'
         sp.write_text(json.dumps(target)); src.write_text(source)
         epilogue = option == 'gemv_epilogue_fusion'
@@ -104,43 +104,41 @@ def main():
             assert run.stdout.count('hyb.npu_gemv = ') == 1
         results[name] = {'transformed': expected}
 
-    for name, source, enabled, expected, changes in [
-        ('epilogue', tensor_source(), True, True, None),
-        ('epilogue_off', tensor_source(), False, False, None),
-        ('shared_accumulator', tensor_source(shared=True), True, False, None),
-        ('nonzero_accumulator', tensor_source().replace('constant 0 : i32', 'constant 1 : i32'), True, False, None),
-        ('different_weight_scale', tensor_source().replace('weight "proj.weight"', 'weight "other.weight"'), True, False, None),
-        ('pim_phase', tensor_source(phase='pim'), True, False, None),
-        ('one_core', tensor_source(), True, True, {'cores': 1}),
-        ('sram_admission', tensor_source(), True, False, {'l1_bytes': 270336}),
-        ('m33', tensor_source(m=33), True, True, None),
+    for name, source, expected, changes in [
+        ('epilogue', tensor_source(), True, None),
+        ('shared_accumulator', tensor_source(shared=True), False, None),
+        ('nonzero_accumulator', tensor_source().replace('constant 0 : i32', 'constant 1 : i32'), False, None),
+        ('different_weight_scale', tensor_source().replace('weight "proj.weight"', 'weight "other.weight"'), False, None),
+        ('pim_phase', tensor_source(phase='pim'), False, None),
+        ('one_core', tensor_source(), True, {'cores': 1}),
+        ('sram_admission', tensor_source(), False, {'l1_bytes': 270336}),
+        ('m33', tensor_source(m=33), True, None),
     ]:
         # Force several weight tiles in small synthetic examples.
-        check(name, source, 'gemv_epilogue_fusion', enabled, expected,
-              {'gemv_tile_bytes': 2048, **(changes or {})})
+        check(name, source, 'gemv_epilogue_fusion', expected, {'gemv_tile_bytes': 2048, **(changes or {})})
     view = '%v = memref.cast %c : memref<8x32xi32,1> to memref<?x32xi32,1>'
-    for name, source, enabled, expected in [
-        ('init', memref_source(), True, True),
-        ('init_off', memref_source(), False, False),
-        ('nonzero', memref_source(zero=1), True, False),
-        ('read_zero', memref_source(before='memref.copy %c,%out : memref<8x32xi32,1> to memref<8x32xi32,2>'), True, False),
-        ('escape_before', memref_source(before='func.call @escape(%c) : (memref<8x32xi32,1>) -> ()'), True, False),
-        ('view_before', memref_source(before=view), True, False),
-        ('view_after', memref_source(after=view), True, True),
-        ('init_pim', memref_source(phase='pim'), True, False),
+    for name, source, expected in [
+        ('init', memref_source(), True),
+        ('nonzero', memref_source(zero=1), False),
+        ('read_zero', memref_source(before='memref.copy %c,%out : memref<8x32xi32,1> to memref<8x32xi32,2>'), False),
+        ('escape_before', memref_source(before='func.call @escape(%c) : (memref<8x32xi32,1>) -> ()'), False),
+        ('view_before', memref_source(before=view), False),
+        ('view_after', memref_source(after=view), True),
+        ('init_pim', memref_source(phase='pim'), False),
     ]:
-        check(name, source, 'matrix_init_elision', enabled, expected)
+        check(name, source, 'matrix_init_elision', expected)
+    # The optimizations have no switches: their former keys are rejected.
     for key in ('matrix_init_elision','gemv_epilogue_fusion','weight_stream_rotate_slots',
                 'async_output_stores',
                 'async_input_loads','input_tile_pipeline','matmul_rhs_packing',
                 'matmul_transpose_output'):
         spec = output/'invalid.json'
-        spec.write_text(json.dumps({'npu':{key:'true'}}))
+        spec.write_text(json.dumps({'npu':{key:True}}))
         flag = 'hyb-npu-gemv-epilogue' if key == 'gemv_epilogue_fusion' else 'hyb-npu-matrix-init'
         run = subprocess.run([str(args.optimizer.resolve()), str(output/'init.mlir'), f'--{flag}=spec={spec}'],
                              text=True,capture_output=True)
-        assert run.returncode and f'npu.{key} must be a boolean' in run.stderr
-        results[key+'_invalid_type'] = {'rejected': True}
+        assert run.returncode and f'npu.{key} is not a target parameter' in run.stderr, run.stderr
+        results[key+'_rejected'] = {'rejected': True}
     (output/'summary.json').write_text(json.dumps(results,indent=2)+'\n')
     print(json.dumps(results,indent=2))
 

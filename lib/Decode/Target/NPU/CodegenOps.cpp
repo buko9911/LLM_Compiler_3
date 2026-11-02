@@ -103,7 +103,7 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
     err = terr;
     return failure();
   }
-  if (in.spec->npu.stagingEarlyRelease && s.space == kLP6 && d.space == kL1) {
+  if (s.space == kLP6 && d.space == kL1) {
     // A normal buffer-copy boundary has no live vector/scalar/SA value: other
     // lowerings store their results to L1 before returning. Never place this
     // cut inside a reduction, row loop, or event-1 weight prefetch. The stream,
@@ -359,64 +359,52 @@ LogicalResult Codegen::lowerQuant(hyb::QuantOp q, std::string &err) {
   FailureOr<View> X = viewOf(q.getInput(), err), Q = viewOf(q.getQInit(), err), S = viewOf(q.getScaleInit(), err);
   if (failed(X) || failed(Q) || failed(S)) return failure();
   int64_t M = X->shape[0], K = X->shape[1];
-  uint64_t temp = scratchBase, maxSlot = temp + uint64_t(K * 2);
   for (int64_t m = 0; m < M; ++m) {
     uint64_t src = addr(*X, m * X->strides[0]), dst = addr(*Q, m * Q->strides[0]);
-    if (in.spec->npu.quantFusedMax) {
-      // s0 = max|x|: v2 accumulates the lane-wise max of the full chunks, a tail chunk is
-      // reduced on its own (lanes past VL are not defined).
-      const int64_t full = K / 32 * 32;
-      int64_t s = 0;
-      if (full) {
-        setVL(32);
-        vload(0, src, 1);
-        emit(rform(OP_V_UN, 2, 0, 0, 0, 6));                        // v2 = |x| of chunk 0
-        s = 32;
+    // s0 = max|x|: v2 accumulates the lane-wise max of the full chunks, a tail chunk is
+    // reduced on its own (lanes past VL are not defined).
+    const int64_t full = K / 32 * 32;
+    int64_t s = 0;
+    if (full) {
+      setVL(32);
+      vload(0, src, 1);
+      emit(rform(OP_V_UN, 2, 0, 0, 0, 6));                        // v2 = |x| of chunk 0
+      s = 32;
+    }
+    // Four chunks per iteration of a hardware loop, |x| in v7..v10, then folded into v2.
+    if (const int64_t iterations = (full - s) / 128; iterations >= 2) {
+      guardLoopRange(src + uint64_t(s) * 2, src + uint64_t(s + iterations * 128) * 2, false);
+      load(kLoopPointers[0], uint32_t(src + uint64_t(s) * 2));
+      loopBegin(uint32_t(iterations));
+      for (uint32_t u = 0; u < 4; ++u) {
+        vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
+        emit(rform(OP_V_UN, 7 + u, 3 + u, 0, 0, 6));
       }
-      // npu.vector_loops: four chunks per iteration, |x| in v7..v10, then folded into v2.
-      if (const int64_t iterations = in.spec->npu.vectorLoops ? (full - s) / 128 : 0; iterations >= 2) {
-        guardLoopRange(src + uint64_t(s) * 2, src + uint64_t(s + iterations * 128) * 2, false);
-        load(kLoopPointers[0], uint32_t(src + uint64_t(s) * 2));
-        loopBegin(uint32_t(iterations));
-        for (uint32_t u = 0; u < 4; ++u) {
-          vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
-          emit(rform(OP_V_UN, 7 + u, 3 + u, 0, 0, 6));
-        }
-        for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_BIN, 2, 2, 7 + u, 0, 4));
-        advance(kLoopPointers[0], 256);
-        loopEnd();
-        s += iterations * 128;
-      }
-      for (; s < full; s += 32) {
-        setVL(32);
-        vload(0, src + s * 2, 1);
-        emit(rform(OP_V_UN, 1, 0, 0, 0, 6));                        // |x|
-        emit(rform(OP_V_BIN, 2, 2, 1, 0, 4));                       // v2 = max(v2, |x|)
-      }
-      if (full) emit(rform(OP_V_RED, 0, 2, 0, 0, 2));               // s0 = max of v2 (FP32)
-      if (K > full) {
-        setVL(uint32_t(K - full));
-        vload(0, src + full * 2, 1);
-        emit(rform(OP_V_UN, 1, 0, 0, 0, 6));
-        emit(rform(OP_V_RED, full ? 1 : 0, 1, 0, 0, 2));
-        if (full) emit(rform(OP_S_ALU, 0, 0, 1, 0, 4));             // s0 = max(s0, s1)
-      }
-    } else {
-      for (int64_t s = 0; s < K; s += 32) {          // |x|
-        setVL(uint32_t(std::min<int64_t>(32, K - s)));
-        vload(0, src + s * 2, 1);
-        emit(rform(OP_V_UN, 1, 0, 0, 0, 6));
-        vstore(temp + s * 2, 1, 2);
-      }
-      reduceToScalar(temp, K, 2, maxSlot);           // max|x| (FP32)
-      sload(0, maxSlot);
+      for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_BIN, 2, 2, 7 + u, 0, 4));
+      advance(kLoopPointers[0], 256);
+      loopEnd();
+      s += iterations * 128;
+    }
+    for (; s < full; s += 32) {
+      setVL(32);
+      vload(0, src + s * 2, 1);
+      emit(rform(OP_V_UN, 1, 0, 0, 0, 6));                        // |x|
+      emit(rform(OP_V_BIN, 2, 2, 1, 0, 4));                       // v2 = max(v2, |x|)
+    }
+    if (full) emit(rform(OP_V_RED, 0, 2, 0, 0, 2));               // s0 = max of v2 (FP32)
+    if (K > full) {
+      setVL(uint32_t(K - full));
+      vload(0, src + full * 2, 1);
+      emit(rform(OP_V_UN, 1, 0, 0, 0, 6));
+      emit(rform(OP_V_RED, full ? 1 : 0, 1, 0, 0, 2));
+      if (full) emit(rform(OP_S_ALU, 0, 0, 1, 0, 4));             // s0 = max(s0, s1)
     }
     sload(1, uint64_t(poolL1 + scalarConst(1.0f / 127.0f)));
     emit(rform(OP_S_ALU, 0, 0, 1, 0, 3));          // s0 = max / 127
     sstore(addr(*S, m * S->strides[0]), 0);
-    int64_t s = 0;
-    // npu.vector_loops: four chunks per iteration through two pointers (x: 64 B, q: 32 B per chunk).
-    if (const int64_t iterations = in.spec->npu.vectorLoops ? K / 128 : 0; iterations >= 2) {
+    s = 0;
+    // Four chunks per iteration through two pointers (x: 64 B, q: 32 B per chunk).
+    if (const int64_t iterations = K / 128; iterations >= 2) {
       guardLoopRange(src, src + uint64_t(iterations * 128) * 2, false);
       guardLoopRange(dst, dst + uint64_t(iterations * 128), true);
       load(kLoopPointers[0], uint32_t(src));

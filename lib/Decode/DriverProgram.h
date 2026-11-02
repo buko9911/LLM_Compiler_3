@@ -28,7 +28,7 @@ void setPimKernel(plena::ProgramBuilder &program, const pim::Program &prog, bool
 /// io.json entry of every phase.
 bool emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
                 const std::vector<pim::Primitive> &pimCommands, const TargetSpec &spec,
-                plena::ProgramBuilder &program, LP6Extra &extra, bool weightPrefetch, int pimActivationCores,
+                plena::ProgramBuilder &program, LP6Extra &extra, int pimActivationCores,
                 std::vector<int> &exit, int &logicalCores, llvm::json::Array &report, std::string &err);
 
 /// The final "collect" phase: the step outputs into L1 (read back from the SRAM dump), and with

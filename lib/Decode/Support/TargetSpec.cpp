@@ -1,4 +1,5 @@
 #include "npu/Decode/Support/TargetSpec.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include <algorithm>
@@ -56,61 +57,26 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(l, "capacity_bytes", s.lp6.capacityBytes); num(l, "row_bytes", s.lp6.rowBytes);
   num(n, "l1_reserved_bytes", s.npu.l1ReservedBytes); num(n, "l2_staging_bytes_per_core", s.npu.l2StagingPerCore);
   num(n, "weight_stream_max_slots", s.npu.weightStreamMaxSlots);
-  num(n, "weight_prefetch_batch_tiles", s.npu.weightPrefetchBatchTiles);
-  if (n)
-    if (auto v = n->getBoolean("weight_prefetch_cross_batch")) s.npu.weightPrefetchCrossBatch = *v;
-  num(n, "gemv_tile_bytes", s.npu.gemvTileBytes); num(n, "completion_event_slots", s.npu.completionEventSlots); num(n, "distribute_min_elements", s.npu.distributeMinElements);
-  num(n, "dequant_min_elements", s.npu.dequantMinElements);
+  num(n, "gemv_tile_bytes", s.npu.gemvTileBytes); num(n, "completion_event_slots", s.npu.completionEventSlots);
   num(n, "staging_misc_bytes", s.npu.stagingMiscBytes);
-  auto booleanOption = [&](llvm::StringRef key, bool &dst) {
-    if (!n || !n->get(key)) return true;
-    auto value = n->getBoolean(key);
-    if (!value) {
-      error = ("npu." + key + " must be a boolean").str();
-      return false;
+  // The target describes the hardware. Every optimization is applied by the compiler itself when
+  // the shapes and these numbers make it pay, so a key that is not a hardware number (for example
+  // a removed on/off switch) is an error rather than silently ignored.
+  static constexpr llvm::StringLiteral kNpuKeys[] = {
+      "clock_mhz", "cores", "sa_rows", "sa_cols", "l1_bytes", "l2_bytes", "lp6_read_gbps", "gemv_fixed_us",
+      "l1_read_bytes_per_cycle", "l1_write_bytes_per_cycle", "mma_k_per_cycle", "mma_pipeline_cycles",
+      "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps",
+      "core_split_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
+      "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns",
+      "attention_query_tile", "attention_key_tile"};
+  if (n)
+    for (auto &kv : *n) {
+      llvm::StringRef key = kv.first;
+      if (!key.starts_with("_") && !llvm::is_contained(kNpuKeys, key)) {
+        error = ("npu." + key + " is not a target parameter (optimizations have no switches)").str();
+        return failure();
+      }
     }
-    dst = *value;
-    return true;
-  };
-  if (!booleanOption("activation_residency", s.npu.activationResidency) ||
-      !booleanOption("attention_fusion", s.npu.attentionFusion) ||
-      !booleanOption("gemv_epilogue_fusion", s.npu.gemvEpilogueFusion) ||
-      !booleanOption("projection_fusion", s.npu.projectionFusion) ||
-      !booleanOption("weight_stream_early_release", s.npu.weightStreamEarlyRelease) ||
-      !booleanOption("matrix_init_elision", s.npu.matrixInitElision) ||
-      !booleanOption("async_output_stores", s.npu.asyncOutputStores) ||
-      !booleanOption("async_input_loads", s.npu.asyncInputLoads) ||
-      !booleanOption("staging_early_release", s.npu.stagingEarlyRelease) ||
-      !booleanOption("command_schedule", s.npu.commandSchedule) ||
-      !booleanOption("gdma_lookahead_streams_only", s.npu.gdmaLookaheadStreamsOnly) ||
-      !booleanOption("cross_phase_prefetch", s.npu.crossPhasePrefetch) ||
-      !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
-      !booleanOption("row_distribution", s.npu.rowDistribution) ||
-      !booleanOption("distribute_transposes", s.npu.distributeTransposes) ||
-      !booleanOption("rope_split", s.npu.ropeSplit) ||
-      !booleanOption("pair_gate_up", s.npu.pairGateUp) ||
-      !booleanOption("pair_consumer_pipeline", s.npu.pairConsumerPipeline) ||
-      !booleanOption("vector_scalar_reuse", s.npu.vectorScalarReuse) ||
-      !booleanOption("vector_chunk_pipeline", s.npu.vectorChunkPipeline) ||
-      !booleanOption("quant_fused_max", s.npu.quantFusedMax) ||
-      !booleanOption("vector_loops", s.npu.vectorLoops) ||
-      !booleanOption("input_tile_pipeline", s.npu.inputTilePipeline) ||
-      !booleanOption("gemv_epilogue_pipeline", s.npu.gemvEpiloguePipeline) ||
-      !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
-      !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
-      !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots) ||
-      !booleanOption("flash_attention", s.npu.flashAttention) ||
-      !booleanOption("flash_decoding", s.npu.flashDecoding) ||
-      !booleanOption("flash_kv_slicing", s.npu.flashKvSlicing))
-    return failure();
-  if (n && n->get("rope_split_min_elements")) {
-    auto value = n->getInteger("rope_split_min_elements");
-    if (!value || *value < 0) {
-      error = "npu.rope_split_min_elements must be a non-negative integer";
-      return failure();
-    }
-    s.npu.ropeSplitMinElements = *value;
-  }
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");
     if (!value || *value < 0 || *value > 1024) {
@@ -131,28 +97,10 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   };
   if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns) ||
       !positiveIntegerOption("attention_query_tile", s.npu.attentionQueryTile) ||
-      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile) ||
-      !positiveIntegerOption("attention_splits", s.npu.attentionSplits))
+      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile))
     return failure();
-  if (s.npu.flashDecoding && (!s.npu.flashAttention || s.npu.attentionSplits < 2 ||
-                            s.npu.attentionSplits > s.npu.cores)) {
-    error = "npu.flash_decoding requires flash_attention and attention_splits in [2, cores]";
-    return failure();
-  }
-  if (!s.npu.flashDecoding && s.npu.attentionSplits != 1) {
-    error = "npu.attention_splits must be 1 when flash_decoding is disabled";
-    return failure();
-  }
-  if (s.npu.flashKvSlicing && !s.npu.flashAttention) {
-    error = "npu.flash_kv_slicing requires flash_attention";
-    return failure();
-  }
   if (s.npu.stagingMiscBytes < 0 || s.npu.stagingMiscBytes % 64) {
     error = "npu.staging_misc_bytes must be a nonnegative multiple of 64";
-    return failure();
-  }
-  if (s.npu.dequantMinElements < 0) {
-    error = "npu.dequant_min_elements must be nonnegative (0 inherits distribute_min_elements)";
     return failure();
   }
   if (llvm::json::Object *m = root->getObject("mapping")) {
@@ -167,9 +115,9 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.npu.cores <= 0 || s.npu.l2Bytes < 64 || s.npu.l2StagingPerCore < 0 ||
       s.npu.l2StagingPerCore % 64 || s.npu.l2StagingPerCore > s.npu.l2Bytes / s.npu.cores ||
-      s.npu.weightStreamMaxSlots < 0 || s.npu.weightPrefetchBatchTiles < 0) {
+      s.npu.weightStreamMaxSlots < 0) {
     error = "invalid NPU staging policy: positive cores/L2, staging=0 (auto) or a fitting 64-byte-aligned window, "
-            "nonnegative ring cap and batch tiles (0 selects auto) required";
+            "and a nonnegative ring cap required";
     return failure();
   }
   return s;

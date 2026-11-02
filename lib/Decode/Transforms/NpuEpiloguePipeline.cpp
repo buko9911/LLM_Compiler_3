@@ -172,7 +172,6 @@ struct HybNpuEpiloguePipelinePass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.gemvEpiloguePipeline) return;
     Builder b(&getContext());
     int64_t id = 0;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
@@ -200,7 +199,7 @@ struct HybNpuEpiloguePipelinePass
         }
         // Gate/up pair: the op on both halves runs tile by tile behind the second GEMV as well.
         int64_t cores = f->hasAttr("hyb.cores") ? f->getAttrOfType<IntegerAttr>("hyb.cores").getInt() : 1;
-        if (target->npu.pairConsumerPipeline && f->hasAttr("hyb.gemv_pair") && pipelined.size() == 2)
+        if (f->hasAttr("hyb.gemv_pair") && pipelined.size() == 2)
           if (auto consumer = pairConsumer(pipelined[0], pipelined[1]);
               consumer && consumerFits(fn, loops.back(), consumer, cores, *target)) {
             consumer->setAttr("hyb.epilogue_consumer", pipelined[1]->getAttr("hyb.epilogue_pipeline"));

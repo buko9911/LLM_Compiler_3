@@ -45,8 +45,6 @@ def main():
     from decode import Device
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--output',type=Path,required=True)
-    ap.add_argument('--modes',nargs='+',choices=['off','fusion','release','both'],
-                    default=['off','fusion','release','both'])
     a = ap.parse_args()
     out = a.output.resolve(); out.mkdir(parents=True,exist_ok=False)
     compiler = root/'build/bin/npu-compile'
@@ -81,10 +79,9 @@ def main():
             [dict(kind='weight',name=f'proj{i}.weight') for i in range(3)],
             results=[dict(kind='output',name=f'y{i}') for i in range(3)])))
         modes = {}
-        for mode in a.modes:
-            spec = json.loads((workspace/'research/npu_async_store_audit/configs/selected_m8.json').read_text())
-            spec['npu'].update(projection_fusion=mode in ('fusion','both'),
-                weight_stream_early_release=mode in ('release','both'),gemv_tile_bytes=k*32)
+        for mode in ['compiler']:     # fusion and early slot release are always applied
+            spec = json.loads((root/'configs/target.json').read_text())
+            spec['npu'].update(gemv_tile_bytes=k*32)
             if name == 'one_core': spec['npu']['cores'] = 1
             if name == 'two_slots': spec['npu']['l2_staging_bytes_per_core'] = k*32*2
             sp = case/f'{mode}.json'; sp.write_text(json.dumps(spec,indent=2))
@@ -97,7 +94,7 @@ def main():
             assert p.returncode == 0,(name,mode,p.stderr)
             io = json.loads((build/'io.json').read_text())
             fused = sum(ph.get('projection_fusion',{}).get('groups',0) for ph in io['phases'])
-            assert fused == (1 if mode in ('fusion','both') else 0),(name,mode,fused)
+            assert fused == 1,(name,mode,fused)
             device = Device(build,settings=settings,lp6_config=ini,lp6_backend='ramulator',lp6_library=library)
             for arg in device.io['args']:
                 if arg['kind']=='input': device.write(arg['name'],{'x':x,'x2':x2}[arg['name']])

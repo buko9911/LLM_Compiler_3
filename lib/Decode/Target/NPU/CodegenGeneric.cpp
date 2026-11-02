@@ -485,7 +485,7 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   // Interleave only independent output coordinates. Exact in-place maps are
   // safe; shifted/uncertain aliases and overlapping destination rows are not.
   // This is checked against the final physical views, not operand names.
-  bool pipelineSafe = in.spec->npu.vectorChunkPipeline && !reduction && vec.back();
+  bool pipelineSafe = !reduction && vec.back();
   uint64_t outputSpan = views.back().eb;
   for (int d = int(views.back().shape.size()) - 1; pipelineSafe && d >= 0; --d) {
     const View &out = views.back();
@@ -506,7 +506,7 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   SmallVector<int64_t> outer(ranges.begin(), ranges.begin() + inner);
   int64_t n = ranges[inner];
   LogicalResult status = success();
-  // npu.vector_loops, short rows: one hardware loop over the rows of the trailing outer dims in
+  // Short rows: one hardware loop over the rows of the trailing outer dims in
   // which every operand advances by a fixed stride (row r of the loop sits at r * stride). The body
   // is one whole row; operands are addressed as their row pointer plus the offset in the row, and
   // each pointer advances by its stride (zero for a broadcast operand) per iteration.
@@ -524,7 +524,7 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   unsigned loopFrom = inner;            // outer dims [loopFrom, inner) form the row loop
   int64_t loopRows = 1;
   SmallVector<int64_t> rowBytes(views.size(), 0);
-  if (in.spec->npu.vectorLoops && inner > 0 && n <= 512 && rowOperands.size() <= std::size(kLoopPointers)) {
+  if (inner > 0 && n <= 512 && rowOperands.size() <= std::size(kLoopPointers)) {
     bool fits = true;
     for (unsigned i : rowOperands) {
       int64_t stride = dimStride(i, inner - 1);
@@ -589,7 +589,7 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
     // row. Use dedicated scalar registers, never the reduction scratch. When
     // the finite register pool is exhausted the original per-chunk code stays.
     DenseMap<Value, uint32_t> reciprocals;
-    if (in.spec->npu.vectorScalarReuse && n > 32) {
+    if (n > 32) {
       DenseMap<Value, int64_t> uses;
       SmallVector<Value> divisors;
       for (Operation *op : vops)
@@ -686,7 +686,7 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
     uint32_t lanes;
     SmallVector<std::function<void()>> instructions;
   };
-  // npu.vector_loops: the full groups of `batch` 32-lane chunks become one hardware loop whose
+  // The full groups of `batch` 32-lane chunks become one hardware loop whose
   // body addresses every operand through its own pointer register (offset = chunk * 64 bytes).
   SmallVector<unsigned> addressed;
   for (unsigned i = 0; i < nArgs; ++i)
@@ -694,7 +694,7 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
   if (!reduction) addressed.push_back(nIn);
   // Four chunks per iteration spread the pointer updates and the loop end over more work.
   const int64_t perIteration = std::max<int64_t>(batch, 4) * 32;
-  int64_t iterations = in.spec->npu.vectorLoops && !rowPointers ? n / perIteration : 0;
+  int64_t iterations = !rowPointers ? n / perIteration : 0;
   if (iterations < 2 || addressed.size() > std::size(kLoopPointers)) iterations = 0;
   DenseMap<unsigned, uint32_t> pointer;
   bool looped = false;

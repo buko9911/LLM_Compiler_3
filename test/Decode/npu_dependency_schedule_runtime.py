@@ -172,8 +172,7 @@ def fixtures():
         reference = ((xq.astype(np.int32) @ wq.astype(np.int32).T).astype(np.float32) / 4096).astype(np.float16)
         cases.append(dict(name=name, source=gemv_source(m, k, n), inputs={"x": x},
                           reference=reference, tokens=m, staging=0, weights={"proj.weight": weight},
-                          options=dict(gemv_tile_bytes=tile, matrix_init_elision=True,
-                                       gemv_epilogue_fusion=False)))
+                          options=dict(gemv_tile_bytes=tile)))
     return cases
 
 
@@ -187,11 +186,7 @@ def main():
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+", help="Optional exact fixture names")
-    parser.add_argument("--modes", nargs="+", choices=("off", "release", "blocking"),
-                        default=("off", "release"))
     args = parser.parse_args()
-    if args.modes[0] not in ("off", "blocking"):
-        parser.error("First mode must be a numerical control: off or blocking")
     sys.path.insert(0, str(root / "runtime"))
     from decode import Device
     out = args.output.resolve()
@@ -225,16 +220,11 @@ def main():
             results=[dict(kind="output", name="y")]), indent=2))
         np.savez(case / "inputs.npz", **fixture["inputs"])
         np.save(case / "reference.npy", fixture["reference"])
-        control = None
         modes = {}
-        for mode in args.modes:
+        # Staging slots are released early and L2 <-> L1 transfers are asynchronous (always applied).
+        for mode in ["compiler"]:
             spec = json.loads((root / "configs/target.json").read_text())
-            spec["npu"].update(staging_early_release=mode == "release",
-                async_input_loads=mode != "blocking",
-                async_output_stores=mode != "blocking",
-                attention_fusion=False, projection_fusion=False, activation_residency=True,
-                input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False,
-                l2_staging_bytes_per_core=fixture["staging"], **fixture["options"])
+            spec["npu"].update(l2_staging_bytes_per_core=fixture["staging"], **fixture["options"])
             target = case / f"{mode}.json"
             target.write_text(json.dumps(spec, indent=2))
             build = case / mode
@@ -257,27 +247,23 @@ def main():
             assert np.isfinite(actual).all(), (name, mode, "nonfinite output")
             error = float(np.max(np.abs(actual.astype(np.float32) - reference.astype(np.float32))))
             assert error == 0., (name, mode, "independent oracle mismatch", error)
-            if control is None:
-                control = actual.copy()
-            assert actual.tobytes() == control.tobytes(), (name, mode, "control byte mismatch")
             timing = json.loads((build / "timing.json").read_text())
             cuts = sum(p.get("dependency_schedule", {}).get("staging_release_cuts", 0) for p in io["phases"])
-            if mode == "release" and not name.startswith("stream_"):
-                assert cuts > 0, (name, mode, "release option was a noop")
+            if not name.startswith("stream_"):
+                assert cuts > 0, (name, mode, "no staging slot was released early")
             observation = observe(build, io)
             modes[mode] = dict(total_us=timing["total_simulated_cycles"] / timing["npu_clock_mhz"],
-                wall_seconds=wall, byte_exact_with_control=True, max_abs_numpy_error=error,
+                wall_seconds=wall, max_abs_numpy_error=error,
                 staging_release_cuts=cuts, read_bytes=timing["lp6_bytes_read"],
                 write_bytes=timing["lp6_bytes_written"], observations=observation,
                 phases=io["phases"], program_sha256=digest(build / "program.bin"))
             print(name, mode, json.dumps({k: v for k, v in modes[mode].items() if k != "phases"}), flush=True)
-        if name == "reduction_gamma" and "off" in modes:
-            before = modes["off"]["observations"]
-            assert before["reduction_events"] > 0 and before["gamma_gdma_events"] > 0
-            if "release" in modes:
-                after = modes["release"]["observations"]
-                assert after["gamma_reduction_overlap_cycles"] > 0, ("release", "no actual reuse of freed staging")
-                assert after["gamma_first_begin"] < before["gamma_first_begin"], ("release", "gamma was not released earlier")
+        if name == "reduction_gamma":
+            # The released staging slot lets gamma stream in before the reduction ends instead of
+            # after it (with the elementwise split, the other cores load their gamma slices first).
+            after = modes["compiler"]["observations"]
+            assert after["reduction_events"] > 0 and after["gamma_gdma_events"] > 0
+            assert after["gamma_first_begin"] < after["reduction_last_end"], ("release", "gamma waited for the reduction")
         summary["cases"][name] = modes
         (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     assert provenance == {str(p): digest(p) for p in paths}, "Build/source changed during run"

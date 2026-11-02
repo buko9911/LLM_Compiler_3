@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Native Ramulator/NPU validation against an independent integer GEMM oracle.
 
-The generated weights/activations have exact binary scales. Check selected
-compiler policies, rectangular/tail MMA shapes, stream wrap and no-stream paths,
-and a core partition that the fused epilogue cuts into column chunks.
+The generated weights/activations have exact binary scales. The compiler applies every GEMV
+optimization itself (matrix-init elision, the fused per-core dequant, the pipelined epilogue,
+early slot release, async stores); check rectangular/tail MMA shapes, stream wrap and no-stream
+paths, one core, and a core partition that the fused epilogue cuts into column chunks.
 """
 import argparse
 import hashlib
@@ -43,13 +44,6 @@ def main():
     from decode import Device
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    policies = {'off': (False, False), 'init': (True, False), 'epilogue': (False, True),
-                'both': (True, True), 'rotated': (True, True), 'batch1': (True, True),
-                'async': (False, False), 'both_async': (True, True),
-                'release': (False, False),
-                'pipeline': (True, True), 'pipeline_release': (True, True), 'round2': (True, True)}
-    parser.add_argument('--modes', nargs='+', choices=list(policies),
-                        default=['off', 'init', 'epilogue', 'both', 'rotated', 'batch1'])
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
@@ -82,56 +76,39 @@ def main():
             mask_min=-30000.,arguments=[dict(kind='input',name='x'),dict(kind='weight',name='proj.weight')],
             results=[dict(kind='output',name='y')]),indent=2))
         modes = {}
-        for mode in args.modes:
-            init, fuse = policies[mode]
-            if name == 'column_chunks' and not fuse:
-                continue   # the unfused lowering keeps a core's whole INT32 output in L1 (no column split)
-            spec = json.loads((workspace/'research/npu_schedule_audit/configs/off.json').read_text())
-            spec['npu'].update(matrix_init_elision=init,gemv_epilogue_fusion=fuse,gemv_tile_bytes=tile)
-            if mode in ('release', 'pipeline_release'):
-                spec['npu']['weight_stream_early_release'] = True
-            if mode in ('pipeline', 'pipeline_release'):
-                spec['npu']['gemv_epilogue_pipeline'] = True
-            if mode == 'round2':   # the 2026-10-31 switches together with the pipelined epilogue
-                spec['npu'].update(weight_stream_early_release=True, gemv_epilogue_pipeline=True,
-                                   quant_fused_max=True, vector_loops=True, staging_misc_bytes=4096,
-                                   gdma_lookahead=2, gdma_lookahead_streams_only=True, cross_phase_prefetch=True)
-            if mode in ('async', 'both_async'):
-                spec['npu']['async_output_stores'] = True
-            if name in ('one_core', 'column_chunks'):
-                spec['npu']['cores'] = 1
-            if name == 'two_slots':
-                spec['npu']['l2_staging_bytes_per_core'] = 4096
-            if mode in ('rotated','batch1'):
-                spec['npu']['weight_stream_rotate_slots'] = True
-            if mode == 'batch1':
-                spec['npu']['weight_prefetch_batch_tiles'] = 1
-            sp=case/f'{mode}.json';sp.write_text(json.dumps(spec,indent=2))
-            build=case/mode
-            command=[str(compiler),'--pipeline=decode',str(case/'step.mlir'),'--manifest',str(case/'manifest.json'),
-                     '--spec',str(sp),'--force=npu','-o',str(build)]
-            run=subprocess.run(command,cwd=workspace,text=True,capture_output=True,
-                               env=dict(os.environ,HYBRID_PROFILE_OPERATIONS='1'))
-            (case/f'{mode}.compile.log').write_text(run.stdout+run.stderr)
-            assert run.returncode == 0,run.stderr
-            device=Device(build,settings=settings,lp6_config=ini,lp6_backend='ramulator',lp6_library=library)
-            device.write('x',x)
-            actual,commands,wall=device.run(profile=True)
-            assert actual['y'].tobytes()==expected.tobytes(),(name,mode,'integer oracle mismatch')
-            io=json.loads((build/'io.json').read_text())
-            streams=[s for phase in io['phases'] for s in phase.get('weight_streams',[])]
-            if name not in ('single_tile','two_slots') and (name not in ('one_core','column_chunks') or fuse):
-                assert streams and all(s['prefetch'] for s in streams),(name,mode,streams)
-            elif name == 'two_slots':
-                assert streams and all(not s['prefetch'] for s in streams),(name,mode,streams)
-            if name == 'column_chunks' and fuse:
-                chunks = [d['chunks'] for phase in io['phases'] for d in phase.get('decisions', [])
-                          if d['kind'] == 'GEMV partition in L1']
-                assert chunks and all(c >= 2 for c in chunks),(name,mode,chunks)
-            timing=json.loads((build/'timing.json').read_text())
-            modes[mode]=dict(cycles=timing['total_simulated_cycles'],wall_seconds=wall,
-                independent_reference_byte_exact=True,output_sha256=hashlib.sha256(actual['y'].tobytes()).hexdigest(),
-                program_sha256=digest(build/'program.bin'),weight_streams=streams)
+        mode = 'compiler'
+        spec = json.loads((root/'configs/baselines/npu_only_lp6_4ch.json').read_text())
+        spec['npu'].update(gemv_tile_bytes=tile)
+        if name in ('one_core', 'column_chunks'):
+            spec['npu']['cores'] = 1
+        if name == 'two_slots':
+            spec['npu']['l2_staging_bytes_per_core'] = 4096
+        sp=case/f'{mode}.json';sp.write_text(json.dumps(spec,indent=2))
+        build=case/mode
+        command=[str(compiler),'--pipeline=decode',str(case/'step.mlir'),'--manifest',str(case/'manifest.json'),
+                 '--spec',str(sp),'--force=npu','-o',str(build)]
+        run=subprocess.run(command,cwd=workspace,text=True,capture_output=True,
+                           env=dict(os.environ,HYBRID_PROFILE_OPERATIONS='1'))
+        (case/f'{mode}.compile.log').write_text(run.stdout+run.stderr)
+        assert run.returncode == 0,run.stderr
+        device=Device(build,settings=settings,lp6_config=ini,lp6_backend='ramulator',lp6_library=library)
+        device.write('x',x)
+        actual,commands,wall=device.run(profile=True)
+        assert actual['y'].tobytes()==expected.tobytes(),(name,mode,'integer oracle mismatch')
+        io=json.loads((build/'io.json').read_text())
+        streams=[s for phase in io['phases'] for s in phase.get('weight_streams',[])]
+        if name not in ('single_tile','two_slots'):
+            assert streams and all(s['prefetch'] for s in streams),(name,mode,streams)
+        elif name == 'two_slots':
+            assert streams and all(not s['prefetch'] for s in streams),(name,mode,streams)
+        if name == 'column_chunks':
+            chunks = [d['chunks'] for phase in io['phases'] for d in phase.get('decisions', [])
+                      if d['kind'] == 'GEMV partition in L1']
+            assert chunks and all(c >= 2 for c in chunks),(name,mode,chunks)
+        timing=json.loads((build/'timing.json').read_text())
+        modes[mode]=dict(cycles=timing['total_simulated_cycles'],wall_seconds=wall,
+            independent_reference_byte_exact=True,output_sha256=hashlib.sha256(actual['y'].tobytes()).hexdigest(),
+            program_sha256=digest(build/'program.bin'),weight_streams=streams)
         results[name]=dict(shape=[m,k,n],modes=modes)
         print(name,{key:value['cycles'] for key,value in modes.items()},flush=True)
         (output/'summary.json').write_text(json.dumps(results,indent=2)+'\n')

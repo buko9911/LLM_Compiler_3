@@ -100,12 +100,11 @@ def HybOutlinePhases : Pass<"hyb-outline-phases", "ModuleOp"> {
   let summary = "Split the step into NPU and PIM phases, each outlined into its own function";
   let description = [{
     Ops run in program order; a PIM group (qmatmuls of one group with target = pim) becomes a
-    PIM phase, runs of the remaining ops become NPU phases. With npu-split = layer, an NPU
-    run also ends before an NPU GEMV of another layer (layer index from the weight name), so
-    one NPU program stays within the command scoreboard. The step function turns into a
-    sequence of func.call ops; values crossing phases live in LP6.
+    PIM phase, runs of the remaining ops become NPU phases. An NPU run also ends before an
+    NPU GEMV of another layer (layer index from the weight name), so one NPU program stays
+    within the command scoreboard. The step function turns into a sequence of func.call ops;
+    values crossing phases live in LP6.
   }];
-  let options = [Option<"npuSplit", "npu-split", "std::string", "\"layer\"", "none | layer">];
 }
 
 //===----------------------------------------------------------------------===//

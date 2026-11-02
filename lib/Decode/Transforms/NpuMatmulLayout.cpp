@@ -87,7 +87,6 @@ linalg::FillOp zeroInitializer(Value output, Operation *matrix) {
 
 bool transposeOutput(linalg::LinalgOp matrix, Value a, Value b, Value c,
                      const TargetSpec &spec, ArrayRef<AffineMap> maps) {
-  if (!spec.npu.matmulTransposeOutput) return false;
   auto originalFill = zeroInitializer(c, matrix);
   if (!originalFill) return false;
   auto at = cast<MemRefType>(a.getType()), bt = cast<MemRefType>(b.getType()), ct = cast<MemRefType>(c.getType());
@@ -179,7 +178,6 @@ bool pack(linalg::LinalgOp matrix, const TargetSpec &spec) {
   auto canonicalMaps = maps;
   canonicalMaps[1] = AffineMap::get(dims, 0, packedMap, ctx);
   if (transposeOutput(matrix, a, b, c, spec, canonicalMaps)) return true;
-  if (!spec.npu.matmulRhsPacking) return false;
   uint64_t bytes = 2;
   for (int64_t dim : bt.getShape()) {
     if (bytes > uint64_t(spec.npu.l1Bytes) / uint64_t(dim)) return false;
@@ -210,7 +208,6 @@ struct HybNpuMatmulLayoutPass : mlir::hybrid::impl::HybNpuMatmulLayoutBase<HybNp
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.matmulRhsPacking && !target->npu.matmulTransposeOutput) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, transposes = 0;
       SmallVector<linalg::LinalgOp> matrices;

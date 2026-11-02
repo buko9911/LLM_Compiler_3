@@ -61,7 +61,6 @@ struct HybNpuMatrixInitPass : mlir::hybrid::impl::HybNpuMatrixInitBase<HybNpuMat
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.matrixInitElision) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0;
       fn.walk([&](linalg::FillOp fill) {

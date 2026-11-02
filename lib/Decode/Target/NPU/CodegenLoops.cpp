@@ -191,19 +191,12 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
   linalg::GenericOp gemv;
   memref::CopyOp output;
   // Two staged weights are needed for L1 ping/pong, plus a spare L2 slot so the next
-  // GDMA can run during this batch. With only two, batching can slow the DRAM pipeline.
-  bool pipeline = in.weightPrefetch && stream && n > 1 && nslots >= 3 &&
-                  weightPipeline(f, stream, gemv, output, err);
+  // GDMA can run while a tile computes.
+  bool pipeline = stream && n > 1 && nslots >= 3 && weightPipeline(f, stream, gemv, output, err);
   if (!err.empty()) return failure();
-  // Keep at least half the L2 ring available for future GDMA where possible. Wait for
-  // the whole small batch up front, so its LDMA operations cannot split the core block.
-  int64_t batch = pipeline ? std::max<int64_t>(2, int64_t(nslots / 2)) : 1;
-  bool crossBatch = pipeline && in.spec->npu.weightPrefetchCrossBatch;
-  if (pipeline && in.spec->npu.weightPrefetchBatchTiles)
-    batch = std::min<int64_t>(in.spec->npu.weightPrefetchBatchTiles, int64_t(nslots));
-  if (crossBatch) batch = std::min(batch, int64_t(nslots) - 1);
+  // The ring starts at an L2 slot that no earlier access still protects.
   uint64_t win = windowBase(curCore), initialSlot = 0;
-  if (stream && in.spec->npu.weightStreamRotateSlots) {
+  if (stream) {
     for (uint64_t candidate = 0; candidate < nslots; ++candidate) {
       uint64_t begin = win + candidate * slotBytes;
       if (llvm::none_of(l2acc, [&](const Acc &a) { return overlaps(a.s, a.e, begin, begin + slotBytes); })) {
@@ -215,7 +208,6 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
   auto slotAddress = [&](int64_t tile) {
     return win + ((uint64_t(tile) + initialSlot) % nslots) * slotBytes;
   };
-  bool earlyRelease = pipeline && in.spec->npu.weightStreamEarlyRelease;
   // hyb-npu-epilogue-pipeline: the dequant after this loop, done one tile behind the GEMV.
   hyb::DequantOp epilogue;
   linalg::GenericOp consumer;      // hyb.epilogue_consumer: the elementwise op on the dequant's columns
@@ -236,13 +228,13 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       pendingDequant = PendingDequant{epilogue, (tile - 1) * epilogueColumns, epilogueColumns, 0, consumer};
   };
   if (f->hasAttr("hyb.stream")) {
-    std::string reason = pipeline ? "enabled" : !in.weightPrefetch ? "disabled" :
-        !stream ? "no_staging_slot" : n <= 1 ? "single_iteration" :
+    std::string reason = pipeline ? "enabled" : !stream ? "no_staging_slot" : n <= 1 ? "single_iteration" :
         nslots < 3 ? "fewer_than_three_slots" : "unsupported_loop_pattern";
-    weightStreams.push_back({int64_t(slotBytes), n, int64_t(nslots), earlyRelease ? 1 : batch,
-                             pipeline, earlyRelease || crossBatch, reason, int64_t(initialSlot)});
+    weightStreams.push_back({int64_t(slotBytes), n, int64_t(nslots), 1, pipeline, pipeline, reason,
+                             int64_t(initialSlot)});
   }
-  if (earlyRelease) {
+  if (pipeline) {
+    // Each staged slot is released as soon as its tile is in L1, then refilled.
     // Global dependencies can observe core-block completion, not a local DMA
     // event. Consume every local event before splitting a block. A slot read
     // therefore belongs to the load/previous-tile block, never to the compute
@@ -305,9 +297,10 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
     if (consumer) consumerTail[consumer] = (n - 1) * epilogueColumns;
     return success();
   }
+  // Without the L1 pipeline the loop runs tile by tile; the GDMA of the next tiles still runs
+  // up to the ring size ahead.
   int64_t issued = -1;
-  for (int64_t i = 0; i < n; i += batch) {
-    int64_t end = std::min(n, i + batch);
+  for (int64_t i = 0; i < n; ++i) {
     if (stream) {
       while (issued + 1 < n && issued + 1 <= i + int64_t(nslots) - 1) {
         ++issued;
@@ -316,52 +309,17 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
         if (failed(v)) return failure();
         gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0, true);
       }
+      streamSlot[stream] = slotAddress(i);
     }
-    if (pipeline) {
-      std::vector<int> deps;
-      // A carried tile is loaded while this batch's last MMA runs. Its GDMA must
-      // already be complete before entering the block, just like all other loads.
-      for (int64_t j = i; j < std::min(n, end + int64_t(crossBatch)); ++j) {
-        uint64_t slot = slotAddress(j);
-        coreDependencies(slot, slot + slotBytes, false, deps);
-        if (j < end && output) {
-          env[iv] = *lb + j * *step;
-          auto o = viewOf(output.getTarget(), err);
-          if (failed(o)) return failure();
-          if (o->space == kL2)
-            for (auto [s, e] : viewRanges(*o)) coreDependencies(s, e, true, deps);
-        }
-      }
-      std::sort(deps.begin(), deps.end());
-      deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
-      blockAfter(deps);
+    prefetchedWeightCopy = nullptr;
+    prefetchedWeightNeedsWait = false;
+    env[iv] = *lb + i * *step;
+    pipelineEpilogue(i);
+    if (failed(emitBlock(*f.getBody(), err))) return failure();
+    if (pendingDequant) {
+      err = "the epilogue-pipelined loop body has no GEMV to interleave the dequant with";
+      return failure();
     }
-    for (int64_t j = i; j < end; ++j) {
-      if (stream) streamSlot[stream] = slotAddress(j);
-      if (pipeline && j + 1 < (crossBatch ? n : end)) {
-        env[iv] = *lb + (j + 1) * *step;
-        auto dst = viewOf(stream.getTarget(), err);
-        if (failed(dst)) return failure();
-        nextWeight = WeightPrefetch{gemv, addr(*dst),
-            slotAddress(j + 1), uint32_t(dst->elements() * dst->eb)};
-      }
-      prefetchedWeightCopy = pipeline && (j > i || (crossBatch && i > 0)) ? stream.getOperation() : nullptr;
-      prefetchedWeightNeedsWait = j > i;
-      env[iv] = *lb + j * *step;
-      pipelineEpilogue(j);
-      if (failed(emitBlock(*f.getBody(), err))) return failure();
-      if (pendingDequant) {
-        err = "the epilogue-pipelined loop body has no GEMV to interleave the dequant with";
-        return failure();
-      }
-    }
-    if (crossBatch && end < n) {
-      // Local events are reset at block entry. Consume the event in its producer
-      // block; the next block inherits ready L1 data through its block dependency.
-      load(10, 1);
-      emit(rform(OP_WAIT_EVENT, 10));
-    }
-    if (pipeline) flush();  // release the batch's L2 read ranges before ring-slot reuse
   }
   if (stream) streamSlot.erase(stream);
   env.erase(iv);

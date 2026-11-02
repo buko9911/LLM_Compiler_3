@@ -26,7 +26,7 @@ struct LP6Extra {
   uint64_t add(std::vector<uint8_t> bytes);
 };
 
-/// L2 and LP6 accesses that an NPU phase leaves for the next NPU phase (npu.cross_phase_prefetch):
+/// L2 and LP6 accesses that an NPU phase leaves for the next NPU phase:
 /// the next phase's GDMA loads wait for these instead of the phase's exit barrier.
 struct CarriedAccesses {
   struct L2Access {
@@ -48,7 +48,6 @@ struct NpuPhaseInput {
   const pim::Program *pim = nullptr;
   const TargetSpec *spec = nullptr;
   plena::ProgramBuilder *program = nullptr;   // the step's single program (phase already begun)
-  bool weightPrefetch = true;            // pipeline streamed GEMV weights through the two L1 slots
   int pimActivationCores = 1;            // explicit bounded isolated quant/activation-feed experiment
   CarriedAccesses *carried = nullptr;    // in: the previous NPU phase's accesses; out: this phase's
 };

@@ -100,7 +100,6 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.projectionFusion) return;
     // A fixed PIM weight storage is a different image contract; never repack its weights.
     if (getOperation()->hasAttr("hyb.pim_weight_storage_requested")) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
@@ -134,25 +133,18 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
     int64_t n = 0;
     for (auto &p : ps) n += p.n;
     // Bound the accumulator / output growth; hyb-npu-memplan makes the final check. A core's L1
-    // holds the INT32 and FP16 of its `columns`, the INT8 input, the row scales and two weight tiles.
-    // With gemv_epilogue_fusion a core partition that does not fit L1 is cut into column chunks
-    // (hyb-npu-gemv-epilogue), so the fused GEMV needs no more memory than the separate ones and
-    // only one SA column block per core must fit. Without it the INT32 accumulator and the FP16
-    // output of all n columns also live in L2.
-    int64_t cores = largestDivisorAtMost(n / 32, target.npu.cores);
-    auto local = [&](int64_t columns) {
-      return first.m * columns * 6 + first.m * first.k + columns * 4 +
-             2 * std::max<int64_t>(target.npu.gemvTileBytes, first.k * 32) + target.npu.l1ReservedBytes + 4096;
-    };
-    const int64_t l1Need = target.npu.gemvEpilogueFusion ? local(32) : local(n / cores);
-    const int64_t l2Need = target.npu.gemvEpilogueFusion ? 0 : first.m * n * 6;
-    const bool fits = l1Need <= target.npu.l1Bytes && l2Need <= target.npu.l2Bytes;
+    // holds the INT32 and FP16 of its columns, the INT8 input, the row scales and two weight tiles.
+    // A core partition that does not fit L1 is cut into column chunks (hyb-npu-gemv-epilogue), so
+    // the fused GEMV needs no more memory than the separate ones: one SA column block per core
+    // must fit.
+    const int64_t l1Need = first.m * 32 * 6 + first.m * first.k + 32 * 4 +
+        2 * std::max<int64_t>(target.npu.gemvTileBytes, first.k * 32) + target.npu.l1ReservedBytes + 4096;
+    const bool fits = l1Need <= target.npu.l1Bytes;
     std::string label = "fused[";
     for (auto &p : ps) label += (label.size() > 6 ? ";" : "") + p.weight.getName().str();
     label += "] " + std::to_string(first.m) + "x" + std::to_string(n);
     cost::recordDecision(fn, "fuse projections", label, fits ? "fused" : "separate",
-                         {{"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(target.npu.l1Bytes) / 1024.0},
-                          {"l2_need_kib", double(l2Need) / 1024.0}, {"l2_kib", double(target.npu.l2Bytes) / 1024.0}});
+                         {{"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(target.npu.l1Bytes) / 1024.0}});
     if (!fits) return false;
 
     OpBuilder b(first.gemv);

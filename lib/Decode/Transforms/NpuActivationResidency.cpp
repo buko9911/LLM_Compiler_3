@@ -42,7 +42,7 @@ struct HybNpuActivationResidencyPass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.activationResidency || !isNpuOnly(getOperation())) return;
+    if (!isNpuOnly(getOperation())) return;
 
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       // hyb-outline-phases emits one straight-line block; leave anything else untouched.

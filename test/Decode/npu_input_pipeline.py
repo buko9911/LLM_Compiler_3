@@ -45,7 +45,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='npu-input-pipeline-') as directory:
         work = Path(directory)
         config = json.loads((root/'configs/target.json').read_text())
-        config['npu'].update(input_tile_pipeline=True, input_tile_columns=32, async_input_loads=True)
+        config['npu'].update(input_tile_columns=32)
         spec = work/'target.json';spec.write_text(json.dumps(config))
         cases = [('matmul_tail', source(), 3), ('batched_tail', source(batch=3), 9),
                  ('batch_only', source(batch=2,n=17), 2), ('one_tile', source(n=17), 0),
@@ -70,12 +70,11 @@ def main():
                 assert 'input_pipeline_copy' in scheduled[0] and 'input_pipeline_copy' in scheduled[1]
                 assert 'input_pipeline_tile' in scheduled[2],scheduled
             print(name,'PASS',tiles)
+        # The pipeline has no switch: its former key is rejected.
         config['npu']['input_tile_pipeline']=False;spec.write_text(json.dumps(config))
         path=work/'off.mlir';path.write_text(source())
-        command=[str(args.opt),str(path)]
-        before=subprocess.check_output(command,text=True)
-        after=subprocess.check_output(command+[f'--hyb-npu-input-pipeline=spec={spec}'],text=True)
-        assert before==after,'disabled pass changed IR'
-        print('disabled_identity PASS')
+        result=subprocess.run([str(args.opt),str(path),f'--hyb-npu-input-pipeline=spec={spec}'],text=True,capture_output=True)
+        assert result.returncode and 'npu.input_tile_pipeline is not a target parameter' in result.stderr,result.stderr
+        print('switch_rejected PASS')
 
 if __name__=='__main__':main()

@@ -12,6 +12,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Support/TargetSpec.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "npu/Decode/Transforms/Passes.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -19,6 +20,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/SetVector.h"
+#include "llvm/Support/raw_ostream.h"
 #include <limits>
 
 namespace mlir::hybrid {
@@ -334,13 +336,12 @@ struct KVSegment {
 
 class OnlineEmitter {
 public:
-  OnlineEmitter(IRRewriter &rewriter, Attention &attention, const TargetSpec &target)
-      : b(rewriter), a(attention), t(target), loc(a.pv.getLoc()), ctx(b.getContext()) {}
+  OnlineEmitter(IRRewriter &rewriter, Attention &attention, const TargetSpec &target, int64_t splits)
+      : b(rewriter), a(attention), t(target), loc(a.pv.getLoc()), ctx(b.getContext()), splits(splits) {}
 
   Value emit() {
-    splits = t.npu.flashDecoding ? t.npu.attentionSplits : 1;
     segments.push_back({a.qk.getDpsInputs()[1], a.pv.getDpsInputs()[1], a.keys, 0});
-    if (t.npu.flashKvSlicing) findKVSegments();
+    findKVSegments();
     headCores = std::min(a.heads, t.npu.cores / splits);
     while (headCores > 1 && a.heads % headCores) --headCores;
     headsPerCore = a.heads / headCores;
@@ -426,7 +427,7 @@ private:
   const TargetSpec &t;
   Location loc;
   MLIRContext *ctx;
-  int64_t splits = 1, headCores = 1, headsPerCore = 1;
+  int64_t splits, headCores = 1, headsPerCore = 1;
   SmallVector<KVSegment, 2> segments;
 
   void findKVSegments() {
@@ -768,6 +769,31 @@ private:
   }
 };
 
+/// Full-row softmax (hyb-npu-attention-fusion) keeps the scores of a query row whole: QK^T and PV
+/// of a KV head run on one core from L1 copies of its keys and values, which come from one L2 copy
+/// of [past; new] K and V of all heads. It is faster than online softmax where it fits (COMPILER.md
+/// appendix A), so online softmax over key tiles, which reads the tiles straight from the cache and
+/// keeps only a running maximum, sum and output, is used when that L2 copy with the activations
+/// around it and a three-slot weight ring per core does not fit L2, or a head's keys, values and
+/// score rows do not fit a core's L1.
+bool fullRowFits(func::FuncOp fn, const Attention &a, const TargetSpec &t) {
+  const auto &npu = t.npu;
+  const int64_t kv = a.heads * a.keys * (a.depth + a.valueDepth) * 2;
+  const int64_t activations = a.heads * a.rows * (a.depth + a.valueDepth) * 2;
+  const int64_t ring = npu.cores * 3 * npu.gemvTileBytes;
+  const int64_t l2Need = kv + activations + ring;
+  const int64_t l1Need = a.keys * (a.depth + a.valueDepth) * 2 + a.rows * a.keys * (4 + 2) +
+                         a.rows * (a.depth * 2 + a.valueDepth * 4) + npu.l1ReservedBytes + 4096;
+  const bool fits = l2Need <= npu.l2Bytes && l1Need <= npu.l1Bytes;
+  std::string label;
+  llvm::raw_string_ostream os(label);
+  os << "attention " << a.heads << "x" << a.rows << "x" << a.keys << "x" << a.depth;
+  cost::recordDecision(fn, "attention softmax", label, fits ? "full row" : "online (key tiles)",
+                       {{"l2_need_kib", double(l2Need) / 1024.0}, {"l2_kib", double(npu.l2Bytes) / 1024.0},
+                        {"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(npu.l1Bytes) / 1024.0}});
+  return fits;
+}
+
 struct HybNpuFlashAttentionPass
     : mlir::hybrid::impl::HybNpuFlashAttentionBase<HybNpuFlashAttentionPass> {
   using Base::Base;
@@ -776,19 +802,12 @@ struct HybNpuFlashAttentionPass
     std::string error;
     auto target = TargetSpec::load(spec, error);
     if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
-    if (!target->npu.flashAttention) return;
+    // NPU-only, like hyb-npu-attention-fusion (mixed programs keep the full-row path).
     for (auto fn : getOperation().getOps<func::FuncOp>())
-      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() != "npu") {
-        fn.emitError("FlashAttention is currently supported only for NPU-only programs");
-        return signalPassFailure();
-      }
+      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() != "npu") return;
     for (auto fn : getOperation().getOps<func::FuncOp>()) {
       auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu") continue;
-      if (fn->hasAttr("hyb.npu_kernel")) {
-        fn.emitError("FlashAttention is unsupported in isolated PIM packet kernels");
-        return signalPassFailure();
-      }
+      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
       SmallVector<linalg::BatchMatmulOp> candidates;
       fn.walk([&](linalg::BatchMatmulOp mm) {
         if (!mm->hasAttr("hyb.flash_tile") && !mm->getParentOfType<scf::ForallOp>() &&
@@ -796,19 +815,16 @@ struct HybNpuFlashAttentionPass
             (hasExpAncestor(mm.getDpsInputs()[0]) || hasMatmulAncestor(mm.getDpsInputs()[0]))) candidates.push_back(mm);
       });
       IRRewriter rewriter(&getContext());
-      int64_t transformed = 0, segmented = 0;
+      int64_t transformed = 0, segmented = 0, splits = 1;
       for (auto candidate : llvm::reverse(candidates)) {
         Attention attention;
-        if (!attention.match(candidate)) {
-          candidate.emitError("unsupported requested FlashAttention chain: ") << attention.error;
-          return signalPassFailure();
-        }
-        if (target->npu.flashDecoding && attention.keys < target->npu.attentionSplits) {
-          candidate.emitError("Flash-Decoding needs at least one key per requested split");
-          return signalPassFailure();
-        }
+        if (!attention.match(candidate) || fullRowFits(fn, attention, *target)) continue;
+        // Flash-Decoding: with fewer KV heads than cores, the keys are split over the idle cores.
+        const int64_t cores = target->npu.cores;
+        splits = attention.heads < cores ? std::max<int64_t>(1, cores / attention.heads) : 1;
+        while (splits > 1 && attention.keys < splits) --splits;
         rewriter.setInsertionPoint(candidate);
-        OnlineEmitter emitter(rewriter, attention, *target);
+        OnlineEmitter emitter(rewriter, attention, *target, splits);
         rewriter.replaceOp(candidate, emitter.emit());
         segmented += emitter.slicedKV();
         ++transformed;
@@ -820,12 +836,12 @@ struct HybNpuFlashAttentionPass
         op.getCanonicalizationPatterns(cleanup, &getContext());
       if (failed(applyPatternsGreedily(fn, std::move(cleanup)))) return signalPassFailure();
       fn->setAttr("hyb.flash_attention", rewriter.getDictionaryAttr({
-          rewriter.getNamedAttr("algorithm", rewriter.getStringAttr(target->npu.flashDecoding ? "flash_decoding" : "flash_attention")),
+          rewriter.getNamedAttr("algorithm", rewriter.getStringAttr(splits > 1 ? "flash_decoding" : "flash_attention")),
           rewriter.getNamedAttr("transformed_chains", rewriter.getI64IntegerAttr(transformed)),
           rewriter.getNamedAttr("segmented_kv_chains", rewriter.getI64IntegerAttr(segmented)),
           rewriter.getNamedAttr("query_tile", rewriter.getI64IntegerAttr(target->npu.attentionQueryTile)),
           rewriter.getNamedAttr("key_tile", rewriter.getI64IntegerAttr(target->npu.attentionKeyTile)),
-          rewriter.getNamedAttr("splits", rewriter.getI64IntegerAttr(target->npu.flashDecoding ? target->npu.attentionSplits : 1))}));
+          rewriter.getNamedAttr("splits", rewriter.getI64IntegerAttr(splits))}));
     }
   }
 };

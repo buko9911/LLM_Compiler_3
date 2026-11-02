@@ -30,8 +30,8 @@ DictionaryAttr lp6Of(func::FuncOp step, Value v) {
   return {};
 }
 
-/// io.json entry of one NPU phase: size of the emitted code, SRAM peaks, weight streams and, for
-/// every enabled optional pass or backend schedule, how often it applied.
+/// io.json entry of one NPU phase: size of the emitted code, SRAM peaks, weight streams, how often
+/// each NPU pass and backend schedule applied, and the cost decisions with their numbers.
 json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const NpuPhaseStats &stats,
                             const TargetSpec &spec, const plena::ProgramBuilder &program) {
   auto count = [&](StringRef attr) -> int64_t {
@@ -39,69 +39,50 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
     return value ? value.getInt() : 0;
   };
   json::Array streams;
-  for (const auto &s : stats.weightStreams) {
-    json::Object stream{{"tile_bytes", s.tileBytes}, {"iterations", s.iterations},
+  for (const auto &s : stats.weightStreams)
+    streams.push_back(json::Object{{"tile_bytes", s.tileBytes}, {"iterations", s.iterations},
         {"slots", s.slots}, {"batch_tiles", s.batch}, {"prefetch", s.prefetch},
-        {"cross_batch", s.crossBatch}, {"reason", s.reason}};
-    if (spec.npu.weightStreamRotateSlots) stream["initial_slot"] = s.initialSlot;
-    if (spec.npu.weightStreamEarlyRelease) stream["release_on_load"] = s.prefetch;
-    streams.push_back(std::move(stream));
-  }
+        {"cross_batch", s.crossBatch}, {"reason", s.reason}, {"initial_slot", s.initialSlot},
+        {"release_on_load", s.prefetch}});
   json::Object report{{"phase", name}, {"kind", "npu"}, {"core_words", stats.coreWords},
       {"commands", stats.commands}, {"l1_peak", stats.l1Peak}, {"cores", stats.cores},
       {"l2_staging_bytes_per_core", stats.l2StagingPerCore}, {"weight_streams", std::move(streams)}};
 
-  // Optional passes, in pipeline order.
-  if (spec.npu.projectionFusion)
-    report["projection_fusion"] = json::Object{{"groups", count("hyb.projection_fusions")}};
-  if (spec.npu.flashAttention) {
-    json::Object flash{{"flash_decoding", spec.npu.flashDecoding}, {"kv_slicing", spec.npu.flashKvSlicing},
-                       {"query_tile", spec.npu.attentionQueryTile}, {"key_tile", spec.npu.attentionKeyTile},
-                       {"splits", spec.npu.attentionSplits}};
-    if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.flash_attention"))
-      for (NamedAttribute field : attr) {
-        if (auto value = dyn_cast<IntegerAttr>(field.getValue())) flash[field.getName().str()] = value.getInt();
-        else if (auto value = dyn_cast<StringAttr>(field.getValue()))
-          flash[field.getName().str()] = value.getValue().str();
-      }
+  // Passes, in pipeline order.
+  report["projection_fusion"] = json::Object{{"groups", count("hyb.projection_fusions")}};
+  if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.flash_attention")) {
+    json::Object flash{{"query_tile", spec.npu.attentionQueryTile}, {"key_tile", spec.npu.attentionKeyTile}};
+    for (NamedAttribute field : attr) {
+      if (auto value = dyn_cast<IntegerAttr>(field.getValue())) flash[field.getName().str()] = value.getInt();
+      else if (auto value = dyn_cast<StringAttr>(field.getValue()))
+        flash[field.getName().str()] = value.getValue().str();
+    }
     report["flash_attention"] = std::move(flash);
   }
-  if (spec.npu.attentionFusion) {
-    json::Object counts;
-    if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.attention_fusion"))
-      for (NamedAttribute field : attr)
-        if (auto value = dyn_cast<IntegerAttr>(field.getValue())) counts[field.getName().str()] = value.getInt();
-    report["attention_fusion"] = std::move(counts);
-  }
-  if (spec.npu.gemvEpilogueFusion)
-    report["gemv_epilogue_fusion"] = json::Object{{"applied", count("hyb.gemv_epilogue_fusions")}};
-  if (spec.npu.elementwiseDistribution)
-    report["elementwise_distribution"] = json::Object{
-        {"groups", count("hyb.elementwise_distributions")},
-        {"candidates", count("hyb.elementwise_candidates")},
-        {"below_threshold", count("hyb.elementwise_small")},
-        {"unsupported", count("hyb.elementwise_unsupported")},
-        {"capacity_rejected", count("hyb.elementwise_capacity")},
-        {"indivisible", count("hyb.elementwise_indivisible")},
-        {"min_elements", spec.npu.distributeMinElements}};
-  if (spec.npu.elementwiseDistribution && spec.npu.distributeTransposes)
-    (*report["elementwise_distribution"].getAsObject())["transposes"] = count("hyb.transposes_distributed");
-  if (spec.npu.ropeSplit) report["rope_split"] = json::Object{{"applied", count("hyb.rope_splits")}};
-  if (spec.npu.pairGateUp)
-    report["gate_up_pair"] = json::Object{{"consumer_pipeline", spec.npu.pairConsumerPipeline},
-                                          {"consumers_pipelined", count("hyb.epilogue_consumers")}};
-  if (spec.npu.activationResidency)
-    report["activation_residency"] =
-        json::Object{{"private_result_destinations", count("hyb.activation_residency_private_results")}};
-  if (spec.npu.matrixInitElision)
-    report["matrix_init_elision"] = json::Object{{"applied", count("hyb.matrix_init_elisions")}};
-  if (spec.npu.matmulRhsPacking || spec.npu.matmulTransposeOutput)
-    report["matmul_rhs_packing"] = json::Object{{"applied", count("hyb.matmul_rhs_packings")},
-                                                {"transpose_output", count("hyb.matmul_output_transposes")}};
-  if (spec.npu.inputTilePipeline)
-    report["input_tile_pipeline"] = json::Object{
-        {"groups", count("hyb.input_pipeline_groups")}, {"tiles", count("hyb.input_pipeline_tiles")},
-        {"columns", spec.npu.inputTileColumns}, {"async_input_loads", spec.npu.asyncInputLoads}};
+  json::Object attention;
+  if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.attention_fusion"))
+    for (NamedAttribute field : attr)
+      if (auto value = dyn_cast<IntegerAttr>(field.getValue())) attention[field.getName().str()] = value.getInt();
+  report["attention_fusion"] = std::move(attention);
+  report["gemv_epilogue_fusion"] = json::Object{{"applied", count("hyb.gemv_epilogue_fusions")}};
+  report["elementwise_distribution"] = json::Object{
+      {"groups", count("hyb.elementwise_distributions")},
+      {"candidates", count("hyb.elementwise_candidates")},
+      {"below_threshold", count("hyb.elementwise_small")},
+      {"unsupported", count("hyb.elementwise_unsupported")},
+      {"capacity_rejected", count("hyb.elementwise_capacity")},
+      {"indivisible", count("hyb.elementwise_indivisible")},
+      {"transposes", count("hyb.transposes_distributed")}};
+  report["rope_split"] = json::Object{{"applied", count("hyb.rope_splits")}};
+  report["gate_up_pair"] = json::Object{{"consumers_pipelined", count("hyb.epilogue_consumers")}};
+  report["activation_residency"] =
+      json::Object{{"private_result_destinations", count("hyb.activation_residency_private_results")}};
+  report["matrix_init_elision"] = json::Object{{"applied", count("hyb.matrix_init_elisions")}};
+  report["matmul_rhs_packing"] = json::Object{{"applied", count("hyb.matmul_rhs_packings")},
+                                              {"transpose_output", count("hyb.matmul_output_transposes")}};
+  report["input_tile_pipeline"] = json::Object{
+      {"groups", count("hyb.input_pipeline_groups")}, {"tiles", count("hyb.input_pipeline_tiles")},
+      {"columns", spec.npu.inputTileColumns}};
 
   // Choices made by comparing costs (NpuCost.h), with the numbers behind each.
   if (auto decisions = phase->getAttrOfType<ArrayAttr>("hyb.decisions")) {
@@ -119,34 +100,22 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
   }
 
   // Backend scheduling.
-  if (spec.npu.asyncOutputStores)
-    report["async_output_stores"] = json::Object{
-        {"issued", stats.asyncOutputStores},
-        {"stores_with_vector_work_before_wait", stats.outputStoresWithVectorWork}};
-  if (spec.npu.stagingEarlyRelease)
-    report["dependency_schedule"] = json::Object{{"staging_release_cuts", stats.stagingReleaseCuts}};
-  if (spec.npu.vectorScalarReuse || spec.npu.vectorChunkPipeline)
-    report["vector_schedule"] = json::Object{
-        {"scalar_reuse_enabled", spec.npu.vectorScalarReuse},
-        {"chunk_pipeline_enabled", spec.npu.vectorChunkPipeline},
-        {"scalar_reciprocals_hoisted", stats.vectorScalarReciprocals},
-        {"scalar_reciprocal_reuses", stats.vectorScalarReuses},
-        {"pipeline_groups", stats.vectorPipelineGroups},
-        {"pipelined_chunks", stats.vectorPipelinedChunks}};
-  if (spec.npu.gdmaLookahead)
-    report["gdma_admission"] = json::Object{{"lookahead", spec.npu.gdmaLookahead},
-                                            {"streams_only", spec.npu.gdmaLookaheadStreamsOnly}};
+  report["async_output_stores"] = json::Object{
+      {"issued", stats.asyncOutputStores},
+      {"stores_with_vector_work_before_wait", stats.outputStoresWithVectorWork}};
+  report["dependency_schedule"] = json::Object{{"staging_release_cuts", stats.stagingReleaseCuts}};
+  report["vector_schedule"] = json::Object{
+      {"scalar_reciprocals_hoisted", stats.vectorScalarReciprocals},
+      {"scalar_reciprocal_reuses", stats.vectorScalarReuses},
+      {"pipeline_groups", stats.vectorPipelineGroups},
+      {"pipelined_chunks", stats.vectorPipelinedChunks}};
+  if (spec.npu.gdmaLookahead) report["gdma_admission"] = json::Object{{"lookahead", spec.npu.gdmaLookahead}};
   if (spec.npu.stagingMiscBytes) report["staging_misc_bytes"] = stats.stagingMiscBytes;
-  if (spec.npu.crossPhasePrefetch) report["cross_phase_prefetch"] = true;
-  if (spec.npu.quantFusedMax || spec.npu.vectorLoops)
-    report["vector_code"] = json::Object{{"quant_fused_max", spec.npu.quantFusedMax},
-                                         {"vector_loops", spec.npu.vectorLoops}};
-  if (spec.npu.commandSchedule)
-    report["command_schedule"] = json::Object{
-        {"commands", int64_t(program.lastSchedule.commands)},
-        {"reordered", int64_t(program.lastSchedule.reordered)},
-        {"redundant_edges_removed", int64_t(program.lastSchedule.redundantEdges)},
-        {"encoding_fallback", program.lastSchedule.encodingFallback}};
+  report["command_schedule"] = json::Object{
+      {"commands", int64_t(program.lastSchedule.commands)},
+      {"reordered", int64_t(program.lastSchedule.reordered)},
+      {"redundant_edges_removed", int64_t(program.lastSchedule.redundantEdges)},
+      {"encoding_fallback", program.lastSchedule.encodingFallback}};
   return report;
 }
 
@@ -185,12 +154,12 @@ void driver::setPimKernel(plena::ProgramBuilder &program, const pim::Program &pr
 
 bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
                         const std::vector<pim::Primitive> &pimCommands, const TargetSpec &spec,
-                        plena::ProgramBuilder &program, LP6Extra &extra, bool weightPrefetch, int pimActivationCores,
+                        plena::ProgramBuilder &program, LP6Extra &extra, int pimActivationCores,
                         std::vector<int> &exit, int &logicalCores, json::Array &report, std::string &err) {
   program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
-  program.commandSchedule = spec.npu.commandSchedule;
+  program.commandSchedule = true;
   int parallelActivationPhases = 0;
-  CarriedAccesses carried;   // npu.cross_phase_prefetch: the last NPU phase's L2 / LP6 accesses
+  CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)
   for (Operation &op : step.getBody().front()) {
     auto call = dyn_cast<func::CallOp>(op);
     if (!call) continue;
@@ -219,7 +188,6 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     in.pim = &prog;
     in.spec = &spec;
     in.program = &program;
-    in.weightPrefetch = weightPrefetch;
     in.pimActivationCores = pimActivationCores;
     const bool packet = callee->hasAttr("hyb.npu_kernel");
     if (packet) carried = {};
@@ -234,6 +202,21 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     exit = program.endPhase();
     for (auto &a : carried.l2) a.id = program.scheduledId(a.id);
     for (auto &a : carried.lp6) a.id = program.scheduledId(a.id);
+    // The parallel activation feed reports command indices; give them after the reorder.
+    if (stats.pimActivationCores > 1 && !stats.pimActivationPlanJson.empty()) {
+      auto plan = json::parse(stats.pimActivationPlanJson);
+      if (!plan || !plan->getAsObject()) {
+        llvm::errs() << "parallel PIM activation feed reported an invalid plan\n";
+        return false;
+      }
+      json::Object &object = *plan->getAsObject();
+      if (json::Array *events = object.getArray("activation_store_events"))
+        for (json::Value &event : *events)
+          if (auto id = event.getAsInteger()) event = program.scheduledId(int(*id));
+      if (auto id = object.getInteger("q_ready_event")) object["q_ready_event"] = program.scheduledId(int(*id));
+      stats.pimActivationPlanJson = llvm::formatv("{0}", json::Value(std::move(*plan))).str();
+      callee->setAttr("hyb.pim_activation_plan", StringAttr::get(callee.getContext(), stats.pimActivationPlanJson));
+    }
     logicalCores = std::max(logicalCores, int(stats.cores));
     if (extra.cursor > extra.limit) {
       llvm::errs() << "NPU constant pools overflow the reserved LP6 region\n";

@@ -130,26 +130,17 @@ def main():
             arguments=[dict(kind="input", name="x"), dict(kind="weight", name="proj.weight")],
             results=[dict(kind="output", name="y")]), indent=2))
         spec = json.loads((root / "configs/target.json").read_text())
-        spec["npu"].update(gemv_tile_bytes=tile, l2_staging_bytes_per_core=staging,
-                           weight_stream_max_slots=8, weight_prefetch_batch_tiles=0,
-                           weight_prefetch_cross_batch=False)
+        spec["npu"].update(gemv_tile_bytes=tile, l2_staging_bytes_per_core=staging, weight_stream_max_slots=8)
         if name == "auto_ring" or name.startswith("cross_batch_"):
-            spec["npu"].update(weight_stream_max_slots=0,
-                               weight_prefetch_cross_batch=name.startswith("cross_batch_"))
-        if name.startswith("cross_batch_"):
-            spec["npu"]["weight_prefetch_batch_tiles"] = 6 if name == "cross_batch_ring" else 2
-        if name == "cross_batch_large_join":
-            spec["npu"]["weight_prefetch_batch_tiles"] = 256
-        if name.startswith("cross_batch_single_tile"):
-            spec["npu"]["weight_prefetch_batch_tiles"] = 1
+            spec["npu"].update(weight_stream_max_slots=0)
         spec_path = case / "target.json"
         spec_path.write_text(json.dumps(spec, indent=2))
         modes = {}
-        for mode in ("serial", "pipeline"):
+        # The L1 weight pipeline is always applied where the ring has at least three slots.
+        for mode in ("pipeline",):
             out = case / mode
             run([a.compiler.resolve(), source, "--manifest", manifest, "--spec", spec_path, "--force=npu",
-                 f"--npu-weight-prefetch={'true' if mode == 'pipeline' else 'false'}", "-o", out],
-                root, case / f"{mode}.compile.log")
+                 "-o", out], root, case / f"{mode}.compile.log")
             io = json.loads((out / "io.json").read_text())
             streams = [s for phase in io["phases"] for s in phase.get("weight_streams", [])]
             if name in ("auto_ring", "cross_batch_ring"):
@@ -170,18 +161,21 @@ def main():
             actual = np.frombuffer(dump, dtype=np.float16, count=m * n, offset=o["l1"]).reshape(m, n)
             assert actual.tobytes() == expected.tobytes(), (name, mode, "independent integer reference mismatch")
             prog = decode_program((out / "program.bin").read_bytes())
-            if name == "cross_batch_large_join" and mode == "pipeline":
-                assert sum(c["kind"] == "barrier" for c in prog["commands"]) > 2
-                assert all(len(c["dependencies"]) <= 255 for c in prog["commands"])
+            assert all(len(c["dependencies"]) <= 255 for c in prog["commands"])
             blocks = [c for c in prog["commands"] if c["kind"] == "core_block"]
             traces = [trace_v2(prog["words"][c["isa_start_word"]:c["isa_start_word"] + c["isa_word_count"]])
                       for c in blocks]
+            # Input loads (event 10) and output stores (event 11) are asynchronous; each one is
+            # retired by exactly one wait.
             async_loads = sum(t[0] == "ldma" and t[1] == 10 for tr in traces for t in tr)
+            async_stores = sum(t[0] == "ldma" and t[1] == 11 for tr in traces for t in tr)
             waits = sum(t[0:2] == ("sync", 4) for tr in traces for t in tr)
-            assert async_loads == waits
-            if name.startswith("cross_batch_") and mode == "pipeline":
-                assert async_loads == sum(s["iterations"] - 1 for s in streams if s["prefetch"]), (name, async_loads, streams)
-            assert (async_loads > 0) == (pipeline and mode == "pipeline"), (name, mode, async_loads)
+            assert async_loads + async_stores == waits, (name, async_loads, async_stores, waits)
+            # Every tile but the last prefetches the next tile's L1 slot (the other event-10 loads are
+            # asynchronous activation loads, encoded the same way).
+            assert async_loads >= sum(s["iterations"] - 1 for s in streams if s["prefetch"]), (name, async_loads, streams)
+            weight_prefetches = sum(s["iterations"] - 1 for s in streams if s["prefetch"])
+            assert (weight_prefetches > 0) == pipeline, (name, mode, streams)
             early_prefetches = 0
             for tr in traces:
                 for index, event in enumerate(tr):
@@ -218,20 +212,9 @@ def main():
                                input_image_sha256=image_hash, output_sha256=hashlib.sha256(actual.tobytes()).hexdigest(),
                                mma_slices=sum(t[0] == "mma" for tr in traces for t in tr))
             modes[mode]["weight_streams"] = streams
-        assert modes["serial"]["input_image_sha256"] == modes["pipeline"]["input_image_sha256"]
-        assert modes["serial"]["output_sha256"] == modes["pipeline"]["output_sha256"]
-        assert modes["serial"]["mma_slices"] == modes["pipeline"]["mma_slices"]
         if pipeline:
             assert modes["pipeline"]["ldma_matrix_overlap_cycles"] > 0, name
-            if name.startswith("cross_batch_single_tile"):
-                # One-tile blocks retain LDMA/MMA overlap without batching blocks.
-                assert modes["pipeline"]["core_blocks"] <= modes["serial"]["core_blocks"], name
-            else:
-                assert modes["pipeline"]["core_blocks"] < modes["serial"]["core_blocks"], name
-        else:
-            assert (case / "serial/program.bin").read_bytes() == (case / "pipeline/program.bin").read_bytes()
-        results[name] = dict(shape=dict(m=m, n=n, k=k), results=modes,
-                             speedup=modes["serial"]["total_cycles"] / modes["pipeline"]["total_cycles"])
+        results[name] = dict(shape=dict(m=m, n=n, k=k), results=modes)
         print(name, json.dumps(results[name]), flush=True)
     (a.output / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
 

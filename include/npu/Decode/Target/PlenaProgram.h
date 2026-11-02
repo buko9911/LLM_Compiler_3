@@ -51,7 +51,7 @@ public:
   /// share a core's window. Aggregate admission is bounded by N * logical cores;
   /// histories are separate because core streams are emitted sequentially.
   uint32_t gdmaLookahead = 0;
-  bool commandSchedule = false;
+  bool commandSchedule = false;  // reorder system commands by their first consumer (the driver sets it)
   struct ScheduleStats {
     uint64_t commands = 0, reordered = 0, redundantEdges = 0;
     bool encodingFallback = false;
@@ -92,7 +92,7 @@ public:
   int numCommands() const { return int(cmds.size()); }
   /// The records every record of the current phase follows (the previous phase's exit).
   const std::vector<int> &phaseEntry() const { return base; }
-  /// A command index of the phase that endPhase just closed, after its command_schedule reorder.
+  /// A command index of the phase that endPhase just closed, after its command reorder.
   int scheduledId(int id) const {
     return id >= int(lastPhaseStart) && size_t(id) - lastPhaseStart < lastRemap.size()
         ? lastRemap[size_t(id) - lastPhaseStart] : id;

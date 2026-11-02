@@ -40,14 +40,13 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!target->npu.gemvEpilogueFusion) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<hyb::DequantOp> candidates;
       for (Operation &op : fn.front())
         if (auto d = dyn_cast<hyb::DequantOp>(op)) candidates.push_back(d);
       int64_t count = 0;
       for (auto d : candidates)
-        if ((target->npu.pairGateUp && fusePaired(d, *target)) || fuse(d, *target)) ++count;
+        if (fusePaired(d, *target) || fuse(d, *target)) ++count;
       fn->setAttr("hyb.gemv_epilogue_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), count));
     }
   }

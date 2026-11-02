@@ -126,7 +126,6 @@ def main():
     output = Path(tempfile.mkdtemp(prefix="run-", dir=args.output))
     cases = {
         "gqa_reshape": (dict(), True, 4, 1),
-        "disabled": (dict(), False, 4, 0),
         "already_direct": (dict(reshaped=False), True, 4, 0),
         "shared_scores": (dict(shared=True), True, 4, 0),
         "index_dependent_body": (dict(indexed=True), True, 4, 0),
@@ -137,14 +136,14 @@ def main():
         "per_token_mask": (dict(with_mask=True), True, 4, 1),
     }
     results = {}
-    for name, (kwargs, enabled, cores, expected) in cases.items():
+    for name, (kwargs, _, cores, expected) in cases.items():
         source = output/f"{name}.mlir"
         text = attention_source(**kwargs)
         if name == "mixed_module":
             text = text.removesuffix("}\n") + '  func.func private @pim() attributes {hyb.phase = "pim"}\n}\n'
         source.write_text(text)
         spec = json.loads((root/"configs/target.json").read_text())
-        spec["npu"].update(attention_fusion=enabled, cores=cores)
+        spec["npu"].update(cores=cores)
         target = output/f"{name}.json"; target.write_text(json.dumps(spec))
         result = subprocess.run([str(args.optimizer.resolve()), str(source),
                                 f"--hyb-npu-attention-fusion=spec={target.resolve()}"],
@@ -177,7 +176,7 @@ def main():
             assert repeated.stdout == result.stdout, (name,"pass must be idempotent")
         if name == "already_direct":
             assert "already_direct = 1" in result.stdout, result.stdout
-        if not enabled or name in ("pim_phase", "mixed_module"):
+        if name in ("pim_phase", "mixed_module"):
             assert "hyb.attention_fusion" not in result.stdout, result.stdout
         results[name] = dict(fused_chains=expected)
     (output/"summary.json").write_text(json.dumps(results,indent=2)+"\n")

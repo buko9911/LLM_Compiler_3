@@ -103,8 +103,6 @@ $PY -B runtime/decode.py out-npu --prompt "..." --steps 8 --check               
 | 옵션 | 의미 |
 |---|---|
 | `--force=npu\|pim`, `--map=substr:target` | GEMV 그룹의 장치를 강제 |
-| `--npu-phase-split=layer\|none` | NPU phase를 층마다 나눔(기본) / 나누지 않음(`--force=npu` 전용, 36층 전체에서는 ISA 의존성 한도를 넘음) |
-| `--npu-weight-prefetch=false` | weight 타일 prefetch 끄기 |
 | `--no-image`, `--no-output-collect`, `--debug-collect [--debug-phases=a,b]` | `lp6.bin` 생략, 출력 회수 생략, phase 사이 값 회수 |
 | `--pim-bankset-pingpong=N` | PIM weight row bank-set ping-pong(연구용) |
 | `--pim-weight-storage-export/-import` | PIM weight 저장 위치 고정 |
@@ -114,42 +112,25 @@ $PY -B runtime/decode.py out-npu --prompt "..." --steps 8 --check               
 pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 `build/bin/npu-opt ir/step.mlir --pass-pipeline="$(cat out/pipeline.txt)" --mlir-print-ir-after-all --mlir-disable-threading`.
 
-## Target spec의 `npu.*` 선택 기능
+## Target spec과 최적화
 
-모두 기본 false(꺼짐)다. NPU-only 기준 설정은 `configs/baselines/npu_only_lp6_4ch.json` 하나이고, 1토큰 decode·
-8토큰 verify·64토큰 prefill을 모두 이 파일로 컴파일한다(아래 표의 "켬"). step은 export의 `--tokens`/`--capacity`로만
-정해진다. 켠 pass를 어느 op에 적용할지(코어에 나눌지, SiLU×up을 up 타일마다 둘지, projection을 합칠지, GEMV 코어 몫을
-열 묶음으로 나눌지)는 텐서 크기와 이 파일의 하드웨어 수치로 계산한 시간·용량으로 정하고(`include/npu/Decode/Transforms/
-NpuCost.h`), 모든 결정과 근거 숫자를 `io.json`의 `phases[].decisions`에 남긴다. 그래서 크기가 같으면 step이 달라도
-프로그램이 같다. 36층 전체는 `--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는
-`../../docs/research/NPU_ONLY_BASELINE.md`에 있다. 2026-11-02 이전의 step별 설정 세 개는 git 이력(`a19bf01`)에 있다.
+최적화에는 켜고 끄는 스위치가 없다(2026-11-02). 모든 pass와 backend 스케줄이 항상 돌고, 각 rewrite를 어느 op에 적용할지는
+텐서 크기와 target의 하드웨어 수치로 계산한 시간·용량으로 정한다(`include/npu/Decode/Transforms/NpuCost.h`). 모든 결정과
+근거 숫자는 `io.json`의 `phases[].decisions`에 남는다. 그래서 크기가 같으면 step이 달라도 프로그램이 같다. 예:
 
-| 키 | 담당 | 기준 설정 |
-|---|---|:-:|
-| `projection_fusion`, `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | 켬 |
-| `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | |
-| `row_distribution`, `gemv_epilogue_pipeline` | pass: 행 사슬 분배, GEMV dequant 겹치기 | 켬 |
-| `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 |
-| `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 |
-| `staging_early_release`, `weight_stream_early_release` | codegen: staging slot 조기 반환 | 켬 |
-| `vector_scalar_reuse`, `vector_chunk_pipeline` | codegen: VPU 명령 배치 | 켬 |
-| `weight_stream_rotate_slots`, `weight_prefetch_cross_batch` | codegen: weight 링 | 켬 |
-| `gdma_lookahead` (정수), `gdma_lookahead_streams_only` | 코어별 선행 GDMA 수, weight ring 읽기만 셈 | 2, 켬 |
-| `staging_misc_bytes` (정수) | 작은 LP6↔L1 전송용 staging 창 끝 영역 | 65536 |
-| `cross_phase_prefetch` | 다음 phase GDMA load가 barrier 대신 같은 주소의 앞 접근만 기다림 | 켬 |
-| `quant_fused_max`, `vector_loops` | codegen: quant max를 register에서, 반복 VPU 묶음을 hardware loop로 | 켬 |
-| `command_schedule` | system command 재배열 | 켬 |
-| `rope_split` | pass `hyb-npu-rope`: rotate-half RoPE를 head 축으로 코어에 나눈 반쪽 generic 둘로, 뒤 전치는 head 단위 출력에 접음. 나눠서 아끼는 시간이 `core_split_us`보다 클 때만 | 켬 |
-| `distribute_transposes` | `hyb-npu-elementwise-distribute`: 맨 위 FP16 전치를 코어에 나눔 | 켬 |
-| `pair_gate_up` | `hyb-npu-gemv-epilogue`: gate·up 두 반쪽의 같은 열을 한 코어가 계산하고 SiLU×up까지. 코어 몫이 L1에 안 들어가면 열 묶음으로 나눔 | 켬 |
-| `pair_consumer_pipeline` | `hyb-npu-epilogue-pipeline`: 짝지은 루프에서 SiLU×up을 up 타일마다 dequant 뒤에. 루프가 weight 읽기를 기다릴 때(타일당 읽기 시간 ≥ SA + dequant)만 | 켬 |
-| 하드웨어 수치(`l1_read_bytes_per_cycle`, `mma_k_per_cycle`, `vector_*`, `gdma_read_gbps`, `core_split_us` 등) | 위 결정의 시간 계산(`NpuCost.h`). 값과 출처는 `configs/baselines/README.md` | |
+- op를 코어에 나눌지: 나눠서 아끼는 시간이 `core_split_us`보다 클 때.
+- attention: 전체 행 softmax의 L2 복사본(K·V 전체)과 그 주변 activation, 코어당 weight ring 3칸이 L2에, head 하나의 K·V·score
+  행이 L1에 들어가면 전체 행 softmax, 아니면 key 조각을 cache에서 바로 읽는 online softmax(`hyb-npu-flash-attention`). KV
+  head가 코어보다 적으면 key를 코어에 나눈다(Flash-Decoding).
+- SiLU×up을 up 타일마다 둘지: 루프가 weight 읽기를 기다릴 때만.
+- projection을 합칠지, GEMV 코어 몫을 열 묶음으로 나눌지: L1에 들어가는지로.
 
-정수 옵션(`gemv_tile_bytes`, `l2_staging_bytes_per_core`, `weight_stream_max_slots`, `weight_prefetch_batch_tiles`,
-`input_tile_columns`)과 하드웨어 값은 `include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 정리되어 있다.
-`distribute_min_elements`, `dequant_min_elements`, `rope_split_min_elements`는 실험용 바닥값이다(기본 0: 없음).
-각 기능이 실제로 몇 번 적용됐는지는 출력 `io.json`의 `phases[]`에, 결정 하나하나와 근거 숫자는 `phases[].decisions`에
-기록된다.
+target 파일(`configs/baselines/npu_only_lp6_4ch.json`, NPU+PIM은 `configs/target.json`)에는 하드웨어 수치만 둔다. 하드웨어 수치가
+아닌 키(옛 스위치 등)는 오류다. 아직 고정값으로 남은 정수(`gemv_tile_bytes`, `l2_staging_bytes_per_core`(0이면 phase마다 남는
+L2로), `weight_stream_max_slots`, `input_tile_columns`, `attention_query_tile`, `attention_key_tile`, `gdma_lookahead`,
+`staging_misc_bytes`)는 `include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 있다. step은 export의 `--tokens`/`--capacity`로만
+정해진다. 측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`, 스위치가 있던 때(2026-11-02 이전)의 스위치별 기여는
+`../../docs/architecture/COMPILER.md` 부록 A에 있다.
 
 ## 테스트
 

@@ -161,8 +161,8 @@ TEST(NpuGdmaAdmission, IndependentCoreStartsWithoutWaitingForOtherCoreTail) {
 }
 
 TEST(NpuGdmaAdmission, UnadmittedLoadsNeitherWaitNorHoldTheChain) {
-  // npu.gdma_lookahead_streams_only: small staged loads are appended with admitted = false. The
-  // weight loads keep their N-deep chain among themselves; the small loads stay out of it.
+  // Small staged loads are appended with admitted = false. The weight loads keep their N-deep
+  // chain among themselves; the small loads stay out of it.
   ProgramBuilder builder;
   builder.gdmaLookahead=2;
   builder.beginPhase("streams",{});
@@ -281,7 +281,7 @@ TEST(NpuCommandSchedule, KeepsOriginalScheduleWhenReorderExceedsDependencyDistan
   EXPECT_FALSE(b.lastSchedule.encodingFallback);
 }
 
-void stridedCopies(bool enabled, bool store, bool overlap, Program &result) {
+void stridedCopies(bool store, bool overlap, Program &result) {
   using namespace mlir;
   using namespace mlir::hybrid;
   DialectRegistry registry;
@@ -303,7 +303,7 @@ void stridedCopies(bool enabled, bool store, bool overlap, Program &result) {
                     "memref.copy %a, %x : "+a+" to "+x+"\nmemref.copy %b, %y : "+b+" to "+y;
   source += "\nreturn\n}}";
   auto module=parseSourceString<ModuleOp>(source,&context);ASSERT_TRUE(module);
-  TargetSpec spec;spec.npu.commandSchedule=enabled;
+  TargetSpec spec;
   ProgramBuilder builder;builder.beginPhase("strided",{});
   NpuPhaseInput input;input.phase=module->lookupSymbol<func::FuncOp>("phase");
   input.spec=&spec;input.program=&builder;
@@ -317,17 +317,14 @@ void stridedCopies(bool enabled, bool store, bool overlap, Program &result) {
 
 TEST(NpuCommandSchedule, StridedMemoryHolesAreIndependentButRealHazardsRemain) {
   for (bool store:{false,true}) for (bool overlap:{false,true}) {
-    Program before,after;
-    stridedCopies(false,store,overlap,before);
-    stridedCopies(true,store,overlap,after);
-    ASSERT_GE(before.commands.size(),3u);ASSERT_EQ(before.commands.size(),after.commands.size());
-    std::vector<int> a,b;
+    Program after;
+    stridedCopies(store,overlap,after);
+    ASSERT_GE(after.commands.size(),3u);
+    std::vector<int> b;
     uint32_t opcode=store?::npu::isa2::kGdmaStore : ::npu::isa2::kGdmaLoad;
-    for (size_t i=0;i<before.commands.size();++i) if (before.commands[i].opcode==opcode) a.push_back(int(i));
     for (size_t i=0;i<after.commands.size();++i) if (after.commands[i].opcode==opcode) b.push_back(int(i));
-    ASSERT_GE(a.size(),2u);ASSERT_GE(b.size(),2u);
-    int previous=a[a.size()-2],last=a.back(),newPrevious=b[b.size()-2],newLast=b.back();
-    EXPECT_NE(std::find(before.commands[last].deps.begin(),before.commands[last].deps.end(),previous),before.commands[last].deps.end());
+    ASSERT_GE(b.size(),2u);
+    int newPrevious=b[b.size()-2],newLast=b.back();
     bool depends=std::find(after.commands[newLast].deps.begin(),after.commands[newLast].deps.end(),newPrevious)!=after.commands[newLast].deps.end();
     EXPECT_EQ(depends,overlap);
   }

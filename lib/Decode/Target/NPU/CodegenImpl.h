@@ -131,7 +131,7 @@ private:
   void planMiscStaging(func::FuncOp fn);
   std::vector<uint64_t> miscCursor;                // per core: next free byte of the small-transfer ring
   uint64_t stagingFor(uint64_t bytes);
-  // npu.cross_phase_prefetch: the first command of this phase. GDMAs keep their hazards on
+  // The first command of this phase. GDMAs keep their hazards on
   // earlier phases; core blocks drop them (they follow the phase entry).
   int phaseFirstCommand = 0;
   void reachableDependencies(std::vector<int> &deps) const;
@@ -170,7 +170,7 @@ private:
     noteOutputStoreVectorWork();
     w.append(rform(OP_V_MEM, 4, v, 0, 0, funct));
   }
-  // ---- hardware loops (npu.vector_loops) ------------------------------------------------------
+  // ---- hardware loops -------------------------------------------------------------------
   // The trip count goes through GP3; loop bodies address memory through pointer registers that
   // only loop code uses and that every other user reloads (GP 11-14, then 6-9). Pending async DMA
   // that touches an operand is retired before the loop (guardLoopRange), so nothing in the body
@@ -364,7 +364,7 @@ private:
   // ---- generic vectorizer (CodegenGeneric.cpp) ----------------------------------------------
   // Kind of a body value: folded constant, row-invariant scalar, or FP16 vector.
   enum class K { Const, Scalar, Vector };
-  // npu.vector_loops row loop: while its body is emitted, operand i (generic operand number) is
+  // Row loop: while its body is emitted, operand i (generic operand number) is
   // addressed as pointer register rowPointers[i] plus the offset inside the row.
   const DenseMap<unsigned, uint32_t> *rowPointers = nullptr;
   LogicalResult lowerGeneric(linalg::GenericOp g, std::string &err);

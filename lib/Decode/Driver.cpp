@@ -67,11 +67,6 @@ static cl::opt<std::string> packetNpu("pim-packet-npu",
 static cl::opt<int> pimActivationCores("pim-activation-cores",
     cl::desc("1 default; 4 opts into checked isolated quant/PIM activation-feed parallelism with --force=pim"),
     cl::init(1));
-static cl::opt<bool> weightPrefetch("npu-weight-prefetch",
-    cl::desc("overlap streamed GEMV weight LDMA with matrix compute (false for serial A/B)"), cl::init(true));
-static cl::opt<std::string> npuPhaseSplit("npu-phase-split",
-    cl::desc("layer (default) | none: keep adjacent NPU ops in one phase; none requires --force=npu"),
-    cl::init("layer"));
 static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
     cl::desc("research PIM weight-row ping-pong: 0 off, 1 default lead 12, 2..63 lead"), cl::init(0));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
@@ -90,11 +85,6 @@ double seconds(std::chrono::steady_clock::time_point t0) {
 
 /// Combinations of the experimental PIM options that the driver supports.
 bool checkOptions(bool fixedStorage) {
-  if ((npuPhaseSplit != "layer" && npuPhaseSplit != "none") ||
-      (npuPhaseSplit == "none" && (forceTarget != "npu" || !mapOverrides.empty() || !packetNpu.empty()))) {
-    llvm::errs() << "--npu-phase-split must be layer or none; none requires --force=npu, no --map and no packet kernel\n";
-    return false;
-  }
   if ((pimActivationCores != 1 && pimActivationCores != 4) ||
       (pimActivationCores == 4 &&
        (forceTarget != "pim" || !mapOverrides.empty() || !packetNpu.empty()))) {
@@ -104,10 +94,6 @@ bool checkOptions(bool fixedStorage) {
   if (!packetNpu.empty() &&
       (packetNpu != "g4" || weightStorageImport.empty() || forceTarget != "npu" || !mapOverrides.empty())) {
     llvm::errs() << "PIM packet NPU requires g4, --force=npu, --pim-weight-storage-import, and no --map overrides\n";
-    return false;
-  }
-  if (!packetNpu.empty() && !weightPrefetch) {
-    llvm::errs() << "PIM packet NPU g4 currently requires --npu-weight-prefetch=true\n";
     return false;
   }
   if (fixedStorage && noImage) {
@@ -157,8 +143,8 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
 };
 
 /// The MLIR pass pipeline, in five stages. Each stage hands the next one a more concrete program:
-/// math -> device and phases -> core tiles -> buffers -> addresses. The optional NPU passes are
-/// no-ops unless their `npu.*` switch is set in the target spec.
+/// math -> device and phases -> core tiles -> buffers -> addresses. Every pass runs; each one
+/// decides from the shapes and the target's hardware numbers where its rewrite applies.
 std::string decodePipeline(const std::string &overrideOpt) {
   const std::string spec = "{spec=" + specFile + "}";
   // 1. Tensor math: name the arguments, clean up the import, W8A8 quantization, FP16 storage.
@@ -174,12 +160,12 @@ std::string decodePipeline(const std::string &overrideOpt) {
       "hyb-partition{spec=" + specFile + " report=" + outDir + "/partition.json" +
       (forceTarget.empty() ? "" : " force=" + forceTarget) + overrideOpt + "},"
       "func.func(hyb-lower-npu-gemv),"                        // INT8 contraction on [N/32, K, 32] weights
-      "hyb-outline-phases{npu-split=" + npuPhaseSplit + "},canonicalize,";
+      "hyb-outline-phases,canonicalize,";
   // 3. Fusion and tiling (tensor level): fuse first, then distribute over cores and tile for L1.
   const std::string fusion =
       "hyb-npu-projection-fusion" + spec + ","                // q/k/v and gate/up -> one GEMV each
       "hyb-npu-rope" + spec + ","                             // rotate-half RoPE per core, head-major
-      "hyb-npu-flash-attention" + spec + ","                  // online-softmax attention (opt-in)
+      "hyb-npu-flash-attention" + spec + ","                  // online softmax where full rows do not fit
       "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
       "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core
       "hyb-npu-tile" + spec + ","                             // scf.forall over cores, scf.for over tiles
@@ -331,7 +317,7 @@ int compileDecode(int argc, char **argv) {
   std::vector<int> exit;           // records the next phase follows
   int logicalCores = 1;
   json::Array report;
-  if (!driver::emitPhases(mod, step, prog, pimCommands, *spec, program, extra, weightPrefetch, pimActivationCores,
+  if (!driver::emitPhases(mod, step, prog, pimCommands, *spec, program, extra, pimActivationCores,
                           exit, logicalCores, report, err))
     return 1;
 

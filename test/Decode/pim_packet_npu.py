@@ -294,8 +294,6 @@ def main():
             compile_case("negative_g2", args.m, ["--pim-weight-storage-import", exported, "--pim-packet-npu=g2"], expect=prefix)
             compile_case("negative_map", args.m, [*packet_options, "--map=proj:npu"], expect=prefix)
             compile_case("negative_no_image", args.m, [*packet_options, "--no-image"], expect="incompatible with --no-image")
-            compile_case("negative_serial_prefetch", args.m, [*packet_options, "--npu-weight-prefetch=false"],
-                         expect="requires --npu-weight-prefetch=true")
             for name, m, shape in [("M9", 9, None), ("N_tail", args.m, (3584, args.k)),
                                     ("K_tail", args.m, (args.n, args.k+1))]:
                 compile_case(f"negative_{name}", m, packet_options, shape=shape,

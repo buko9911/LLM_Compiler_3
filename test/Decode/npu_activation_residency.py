@@ -63,18 +63,16 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     out = Path(tempfile.mkdtemp(prefix='run-', dir=args.output))
     optimizer = str(args.optimizer.resolve())
-    for enabled in (False, True):
-        target = json.loads((root/'configs/target.json').read_text())
-        target['npu']['activation_residency'] = enabled
-        (out/f'{enabled}.json').write_text(json.dumps(target))
+    spec = out/'target.json'
+    spec.write_text((root/'configs/target.json').read_text())
 
     results = {}
 
-    def run(name, source=SOURCE, enabled=True, extra=(), bare=False):
+    def run(name, source=SOURCE, extra=(), bare=False):
         src = out/(name+'.mlir'); src.write_text(source)
         command = [optimizer, str(src)]
         if not bare:
-            command.append(f'--hyb-npu-activation-residency=spec={out / (str(enabled)+".json")}')
+            command.append(f'--hyb-npu-activation-residency=spec={spec}')
         command.extend(extra)
         result = subprocess.run(command, capture_output=True, text=True)
         (out/(name+'.log')).write_text(result.stdout+result.stderr)
@@ -82,9 +80,6 @@ def main():
         return result.stdout
 
     baseline = run('original', bare=True)
-    disabled = run('disabled', enabled=False)
-    assert disabled == baseline, 'disabled pass changed IR'
-    results['disabled'] = {'byte_identical_ir': True}
     positive = run('shared_destination')
     assert 'hyb.activation_residency_private_results = 1' in positive
     assert positive.count('tensor.empty') == baseline.count('tensor.empty') + 1
@@ -164,7 +159,7 @@ def main():
     pipeline = ('--one-shot-bufferize=bufferize-function-boundaries function-boundary-type-conversion=identity-layout-map',
                 '--buffer-results-to-out-params=hoist-static-allocs',
                 '--canonicalize', '--cse', '--hyb-npu-place', '--hyb-npu-promote')
-    before_mem = run('before_bufferization', enabled=False, extra=pipeline)
+    before_mem = run('before_bufferization', bare=True, extra=pipeline)
     after_mem = run('after_bufferization', extra=pipeline)
     assert 'memref<32xf16, 2>' in after_mem, 'local shared activation was not placed in L2'
     # The initial fill must now write an on-chip value, never the DRAM output.
@@ -180,15 +175,14 @@ def main():
     assert re.search(r'memref.copy[^\n]+to memref<32xf16, 2>', after_prefix), after_prefix
     results['bufferized_residency'] = {'local_dram_flush_removed': True, 'shared_l2_used': True}
 
-    # Policy errors must not silently fall back to the unoptimized program.
-    for name, bad in (('integer', 1), ('string', 'true'), ('null', None)):
-        target = json.loads((out/'True.json').read_text())
-        target['npu']['activation_residency'] = bad
-        path = out/f'invalid-{name}.json'; path.write_text(json.dumps(target))
-        result = subprocess.run([optimizer, str(out/'original.mlir'),
-            f'--hyb-npu-activation-residency=spec={path}'], capture_output=True, text=True)
-        assert result.returncode and 'npu.activation_residency must be a boolean' in result.stderr
-        results[f'invalid_{name}'] = {'rejected': True}
+    # The optimization has no switch: its former key is rejected, not silently ignored.
+    target = json.loads(spec.read_text())
+    target['npu']['activation_residency'] = False
+    path = out/'switch.json'; path.write_text(json.dumps(target))
+    result = subprocess.run([optimizer, str(out/'original.mlir'),
+        f'--hyb-npu-activation-residency=spec={path}'], capture_output=True, text=True)
+    assert result.returncode and 'npu.activation_residency is not a target parameter' in result.stderr
+    results['switch_rejected'] = {'rejected': True}
     path = out/'array.json'; path.write_text('[]')
     result = subprocess.run([optimizer, str(out/'original.mlir'),
         f'--hyb-npu-activation-residency=spec={path}'], capture_output=True, text=True)

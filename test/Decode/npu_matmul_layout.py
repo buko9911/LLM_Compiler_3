@@ -42,31 +42,25 @@ def main():
     args=ap.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     out=Path(tempfile.mkdtemp(prefix='run-',dir=args.output))
     root=Path(__file__).resolve().parents[2]
-    cases=[('batch',{},True,True,{}),('plain',{'batch':0},True,True,{}),
-           ('tails',{'m':5,'n':37,'k':19},True,True,{}),
-           ('off',{},False,False,{}),('single_row',{'m':1},True,False,{}),
-           ('other_phase',{'phase':'pim'},True,False,{}),('f32',{'dtype':'f32'},True,False,{}),
-           ('canonical',{'canonical':True},True,False,{}),
-           ('rhs_output_overlap',{'output_strided':True},True,False,{}),
-           ('alias',{'m':32,'n':128,'k':128,'alias':True},True,False,{}),
-           ('capacity',{},True,False,{'l1_bytes':262144}),
-           ('too_large',{'n':20000},True,False,{}),
-           ('swap_batch',{},False,'swap',{'matmul_transpose_output':True}),
-           ('swap_plain',{'batch':0},False,'swap',{'matmul_transpose_output':True}),
-           ('swap_tail',{'m':5,'n':37,'k':19},False,'swap',{'matmul_transpose_output':True}),
-           ('swap_intervening_read',{'read_after_fill':True},False,False,{'matmul_transpose_output':True}),
-           ('swap_nonzero',{'zero':1.0},False,False,{'matmul_transpose_output':True}),
-           ('swap_negative_zero',{'zero':-0.0},False,False,{'matmul_transpose_output':True}),
-           ('swap_output_overlap',{'output_strided':True},False,False,{'matmul_transpose_output':True}),
-           ('swap_m1',{'m':1},False,False,{'matmul_transpose_output':True}),
-           ('swap_no_traffic_win',{'m':32,'n':8,'k':16},False,False,{'matmul_transpose_output':True}),
-           ('swap_capacity',{},False,False,{'matmul_transpose_output':True,'l1_bytes':262144}),
-           ('swap_alias',{'m':32,'n':128,'k':128,'alias':True},False,False,{'matmul_transpose_output':True})]
+    # Both layouts are always considered: the output transpose first (it also fills the SA columns of
+    # a short M), RHS packing when the transpose does not apply. expected: 'swap', True (packed), False.
+    cases=[('batch',{},'swap',{}),('plain',{'batch':0},'swap',{}),
+           ('tails',{'m':5,'n':37,'k':19},'swap',{}),('single_row',{'m':1},False,{}),
+           ('other_phase',{'phase':'pim'},False,{}),('f32',{'dtype':'f32'},False,{}),
+           ('canonical',{'canonical':True},False,{}),
+           ('rhs_output_overlap',{'output_strided':True},False,{}),
+           ('alias',{'m':32,'n':128,'k':128,'alias':True},False,{}),
+           ('capacity',{},False,{'l1_bytes':262144}),
+           ('too_large',{'n':20000},False,{}),
+           ('intervening_read',{'read_after_fill':True},True,{}),
+           ('nonzero_init',{'zero':1.0},True,{}),
+           ('negative_zero_init',{'zero':-0.0},True,{}),
+           ('no_traffic_win',{'m':32,'n':8,'k':16},True,{})]
     result={}
-    for name,kw,enabled,expected,options in cases:
+    for name,kw,expected,options in cases:
         src=out/f'{name}.mlir';src.write_text(source(**kw))
         spec=json.loads((root/'configs/target.json').read_text())
-        spec['npu'].update(matmul_rhs_packing=enabled,**options)
+        spec['npu'].update(options)
         path=out/f'{name}.json';path.write_text(json.dumps(spec))
         cmd=[str(args.optimizer.resolve()),str(src),f'--hyb-npu-matmul-layout=spec={path.resolve()}']
         run=subprocess.run(cmd,text=True,capture_output=True)

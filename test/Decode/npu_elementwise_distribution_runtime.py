@@ -146,8 +146,6 @@ def main():
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+")
-    parser.add_argument("--command-schedule", action="store_true",
-                        help="Also exercise the system command scheduler on both numerical paths")
     args = parser.parse_args()
     sys.path.insert(0, str(root / "runtime"))
     from decode import Device
@@ -180,16 +178,12 @@ def main():
             results=[dict(kind="output", name=k) for k in ["y", *fixture.get("extra_reference", {})]]), indent=2))
         np.savez(case / "inputs.npz", **fixture["inputs"])
         np.save(case / "reference.npy", fixture["reference"])
-        control = None
         modes = {}
-        for mode, enabled in (("off", False), ("distributed", True)):
+        # The compiler distributes by the cost rule (NpuCost.h) and always schedules commands. These
+        # tiny fixtures exercise the distributed code with no split cost.
+        for mode, enabled in (("compiler", True),):
             spec = json.loads((root / "configs/target.json").read_text())
-            spec["npu"].update(elementwise_distribution=enabled, distribute_min_elements=1,
-                vector_scalar_reuse=False, vector_chunk_pipeline=False,
-                activation_residency=True, attention_fusion=False, projection_fusion=False,
-                l2_staging_bytes_per_core=0)
-            if args.command_schedule:
-                spec["npu"]["command_schedule"] = True
+            spec["npu"].update(l2_staging_bytes_per_core=0, core_split_us=0)
             target = case / f"{mode}.json"
             target.write_text(json.dumps(spec, indent=2))
             build = case / mode
@@ -214,10 +208,6 @@ def main():
             assert error <= fixture["tolerance"], (name, mode, "independent oracle mismatch", error)
             for key, expected in fixture.get("extra_reference", {}).items():
                 assert actual_outputs[key].tobytes() == expected.tobytes(), (name, mode, key, "oracle mismatch")
-            if control is None:
-                control = {key: array.copy() for key, array in actual_outputs.items()}
-            for key, array in actual_outputs.items():
-                assert array.tobytes() == control[key].tobytes(), (name, mode, key, "OFF/ON byte mismatch")
             timeline = json.loads((build / "timeline.json").read_text())
             assert timeline["dropped_events"] == 0
             by_core = {}
@@ -232,7 +222,7 @@ def main():
             timing = json.loads((build / "timing.json").read_text())
             modes[mode] = dict(total_us=timing["total_simulated_cycles"] / timing["npu_clock_mhz"],
                 max_abs_numpy_error=error, numpy_tolerance=fixture["tolerance"],
-                byte_exact_with_control=True, distributions=distributions,
+                distributions=distributions,
                 shared_copy_staging_markers=staging,
                 vpu_instruction_records_by_core=by_core, wall_seconds=wall,
                 read_bytes=timing["lp6_bytes_read"], write_bytes=timing["lp6_bytes_written"],

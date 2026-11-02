@@ -227,12 +227,9 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
       int64_t N = t.getDimSize(1);
       int64_t cores = largestDivisorAtMost(N / 32, target.npu.cores);
       if (cores < 2) continue;
-      // The split rule of NpuCost.h; npu.dequant_min_elements (0: npu.distribute_min_elements) is a
-      // floor kept for experiments.
-      const int64_t floor = target.npu.dequantMinElements > 0
-          ? target.npu.dequantMinElements : target.npu.distributeMinElements;
+      // The split rule of NpuCost.h.
       double cycles = double(t.getNumElements()) * cost::dequantCyclesPerElement(target.npu);
-      bool split = cost::splitPays(target.npu, cycles, cores) && t.getNumElements() >= floor;
+      bool split = cost::splitPays(target.npu, cycles, cores);
       std::string label;
       llvm::raw_string_ostream os(label);
       os << "hyb.dequant " << d.getInit().getType();

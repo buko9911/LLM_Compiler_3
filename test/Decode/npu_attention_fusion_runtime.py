@@ -45,17 +45,13 @@ def main():
     root = Path(__file__).resolve().parents[2]
     workspace = root.parent.parent
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-pipeline", action="store_true", help="Compare blocking, async-only, and common tiled input pipeline")
     parser.add_argument("--input-tile-columns", type=int, default=128)
-    parser.add_argument("--input-scheduling", action="store_true", help="Compare asynchronous input loads against blocking loads")
     parser.add_argument("--compiler",type=Path,default=root/"build/bin/npu-compile")
     parser.add_argument("--output",type=Path,required=True)
     parser.add_argument("--emulator",type=Path,default=workspace/"core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
     parser.add_argument("--settings",type=Path,default=workspace/"research/checkpoint_race/hardware/kernel_probe/settings_4core.toml")
     parser.add_argument("--lp6-library",type=Path,default=workspace/"core/ramulator2/liblp6_ramulator.so")
     args=parser.parse_args()
-    if args.input_pipeline and args.input_scheduling:
-        parser.error("Choose input pipeline or input scheduling experiment")
     output=args.output.resolve(); output.mkdir(parents=True,exist_ok=False)
     model=output/"model"; model.mkdir()
     save_file({"unused":np.zeros((1,),dtype=np.float16)},model/"model.safetensors")
@@ -66,20 +62,19 @@ def main():
     (output/"provenance.json").write_text(json.dumps(provenance,indent=2)+"\n")
     cases=[("m1_causal",8,4,1,9,8,False),
            ("m8_causal_and_finite_masked_row",8,4,8,40,32,True),
-           ("odd_keys_nonpower_heads",6,2,3,7,8,True)]
-    if args.input_pipeline:
-        cases += [("pipeline_column_tail",8,2,3,9,65,True),
-                  ("pipeline_many_heads",12,2,2,17,128,False)]
+           ("odd_keys_nonpower_heads",6,2,3,7,8,True),
+           # V assembled from a KV append in shared L2: the tiled input pipeline feeds the head.
+           ("pipeline_column_tail",8,2,3,9,65,True),
+           ("pipeline_many_heads",12,2,2,17,128,False)]
     summary={"kind":"native_cycle_simulator_functional_microtests","cases":{}}
     for name,h,g,m,s,d,masked in cases:
         case=output/name;case.mkdir()
         source=case/"step.mlir"
         text=attention_source(heads=h,groups=g,tokens=m,keys=s,depth=d,with_mask=True)
         text=text.replace("@phase(","@decode_step(").replace('attributes {hyb.phase = "npu"}',"")
-        if args.input_pipeline:
+        if name.startswith("pipeline_"):
             # Model a KV append rather than a phase argument read: two disjoint
             # slices assemble V in shared L2 before the head-local consumer.
-            # Values are unchanged; all three modes pay this same preparation.
             vt=f"tensor<{h}x{s}x{d}xf16>"
             head=f"tensor<{h}x{s-1}x{d}xf16>"
             tail=f"tensor<{h}x1x{d}xf16>"
@@ -109,18 +104,11 @@ def main():
         np.savez(case/"inputs.npz",**inputs)
         reference=value_reference(inputs,h,g,m,s,d);np.save(case/"numpy_reference.npy",reference)
         runs={}
-        previous=None
-        modes = [("blocking",False,False), ("overlap",True,False)] if args.input_scheduling else [("off",False,False),("on",False,False)]
-        if args.input_pipeline:
-            modes = [("blocking",False,False), ("async",True,False), ("pipeline",True,True)]
-        for mode,async_input,pipeline in modes:
-            enabled = args.input_pipeline or args.input_scheduling or mode == "on"
+        # Attention fusion, async input loads and the tiled input pipeline are always applied.
+        for mode in ["compiler"]:
             build=case/mode
             spec=json.loads((root/"configs/target.json").read_text())
-            spec["npu"].update(attention_fusion=enabled,
-                               l2_staging_bytes_per_core=0, async_input_loads=async_input,
-                               input_tile_pipeline=pipeline,
-                               input_tile_columns=args.input_tile_columns)
+            spec["npu"].update(l2_staging_bytes_per_core=0, input_tile_columns=args.input_tile_columns)
             target=case/f"{mode}.json";target.write_text(json.dumps(spec,indent=2))
             command=[args.compiler.resolve(),"--pipeline=decode",source,"--manifest",manifest,
                      "--spec",target,"--force=npu","-o",build]
@@ -147,24 +135,19 @@ def main():
             array=np.frombuffer(raw[output_info["l1"]:output_info["l1"]+output_info["bytes"]],dtype=np.float16).reshape(output_info["shape"])
             np.save(build/"output.npy",array)
             assert np.isfinite(array).all(),name
-            exact=previous is None or array.tobytes()==previous.tobytes()
             maximum=float(np.max(np.abs(array.astype(np.float32)-reference.astype(np.float32))))
-            # The independent reference checks values, while byte comparison
-            # checks the unchanged compiler numerical contract exactly.
+            # The independent reference checks the values.
             assert maximum<=0.002,(name,mode,maximum)
-            assert exact,(name,"off/on numerical mismatch")
             timing=json.loads((build/"timing.json").read_text())
             runs[mode]=dict(total_us=timing["total_simulated_cycles"]/timing["npu_clock_mhz"],
-                wall_seconds=wall,byte_exact_with_off=exact,max_abs_numpy_error=maximum,
-                argmax_equal_to_off=previous is None or bool(np.array_equal(array.argmax(-1),previous.argmax(-1))),
+                wall_seconds=wall,max_abs_numpy_error=maximum,
                 elements=int(array.size),lp6_read_bytes=timing["lp6_bytes_read"],lp6_write_bytes=timing["lp6_bytes_written"],
                 phase_metadata=io["phases"], input_pipeline_groups=sum(map(int,__import__("re").findall(r"hyb.input_pipeline_groups = (\d+)",(build/"compiled.mlir").read_text()))))
-            previous=array.copy()
         summary["cases"][name]=runs
         (output/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
         print(name,json.dumps({mode:{k:v for k,v in result.items() if k!="phase_metadata"} for mode,result in runs.items()}),flush=True)
-    if args.input_pipeline:
-        assert any(case["pipeline"]["input_pipeline_groups"] for case in summary["cases"].values()), "No pipeline exercised"
+    assert any(runs["compiler"]["input_pipeline_groups"] for name, runs in summary["cases"].items()
+               if name.startswith("pipeline_")), "No pipeline exercised"
     for path in sources:
         if path.exists():assert digest(path)==provenance[str(path)],f"Changed while running: {path}"
 

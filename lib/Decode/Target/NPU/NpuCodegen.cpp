@@ -182,7 +182,7 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   satisfied.assign(size_t(cores), {});
   miscCursor.assign(size_t(cores), 0);
   phaseFirstCommand = commands0;
-  if (in.carried && in.spec->npu.crossPhasePrefetch) {
+  if (in.carried) {
     for (const auto &a : in.carried->l2) l2acc.push_back({a.s, a.e, a.id, a.core, AccKind(a.kind)});
     for (const auto &a : in.carried->lp6) lp6acc.push_back({a.s, a.e, a.id, a.store});
   }
@@ -201,11 +201,9 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   if (in.carried) {
     in.carried->l2.clear();
     in.carried->lp6.clear();
-    if (in.spec->npu.crossPhasePrefetch) {
-      for (const Acc &a : l2acc)
-        if (a.id >= 0) in.carried->l2.push_back({a.s, a.e, a.id, a.core, int(a.k)});
-      for (const LAcc &a : lp6acc) in.carried->lp6.push_back({a.s, a.e, a.id, a.store});
-    }
+    for (const Acc &a : l2acc)
+      if (a.id >= 0) in.carried->l2.push_back({a.s, a.e, a.id, a.core, int(a.k)});
+    for (const LAcc &a : lp6acc) in.carried->lp6.push_back({a.s, a.e, a.id, a.store});
   }
   stats.coreWords = w.coreWords() - words0;
   stats.commands = w.numCommands() - commands0;

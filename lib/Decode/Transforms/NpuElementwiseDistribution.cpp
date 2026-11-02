@@ -49,14 +49,12 @@ double oneCoreCycles(Operation *op, const TargetSpec &target) {
   return 0;
 }
 
-/// The split rule: split when `cores` cores save more than the fixed cost of a split (and the op has
-/// at least npu.distribute_min_elements elements, a floor kept for experiments; 0 by default).
-/// Records the choice and its numbers.
+/// The split rule: split when `cores` cores save more than the fixed cost of a split. Records the
+/// choice and its numbers.
 bool splitDecision(func::FuncOp fn, Operation *op, StringRef kind, double cycles, int64_t cores,
                    const TargetSpec &target) {
   const auto &npu = target.npu;
-  int64_t elements = cast<ShapedType>(op->getResult(0).getType()).getNumElements();
-  bool split = cost::splitPays(npu, cycles, cores) && elements >= npu.distributeMinElements;
+  bool split = cost::splitPays(npu, cycles, cores);
   std::string label;
   llvm::raw_string_ostream os(label);
   os << op->getName().getStringRef() << ' ' << op->getResult(0).getType();
@@ -321,14 +319,14 @@ struct HybNpuElementwiseDistributePass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    // An NPU-only option, like hyb-npu-attention-fusion.
-    if (!target->npu.elementwiseDistribution || hasPimPhase(getOperation())) return;
+    // NPU-only, like hyb-npu-attention-fusion.
+    if (hasPimPhase(getOperation())) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, candidates = 0, small = 0, unsupported = 0, capacity = 0, indivisible = 0;
       fn.walk([&](scf::ForallOp loop) { count += loop->hasAttr(marker); });
       IRRewriter rewriter(&getContext());
       int64_t rowChains = 0, rowFused = 0;
-      if (target->npu.rowDistribution && failed(distributeRows(fn, *target, rewriter, rowChains, rowFused)))
+      if (failed(distributeRows(fn, *target, rewriter, rowChains, rowFused)))
         return signalPassFailure();
       count += rowChains;
       SmallVector<linalg::GenericOp> work;
@@ -367,13 +365,12 @@ struct HybNpuElementwiseDistributePass
         rewriter.replaceOp(generic, result->replacements);
         ++count;
       }
-      // npu.distribute_transposes: a top-level FP16 transpose (a strided copy) over the cores by
-      // its leading output axis; each core moves its own output rows.
+      // A top-level FP16 transpose (a strided copy) over the cores by its leading output axis;
+      // each core moves its own output rows.
       int64_t transposes = 0;
       SmallVector<linalg::TransposeOp> layouts;
-      if (target->npu.distributeTransposes)
-        for (Operation &op : fn.front())
-          if (auto t = dyn_cast<linalg::TransposeOp>(op)) layouts.push_back(t);
+      for (Operation &op : fn.front())
+        if (auto t = dyn_cast<linalg::TransposeOp>(op)) layouts.push_back(t);
       for (linalg::TransposeOp t : layouts) {
         auto type = dyn_cast<RankedTensorType>(t->getResult(0).getType());
         if (!t.hasPureTensorSemantics() || !type || !type.hasStaticShape() || !type.getElementType().isF16() ||
@@ -417,11 +414,9 @@ struct HybNpuElementwiseDistributePass
       record("hyb.elementwise_unsupported", unsupported);
       record("hyb.elementwise_capacity", capacity);
       record("hyb.elementwise_indivisible", indivisible);
-      if (target->npu.rowDistribution) {
-        record("hyb.row_distributions", rowChains);
-        record("hyb.row_fused", rowFused);
-      }
-      if (target->npu.distributeTransposes) record("hyb.transposes_distributed", transposes);
+      record("hyb.row_distributions", rowChains);
+      record("hyb.row_fused", rowFused);
+      record("hyb.transposes_distributed", transposes);
     }
   }
 };

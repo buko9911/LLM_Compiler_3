@@ -104,38 +104,40 @@ def main():
     args.output.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix="run-", dir=args.output)).resolve()
     base = dict(heads=4, groups=2, tokens=3, keys=23, depth=8, with_mask=True)
+    # Online softmax is chosen when the full-row path does not fit: its L2 copy of K and V, the
+    # activations and a three-slot weight ring per core must fit L2. A 1 MiB L2 (smaller than the
+    # ring alone) makes every supported chain of these small graphs online; the 8 MiB target keeps
+    # them full-row. With fewer KV heads than the 4 cores the keys are split over the cores.
+    small = {"l2_bytes": 1 << 20}
     # name, graph changes, target changes, transform expected.
     cases = (
-        ("online_gqa_mask_tail", {}, {}, True),
-        ("split_key_decode", {"heads": 1, "tokens": 1, "keys": 67},
-         {"flash_decoding": True, "attention_splits": 4}, True),
-        ("prefill_query_tiles", {"tokens": 33, "keys": 65}, {}, True),
-        ("direct_no_mask", {"reshaped": False, "with_mask": False}, {}, True),
-        ("gqa_no_mask", {"with_mask": False}, {}, True),
-        ("non_power_two_score_scale", {"score_scale": 0.3535533905932738}, {}, True),
-        ("concat_transposed_key", {"keys": 67, "kv_prefix": 64}, {"flash_kv_slicing": True}, True),
+        ("online_gqa_mask_tail", {}, small, True),
+        ("full_row_fits", {}, {}, False),
+        ("split_key_decode", {"heads": 1, "tokens": 1, "keys": 67}, small, True),
+        ("prefill_query_tiles", {"tokens": 33, "keys": 65}, small, True),
+        ("direct_no_mask", {"reshaped": False, "with_mask": False}, small, True),
+        ("gqa_no_mask", {"with_mask": False}, small, True),
+        ("non_power_two_score_scale", {"score_scale": 0.3535533905932738}, small, True),
+        ("concat_transposed_key", {"keys": 67, "kv_prefix": 64}, small, True),
         ("concat_sequence_major_key", {"tokens": 8, "keys": 72, "kv_prefix": 64, "key_sequence_major": True},
-         {"flash_kv_slicing": True, "flash_decoding": True, "attention_splits": 2}, True),
-        ("concat_slicing_off", {"keys": 67, "kv_prefix": 64}, {"flash_kv_slicing": False}, True),
-        ("concat_mismatched_boundaries", {"keys": 67, "kv_prefix": 64, "kv_value_prefix": 63},
-         {"flash_kv_slicing": True}, True),
-        ("concat_shared_results", {"keys": 67, "kv_prefix": 64, "shared_kv": True},
-         {"flash_kv_slicing": True}, True),
-        ("canonical_single_head_m1", {"heads": 1, "groups": 4, "tokens": 1, "keys": 67, "depth": 32}, {}, True),
-        ("canonical_single_head_m8", {"heads": 1, "tokens": 8, "keys": 72, "depth": 16}, {}, True),
-        ("disabled", {}, {"flash_attention": False}, False),
-        ("shared_score_result", {"shared": True}, {}, False),
-        ("index_dependent_softmax", {"indexed": True}, {}, False),
-        ("pim_phase", {"phase": "pim"}, {}, False),
-        ("mixed_module", {}, {}, False),
-        ("wrong_softmax_math", {}, {}, False),
-        ("fixed_nonzero_mask_row", {}, {}, False),
-        ("nonzero_qk_init", {}, {}, False),
-        ("nonzero_pv_init", {}, {}, False),
-        ("nonzero_sum_init", {}, {}, False),
-        ("wrong_max_init", {}, {}, False),
-        ("empty_requested_split", {"tokens": 1, "keys": 3},
-         {"flash_decoding": True, "attention_splits": 4}, False),
+         small, True),
+        ("concat_two_heads_split", {"heads": 2, "keys": 67, "kv_prefix": 64}, small, True),
+        ("concat_mismatched_boundaries", {"keys": 67, "kv_prefix": 64, "kv_value_prefix": 63}, small, True),
+        ("concat_shared_results", {"keys": 67, "kv_prefix": 64, "shared_kv": True}, small, True),
+        ("canonical_single_head_m1", {"heads": 1, "groups": 4, "tokens": 1, "keys": 67, "depth": 32}, small, True),
+        ("canonical_single_head_m8", {"heads": 1, "tokens": 8, "keys": 72, "depth": 16}, small, True),
+        ("few_keys_one_split", {"heads": 1, "tokens": 1, "keys": 3}, small, True),
+        # Unsupported chains keep the full-row path.
+        ("shared_score_result", {"shared": True}, small, False),
+        ("index_dependent_softmax", {"indexed": True}, small, False),
+        ("pim_phase", {"phase": "pim"}, small, False),
+        ("mixed_module", {}, small, False),
+        ("wrong_softmax_math", {}, small, False),
+        ("fixed_nonzero_mask_row", {}, small, False),
+        ("nonzero_qk_init", {}, small, False),
+        ("nonzero_pv_init", {}, small, False),
+        ("nonzero_sum_init", {}, small, False),
+        ("wrong_max_init", {}, small, False),
     )
     summary = {"kind": "compiler_structure_not_runtime_performance", "cases": {}}
     for name, graph_options, config_options, transformed in cases:
@@ -161,27 +163,20 @@ def main():
         source = output / f"{name}.mlir"
         source.write_text(text)
         target = json.loads((root / "configs/target.json").read_text())
-        target["npu"].update(flash_attention=True, flash_decoding=False,
-            attention_query_tile=2, attention_key_tile=8, attention_splits=1)
+        target["npu"].update(attention_query_tile=2, attention_key_tile=8)
         target["npu"].update(config_options)
         target_file = output / f"{name}.json"
         target_file.write_text(json.dumps(target, indent=2))
         result = invoke(args.optimizer.resolve(), source, target_file,
                         canonicalize=name.startswith("canonical_single_head"))
         (output / f"{name}.log").write_text(result.stdout + result.stderr)
-        if not transformed and name != "disabled":
-            # Explicitly requesting online attention on an unsupported graph
-            # must fail rather than silently claiming the feature was enabled.
-            assert result.returncode != 0, (name, "unsupported request accepted")
-            assert "error:" in result.stderr, (name, result.stderr)
-            summary["cases"][name] = {"rejected": True, "passed": True}
-            continue
         assert result.returncode == 0, (name, result.stderr)
         counts = re.findall(r"transformed_chains = (\d+) : i64", result.stdout)
         transformed_count = sum(map(int, counts))
         assert transformed_count == int(transformed), (name, transformed_count, result.stdout)
         if transformed:
-            algorithm = "flash_decoding" if config_options.get("flash_decoding") else "flash_attention"
+            splits = 1 if graph["heads"] >= 4 else min(4 // graph["heads"], graph["keys"])
+            algorithm = "flash_decoding" if splits > 1 else "flash_attention"
             assert f'algorithm = "{algorithm}"' in result.stdout, result.stdout
             assert "hyb.flash_math" in result.stdout, result.stdout
             assert "hyb.flash_tile" in result.stdout, result.stdout
@@ -193,7 +188,7 @@ def main():
             for shape in (f"{h}x{g*m}x{s}xf16", f"{h}x{g}x{m}x{s}xf16"):
                 assert not re.search(r"tensor\.empty\(\)[^\n]*tensor<" + re.escape(shape) + r">", result.stdout), (name, "full score workspace remains")
             if graph.get("kv_prefix"):
-                sliced = config_options.get("flash_kv_slicing") and not graph.get("shared_kv") and not graph.get("kv_value_prefix")
+                sliced = not graph.get("shared_kv") and not graph.get("kv_value_prefix")
                 assert ("segmented_kv_chains = 1" in result.stdout) == bool(sliced), (name, result.stdout)
                 assert ("tensor.concat" not in result.stdout) == bool(sliced), (name, "unexpected concat materialization")
             if algorithm == "flash_decoding":
@@ -207,26 +202,26 @@ def main():
         else:
             plain = invoke(args.optimizer.resolve(), source)
             assert plain.returncode == 0, plain.stderr
-            assert result.stdout == plain.stdout, (name, "inactive path changed")
+            # The full-row program stays; only the decision record is added.
             assert "hyb.flash_tile" not in result.stdout, name
+            assert "hyb.flash_math" not in result.stdout, name
         summary["cases"][name] = {"transformed_chains": transformed_count, "passed": True}
 
+    # The removed switches are rejected like malformed tiles.
     invalid = (
-        ("bool_type", {"flash_attention": 1}),
-        ("decode_without_flash", {"flash_attention": False, "flash_decoding": True, "attention_splits": 2}),
+        ("flash_switch", {"flash_attention": True}),
+        ("decoding_switch", {"flash_decoding": True}),
+        ("slicing_switch", {"flash_kv_slicing": True}),
+        ("splits_key", {"attention_splits": 2}),
         ("query_tile_zero", {"attention_query_tile": 0}),
         ("key_tile_zero", {"attention_key_tile": 0}),
-        ("too_many_splits", {"flash_decoding": True, "attention_splits": 8}),
-        ("single_split_decode", {"flash_decoding": True, "attention_splits": 1}),
-        ("splits_without_decoding", {"attention_splits": 2}),
         ("fractional_tile", {"attention_key_tile": 8.5}),
         ("overflow_tile", {"attention_query_tile": 2**63}),
     )
     source = output / "online_gqa_mask_tail.mlir"
     for name, overrides in invalid:
         target = json.loads((root / "configs/target.json").read_text())
-        target["npu"].update(flash_attention=True, flash_decoding=False,
-            attention_query_tile=2, attention_key_tile=8, attention_splits=1)
+        target["npu"].update(attention_query_tile=2, attention_key_tile=8, **small)
         target["npu"].update(overrides)
         target_file = output / f"invalid_{name}.json"
         target_file.write_text(json.dumps(target, indent=2))

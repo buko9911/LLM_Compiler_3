@@ -4,16 +4,17 @@
 verify and 64-token prefill. The step comes only from the export (`frontend/export.py --tokens M
 --capacity P`, P = 0 for prefill); the file never names a step. Hardware: four LPDDR6 channels
 (8 subchannels x 2 ranks), 4 NPU cores at 800 MHz, L1 4 MiB per core, L2 8 MiB, run with the 4-core
-simulator settings and the LPDDR6 Ramulator backend. Compile with `--force=npu --npu-phase-split=layer`
-(with `none`, one 36-layer phase exceeds the ISA 2.0 dependency record: command dependencies must lie
-within 65,535 earlier commands).
+simulator settings and the LPDDR6 Ramulator backend. Compile with `--force=npu` (NPU phases end at layer
+boundaries: one 36-layer phase would exceed the ISA 2.0 dependency record, whose command dependencies
+must lie within 65,535 earlier commands).
 
-The `npu.*` switches enable the optional passes. Whether a pass applies to an op is a cost comparison
-of the tensor shapes against the hardware numbers in the file (`include/npu/Decode/Transforms/NpuCost.h`):
-splitting an op over the cores, running SiLU*up tile by tile inside the up GEMV loop, fusing projections
-that read the same input, cutting a GEMV partition that does not fit L1 into column chunks. Every choice
-and its numbers are listed in the output `io.json` under `phases[].decisions`, so equal shapes get equal
-programs whatever the step.
+The file holds hardware numbers only; the optimizations have no switches (2026-11-02), and a key that
+is not a target parameter is an error. Whether a rewrite applies to an op is a cost comparison of the
+tensor shapes against these numbers (`include/npu/Decode/Transforms/NpuCost.h`): splitting an op over
+the cores, full-row versus online softmax (does the full-row attention fit L2 and L1), running SiLU*up
+tile by tile inside the up GEMV loop, fusing projections that read the same input, cutting a GEMV
+partition that does not fit L1 into column chunks. Every choice and its numbers are listed in the output
+`io.json` under `phases[].decisions`, so equal shapes get equal programs whatever the step.
 
 | Hardware number | Value | Source |
 |---|---|---|
@@ -23,8 +24,9 @@ programs whatever the step.
 | `gdma_read_gbps` | 92.9 | a Qwen3-4B program's GDMA reads replayed without compute (2026-10-31) |
 | `core_split_us` | 0.5 | fixed cost of running one op on 4 cores instead of 1, Qwen3-4B one-layer fixtures, every op split vs none at M = 1, 4, 8 (2026-10-31) |
 
-The `*_min_elements` keys are floors kept for experiments (0: none). Measurements, the comparison with
-the earlier per-step presets and what remains: workspace `docs/research/NPU_ONLY_BASELINE.md`.
+Measurements, the comparison with the earlier per-step presets and what remains: workspace
+`docs/research/NPU_ONLY_BASELINE.md`. The contribution of each former switch (measured 2026-11-02, before
+they were removed): workspace `docs/architecture/COMPILER.md` appendix A.
 
 Until 2026-11-02 there were three per-step presets with fixed size thresholds
 (`qwen3_4b_m1_c512.json`, `qwen3_4b_m8_c512.json`, `qwen3_4b_prefill64.json`, the last two differing

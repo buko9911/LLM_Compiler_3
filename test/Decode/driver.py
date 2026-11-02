@@ -8,14 +8,13 @@ p = argparse.ArgumentParser()
 p.add_argument("--compiler", required=True)
 a = p.parse_args()
 for args, code, needle in [
-    (["--help"], 0, "--npu-weight-prefetch"),
+    (["--help"], 0, "--pim-bankset-pingpong"),
     (["--pipeline=graph", "--help"], 2, "--pipeline must be decode"),
     (["--pipeline=prefill", "--help"], 2, "--pipeline must be decode"),
     (["--pipeline=graph-hybrid", "--help"], 2, "--pipeline must be decode"),
-    (["--pipeline=decode", "--help"], 0, "--npu-weight-prefetch"),
-    (["--pipeline=decode", "--help"], 0, "--npu-phase-split"),
+    (["--pipeline=decode", "--help"], 0, "--force"),
     (["--pipeline", "decode", "--help"], 0, "--pim-bankset-pingpong"),
-    (["--manifest=unused.json", "--help"], 0, "--npu-weight-prefetch"),
+    (["--manifest=unused.json", "--help"], 0, "--no-output-collect"),
     (["--pipeline=unknown"], 2, "must be decode"),
     (["--pipeline"], 2, "needs a value"),
     (["--pipeline=decode", "--pipeline=graph"], 2, "only once"),
@@ -23,19 +22,21 @@ for args, code, needle in [
 ]:
     r = subprocess.run([a.compiler, *args], text=True, capture_output=True)
     assert r.returncode == code and needle in r.stdout + r.stderr, (args, r.returncode, r.stdout, r.stderr)
-with tempfile.TemporaryDirectory(prefix="npu-phase-options-") as output:
+# Optimizations have no switches: the removed options are rejected.
+with tempfile.TemporaryDirectory(prefix="npu-removed-options-") as output:
     base = [a.compiler, "--pipeline=decode", "unused.mlir", "--manifest=unused.json",
             "--spec=unused.json", "-o", output]
-    for selectors in [
-        ["--npu-phase-split=invalid"],
-        ["--npu-phase-split=none"],
-        ["--npu-phase-split=none", "--force=pim"],
-        ["--npu-phase-split=none", "--force=npu", "--map=q_proj:npu"],
-        ["--npu-phase-split=none", "--force=npu", "--pim-packet-npu=g4"],
-    ]:
-        r = subprocess.run([*base, *selectors], text=True, capture_output=True)
-        assert r.returncode != 0 and "--npu-phase-split must be layer or none" in r.stderr, (
-            selectors, r.returncode, r.stdout, r.stderr)
+    for selector in ["--npu-phase-split=none", "--npu-weight-prefetch=false"]:
+        r = subprocess.run([*base, selector], text=True, capture_output=True)
+        assert r.returncode != 0 and "Unknown command line argument" in r.stderr, (selector, r.stderr)
+    # A target key that is not a hardware number (here a removed on/off switch) is an error.
+    spec, source = Path(output)/"spec.json", Path(output)/"step.mlir"
+    spec.write_text('{"npu": {"cores": 4, "projection_fusion": true}}')
+    source.write_text('module { func.func @decode_step() { return } }')
+    opt = Path(a.compiler).with_name("npu-opt")
+    r = subprocess.run([str(opt), str(source), f"--hyb-npu-projection-fusion=spec={spec}"],
+                       text=True, capture_output=True)
+    assert r.returncode != 0 and "npu.projection_fusion is not a target parameter" in r.stderr, r.stderr
 with tempfile.TemporaryDirectory(prefix="npu-reserved-init-") as output:
     for attr in ("hyb.elide_matrix_init", "hyb.matrix_init_elisions", "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions",
                  "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions"):
@@ -45,4 +46,4 @@ with tempfile.TemporaryDirectory(prefix="npu-reserved-init-") as output:
                             "--spec=unused.json", "--force=npu", "-o", str(Path(output)/"build")],
                            text=True, capture_output=True)
         assert r.returncode and "reserved compiler IR attributes" in r.stderr, (attr,r.stderr)
-print("24 compiler routing/diagnostic checks passed")
+print("21 compiler routing/diagnostic checks passed")

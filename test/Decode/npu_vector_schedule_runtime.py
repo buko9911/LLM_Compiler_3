@@ -160,15 +160,10 @@ def main():
         np.save(case/"legacy_reference.npy", fixture["reference"])
         control = None
         records = {}
-        # loops: "both" with the repeated chunks / short rows as hardware loops (npu.vector_loops).
-        for mode in ["off", "reuse", "pipeline", "both", "loops"]:
+        # The compiler always reuses row scalars, interleaves independent chunks and emits repeated
+        # chunks / short rows as hardware loops.
+        for mode in ["compiler"]:
             spec = json.loads((root/"configs/target.json").read_text())
-            reuse, pipeline = mode in ("reuse","both","loops"), mode in ("pipeline","both","loops")
-            spec["npu"].update(vector_scalar_reuse=reuse, vector_chunk_pipeline=pipeline, vector_loops=mode == "loops",
-                elementwise_distribution=False, staging_early_release=False,
-                attention_fusion=False, projection_fusion=False,
-                activation_residency=True,
-                input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False)
             target = case/f"{mode}.json";target.write_text(json.dumps(spec,indent=2))
             build = case/mode
             command = [args.compiler, "--pipeline=decode", source_path, "--manifest", manifest,
@@ -189,13 +184,13 @@ def main():
             fields=[p.get("vector_schedule",{}) for p in io["phases"]]
             stats={key:sum(p.get(key,0) for p in fields) for key in
                 ["scalar_reciprocals_hoisted","scalar_reciprocal_reuses","pipeline_groups","pipelined_chunks"]}
-            expect_reuse=reuse and fixture["scalar_reuse"]
-            expect_pipeline=pipeline and fixture["pipeline"] and (not fixture["scalar_reuse"] or reuse)
+            expect_reuse=fixture["scalar_reuse"]
+            expect_pipeline=fixture["pipeline"]
             assert (stats["scalar_reciprocals_hoisted"]>0)==expect_reuse,(fixture["name"],mode,stats)
             assert (stats["pipeline_groups"]>0)==expect_pipeline,(fixture["name"],mode,stats)
             timing=json.loads((build/"timing.json").read_text())
             record=dict(total_us=timing["total_simulated_cycles"]/timing["npu_clock_mhz"], wall_seconds=wall,
-                byte_exact_with_off=True,byte_exact_with_legacy_oracle=True,actual_applied=stats,
+                byte_exact_with_legacy_oracle=True,actual_applied=stats,
                 program_sha256=digest(build/"program.bin"))
             if "fp32_reference" in fixture:
                 fp32=fixture["fp32_reference"]

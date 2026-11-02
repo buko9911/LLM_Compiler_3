@@ -67,15 +67,17 @@ def main():
                 array.flat[::3]=np.nextafter(np.float16(0),np.float16(1));array.flat[1::3]=-np.nextafter(np.float16(0),np.float16(1))
         reference=np.matmul(inputs['a'].astype(np.float32),np.swapaxes(inputs['b'].astype(np.float32),-1,-2)).astype(np.float16)
         np.savez(case/'inputs.npz',**inputs);np.save(case/'reference.npy',reference)
-        previous=None;runs={}
-        for mode,enabled,swapped in [('off',False,False),('packed',True,False),('swapped',False,True)]:
-            spec=json.loads((root/'configs/target.json').read_text());spec['npu'].update(matmul_rhs_packing=enabled,matmul_transpose_output=swapped,l2_staging_bytes_per_core=0)
+        runs={}
+        # Both layouts are considered: the output transpose when it moves fewer L1 bytes, else RHS packing.
+        for mode in ['compiler']:
+            swapped=m>1 and m*(k+n)<n*k
+            spec=json.loads((root/'configs/target.json').read_text());spec['npu'].update(l2_staging_bytes_per_core=0)
             target=case/f'{mode}.json';target.write_text(json.dumps(spec,indent=2));build=case/mode
             run([args.compiler.resolve(),'--pipeline=decode',src,'--manifest',manifest,'--spec',target,'--force=npu','-o',build],workspace,case/f'{mode}.compile.log')
             compiled=(build/'compiled.mlir').read_text();applied=compiled.count('hyb.matmul_rhs_packed')
             swap_count=compiled.count('hyb.matmul_transpose_output')
-            assert bool(applied)==(enabled and m>1),(name,mode,applied)
-            assert bool(swap_count)==(swapped and m>1 and m*(k+n)<n*k),(name,mode,swap_count)
+            assert bool(applied)==(m>1 and not swapped),(name,mode,applied)
+            assert bool(swap_count)==swapped,(name,mode,swap_count)
             device=Device(build,settings=settings,lp6_config=ini,lp6_backend='ramulator',lp6_library=bridge)
             for key,array in inputs.items():device.write(key,array)
             output,commands,wall=device.run(profile=True);actual=output['y'];np.save(build/'output.npy',actual)
@@ -84,14 +86,11 @@ def main():
             error=float(np.max(np.abs(actual.astype(np.float32)-reference.astype(np.float32))))
             tolerance=0.002 if name.startswith('fractional') else 0.0
             assert error<=tolerance,(name,mode,error)
-            exact=previous is None or actual.tobytes()==previous.tobytes()
-            assert exact,(name,mode,'OFF/ON mismatch')
             timing=json.loads((build/'timing.json').read_text())
             runs[mode]=dict(total_us=timing['total_simulated_cycles']/timing['npu_clock_mhz'],packings=applied,output_transposes=swap_count,
-                           byte_exact_with_off=exact,max_abs_numpy_error=error,numpy_abs_tolerance=tolerance,wall_seconds=wall,
+                           max_abs_numpy_error=error,numpy_abs_tolerance=tolerance,wall_seconds=wall,
                            read_bytes=timing['lp6_bytes_read'],write_bytes=timing['lp6_bytes_written'],
                            program_sha256=digest(build/'program.bin'),compiled_sha256=digest(build/'compiled.mlir'))
-            if previous is None:previous=actual
         summary['cases'][name]=runs;(out/'summary.json').write_text(json.dumps(summary,indent=2)+'\n')
         print(name,json.dumps(runs),flush=True)
     assert provenance=={str(p):digest(p) for p in sources},'Source changed during execution'

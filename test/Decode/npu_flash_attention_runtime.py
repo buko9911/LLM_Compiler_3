@@ -235,21 +235,21 @@ def errors(actual, expected, atol=ATOL, rtol=RTOL):
     }
 
 
-def make_spec(root, mode, case, splits):
+def make_spec(root, mode, case):
+    """full_row: the 8 MiB target, where these small attentions keep full softmax rows. online: a
+    1 MiB L2, smaller than a three-slot weight ring per core, so the compiler chooses online softmax
+    (and, with fewer KV heads than the 4 cores, splits the keys over the idle cores)."""
     target = json.loads((root / "configs/target.json").read_text())
-    target["npu"].update(
-        flash_attention=mode != "off",
-        flash_decoding=mode == "decoding",
-        flash_kv_slicing=mode != "off" and bool(case.kv_prefix),
-        attention_query_tile=case.query_tile,
-        attention_key_tile=case.key_tile,
-        attention_splits=splits if mode == "decoding" else 1,
-        attention_fusion=True,
-        activation_residency=False,
-        overlap_dequant_gemv=False,
-        l2_staging_bytes_per_core=0,
-    )
+    target["npu"].update(attention_query_tile=case.query_tile, attention_key_tile=case.key_tile,
+                         l2_staging_bytes_per_core=0)
+    if mode == "online":
+        target["npu"]["l2_bytes"] = 1 << 20
     return target
+
+
+def online_splits(case, cores=4):
+    """The Flash-Decoding split the compiler chooses (NpuFlashAttention.cpp)."""
+    return 1 if case.heads >= cores else max(1, min(cores // case.heads, case.keys))
 
 
 def run(command, cwd, log, env=None):
@@ -301,8 +301,7 @@ def main():
     parser.add_argument("--compiler", type=Path, default=root / "build/bin/npu-compile")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--only", default="", help="Comma-separated case names")
-    parser.add_argument("--modes", default="off,attention,decoding")
-    parser.add_argument("--splits", type=int, default=2)
+    parser.add_argument("--modes", default="full_row,online")
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--emulator", type=Path, default=workspace / "core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
@@ -310,8 +309,8 @@ def main():
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     args = parser.parse_args()
     modes = args.modes.split(",")
-    if not modes or any(mode not in ("off", "attention", "decoding") for mode in modes):
-        parser.error("--modes accepts off,attention,decoding")
+    if not modes or any(mode not in ("full_row", "online") for mode in modes):
+        parser.error("--modes accepts full_row,online")
     selected = set(args.only.split(",")) if args.only else {case.name for case in CASES}
     unknown = selected - {case.name for case in ALL_CASES}
     if unknown:
@@ -365,17 +364,19 @@ def main():
         for mode in modes:
             build = directory / mode
             target = directory / f"{mode}.json"
-            target.write_text(json.dumps(make_spec(root, mode, case, args.splits), indent=2))
+            target.write_text(json.dumps(make_spec(root, mode, case), indent=2))
             compile_command = [args.compiler.resolve(), "--pipeline=decode", source, "--manifest", manifest,
                                "--spec", target, "--force=npu", "-o", build]
             try:
                 run(compile_command, workspace, directory / f"{mode}.compile.log")
                 io = json.loads((build / "io.json").read_text())
-                if mode != "off":
-                    reports = [phase.get("flash_attention", {}) for phase in io["phases"]]
-                    count = sum(report.get("transformed_chains", 0) for report in reports)
-                    assert count == 1, (case.name, mode, "requested online kernel was not transformed", reports)
-                    algorithm = "flash_decoding" if mode == "decoding" else "flash_attention"
+                reports = [phase.get("flash_attention", {}) for phase in io["phases"]]
+                count = sum(report.get("transformed_chains", 0) for report in reports)
+                if mode == "full_row":
+                    assert count == 0, (case.name, mode, "online softmax chosen although full rows fit", reports)
+                else:
+                    assert count == 1, (case.name, mode, "online softmax was not chosen", reports)
+                    algorithm = "flash_decoding" if online_splits(case) > 1 else "flash_attention"
                     assert any(report.get("algorithm") == algorithm for report in reports), reports
                     if case.kv_prefix:
                         assert sum(report.get("segmented_kv_chains", 0) for report in reports) == 1, ("KV slicing was not applied", reports)
@@ -410,7 +411,7 @@ def main():
                     "total_us": timing["total_simulated_cycles"] / timing["npu_clock_mhz"],
                     "wall_seconds": wall, "fp64_reference": errors(actual, expected),
                     "dense_rounded_score_reference": errors(actual, contracted),
-                    "online_contract_reference": errors(actual, online_contract_reference(inputs, case, args.splits if mode == "decoding" else 1),
+                    "online_contract_reference": errors(actual, online_contract_reference(inputs, case, online_splits(case)),
                                                         ONLINE_ATOL, ONLINE_RTOL),
                     "legacy_reference": errors(actual, legacy), "elements": int(actual.size),
                     "lp6_read_bytes": timing["lp6_bytes_read"], "lp6_write_bytes": timing["lp6_bytes_written"],
@@ -421,15 +422,15 @@ def main():
                               "merge_gap_cycles": timeline["merge_gap_cycles"],
                               "events": len(timeline["events"])},
                     "phase_metadata": io["phases"]}
-                if "off" in outputs and mode != "off":
-                    result["versus_native_off"] = errors(actual, outputs["off"])
-                    result["byte_exact_with_off"] = actual.tobytes() == outputs["off"].tobytes()
+                if "full_row" in outputs and mode != "full_row":
+                    result["versus_full_row"] = errors(actual, outputs["full_row"])
+                    result["byte_exact_with_full_row"] = actual.tobytes() == outputs["full_row"].tobytes()
                 case_results["modes"][mode] = result
                 # The old rounded graph is diagnostic, including known NaN
                 # all-masked behavior. The new kernels must satisfy the oracle.
-                if mode != "off" and not result["dense_rounded_score_reference"]["tolerance_pass"]:
+                if mode != "full_row" and not result["dense_rounded_score_reference"]["tolerance_pass"]:
                     failures.append(f"{case.name}/{mode}: dense rounded-score reference mismatch")
-                if mode != "off" and not result["online_contract_reference"]["tolerance_pass"]:
+                if mode != "full_row" and not result["online_contract_reference"]["tolerance_pass"]:
                     failures.append(f"{case.name}/{mode}: online mixed-precision reference mismatch")
                 print(case.name, mode, json.dumps({key: value for key, value in result.items() if key != "phase_metadata"}), flush=True)
             except Exception as error:
