@@ -33,7 +33,7 @@ namespace npu::pim {
 inline constexpr int kPUs = 8, kLanes = 4, kAccs = 16, kGroup = 8, kSlices = 4, kInTiles = 32;
 inline constexpr int64_t kKPerSweep = 256, kRowsPerStream = 512, kPacketsPerRow = 64;
 inline constexpr int kRanks = 2;
-inline constexpr int64_t kChBytes = 32, kRankBytes = int64_t(1) << 33;
+inline constexpr int64_t kChBytes = 32, kRankBytes = int64_t(1) << 34;   // 16 GiB per rank: the 32 GiB Ramulator LPDDR6-PIM device (65,536 rows)
 
 // One physical 32-byte weight packet, described without reading weight data.
 // Lane l stores W[inputBegin + e, outputChannels[l]], e=0..7, in the

@@ -1,0 +1,55 @@
+{
+  "_comment": "NPU+PIM target with the 32 GiB logical LP6 of the Ramulator LPDDR6-PIM device (8 subchannels x 2 ranks, 65,536 rows, 16 GiB per rank). Run with an INI of rows = 65536 and channel_size = 4096 (32 GiB) and --lp6-size 32GiB. Otherwise as configs/target.json.",
+  "npu": {
+    "clock_mhz": 800,
+    "cores": 4,
+    "sa_rows": 32,
+    "sa_cols": 32,
+    "l1_bytes": 4194304,
+    "l2_bytes": 8388608,
+    "lp6_read_gbps": 56.2,
+    "gemv_fixed_us": 2.0,
+    "l1_read_bytes_per_cycle": 128,
+    "l1_write_bytes_per_cycle": 128,
+    "mma_k_per_cycle": 2,
+    "mma_pipeline_cycles": 2,
+    "vector_lanes": 16,
+    "vector_exp_per_cycle": 4,
+    "vector_rcp_per_cycle": 2,
+    "vector_sqrt_per_cycle": 2,
+    "gdma_read_gbps": 92.9,
+    "core_split_us": 0.5,
+    "l2_staging_bytes_per_core": 0,
+    "l1_reserved_bytes": 262144,
+    "gemv_tile_bytes": 131072,
+    "completion_event_slots": 65536,
+    "weight_stream_max_slots": 0,
+    "input_tile_columns": 128,
+    "gdma_lookahead": 2,
+    "staging_misc_bytes": 65536
+  },
+  "pim": {
+    "clock_mhz": 2400,
+    "pus": 8,
+    "lanes": 4,
+    "channels": 8,
+    "ranks": 2,
+    "partitions": 16,
+    "concurrent_ranks": false,
+    "nlld_ck": 10,
+    "efficiency": 0.5725,
+    "phase_fixed_us": 1.0,
+    "act_write_us_per_kib": 0.9,
+    "act_write_fixed_us": 1.5,
+    "readback_us_per_kib": 0.35,
+    "readback_fixed_us": 1.5
+  },
+  "lp6": {
+    "capacity_bytes": 34359738368,
+    "row_bytes": 262144
+  },
+  "mapping": {
+    "policy": "cost",
+    "overrides": {}
+  }
+}
