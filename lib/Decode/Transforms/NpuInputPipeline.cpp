@@ -1,8 +1,11 @@
 //===- NpuInputPipeline.cpp - hyb-npu-input-pipeline ----------------------===//
 //
 // Split a private L2 -> L1 input copy and the FP16 matmul that consumes it into batch / N tiles
-// over disjoint slices of the same allocation (full K per tile), so the next tile's copy can
-// overlap the current tile's compute. No extra SRAM; the backend's events enforce readiness.
+// (full K per tile), so the next tile's copy can overlap the current tile's compute. Batch tiles
+// are disjoint contiguous slices of the same allocation. Column tiles of a matrix with several
+// rows are interleaved rows of it: an access is tracked by its address span, so the next tile's
+// copy would overlap the current tile's operand load and wait for it. Those tiles go through two
+// contiguous L1 buffers instead (ping-pong), which also replace the whole B buffer.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -119,15 +122,32 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
   // Bound generated code growth; an unsupported large shape retains its copy.
   if (batches * tilesPerBatch < 2 || batches * tilesPerBatch > 256) return 0;
   OpBuilder builder(copy);
+  const int64_t rows = bt.getDimSize(rank - 2);
+  const bool pingPong = tilesPerBatch > 1 && rows > 1;
+  SmallVector<Value, 2> buffers;
+  if (pingPong) {
+    SmallVector<int64_t> shape(bt.getShape());
+    if (batched) shape[0] = 1;
+    shape.back() = std::min(tileColumns, n);
+    auto type = MemRefType::get(shape, bt.getElementType(), MemRefLayoutAttrInterface{}, bt.getMemorySpace());
+    for (int i = 0; i < 2; ++i) buffers.push_back(memref::AllocOp::create(builder, copy.getLoc(), type));
+  }
   SmallVector<Tile> tiles;
   for (int64_t batch = 0; batch < batches; ++batch) {
     Value activation = batched ? slice(builder, copy.getLoc(), a, true, batch, 0,
                                        cast<MemRefType>(a.getType()).getShape().back()) : a;
     for (int64_t column = 0; column < n; column += tileColumns) {
       int64_t size = std::min(tileColumns, n - column);
-      tiles.push_back({slice(builder, copy.getLoc(), copy.getSource(), batched, batch, column, size),
-                       slice(builder, copy.getLoc(), b, batched, batch, column, size), activation,
-                       slice(builder, copy.getLoc(), c, batched, batch, column, size)});
+      Value weight;
+      if (pingPong) {
+        Value buffer = buffers[tiles.size() % 2];
+        weight = size == cast<MemRefType>(buffer.getType()).getShape().back()
+                     ? buffer : slice(builder, copy.getLoc(), buffer, batched, 0, 0, size);
+      } else {
+        weight = slice(builder, copy.getLoc(), b, batched, batch, column, size);
+      }
+      tiles.push_back({slice(builder, copy.getLoc(), copy.getSource(), batched, batch, column, size), weight,
+                       activation, slice(builder, copy.getLoc(), c, batched, batch, column, size)});
     }
   }
   auto emitCopy = [&](const Tile &tile) {
@@ -151,6 +171,7 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
   matrix.erase();
   copy.erase();
   zeroInit.erase();
+  if (pingPong && b.use_empty()) b.getDefiningOp()->erase();
   return count;
 }
 

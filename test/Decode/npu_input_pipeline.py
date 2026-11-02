@@ -47,6 +47,9 @@ def main():
         config = json.loads((root/'configs/target.json').read_text())
         config['npu'].update(input_tile_columns=32)
         spec = work/'target.json';spec.write_text(json.dumps(config))
+        # Column tiles of a multi-row B go through two contiguous ping-pong buffers that replace B
+        # (an access is tracked by its span; interleaved column slices would overlap): 4 - 1 + 2.
+        column_tiled = {'matmul_tail', 'batched_tail'}
         cases = [('matmul_tail', source(), 3), ('batched_tail', source(batch=3), 9),
                  ('batch_only', source(batch=2,n=17), 2), ('one_tile', source(n=17), 0),
                  ('shared_B', source(shared=True), 0), ('nonzero_init', source(nonzero=True), 0),
@@ -61,7 +64,7 @@ def main():
             output=result.stdout
             assert output.count('hyb.input_pipeline_copy')==tiles,(name,output)
             assert len(re.findall(r'hyb\.input_pipeline_tile\b', output))==tiles,(name,output)
-            assert output.count('memref.alloc')==4,(name,'changed storage allocation')
+            assert output.count('memref.alloc')==(5 if name in column_tiled else 4),(name,'changed storage allocation')
             if tiles:
                 assert output.count('linalg.fill')==tiles,(name,'missing tile init')
                 # Full K=8 survives every tile; the first matrix is issued after
