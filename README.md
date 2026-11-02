@@ -131,13 +131,11 @@ NpuCost.h`), 모든 결정과 근거 숫자를 `io.json`의 `phases[].decisions`
 | `row_distribution`, `gemv_epilogue_pipeline` | pass: 행 사슬 분배, GEMV dequant 겹치기 | 켬 |
 | `matmul_rhs_packing`, `matmul_transpose_output`, `input_tile_pipeline` | pass | 켬 |
 | `async_input_loads`, `async_output_stores` | codegen: L2↔L1 전송을 event로 비동기 처리 | 켬 |
-| `async_output_store_vector_overlap` (기본 true) | codegen: 비동기 저장 중 vector 작업 허용 | 끔 |
 | `staging_early_release`, `weight_stream_early_release` | codegen: staging slot 조기 반환 | 켬 |
-| `memory_dependency_schedule` | codegen: 행렬/출력 DMA 의존성을 실제 L1 범위로 | |
 | `vector_scalar_reuse`, `vector_chunk_pipeline` | codegen: VPU 명령 배치 | 켬 |
 | `weight_stream_rotate_slots`, `weight_prefetch_cross_batch` | codegen: weight 링 | 켬 |
 | `gdma_lookahead` (정수), `gdma_lookahead_streams_only` | 코어별 선행 GDMA 수, weight ring 읽기만 셈 | 2, 켬 |
-| `staging_misc_bytes` (정수), `staging_misc_fit_rings` | 작은 LP6↔L1 전송용 staging 창 끝 영역, 그 크기를 ring 남는 공간으로 줄일지 | 65536, |
+| `staging_misc_bytes` (정수) | 작은 LP6↔L1 전송용 staging 창 끝 영역 | 65536 |
 | `cross_phase_prefetch` | 다음 phase GDMA load가 barrier 대신 같은 주소의 앞 접근만 기다림 | 켬 |
 | `quant_fused_max`, `vector_loops` | codegen: quant max를 register에서, 반복 VPU 묶음을 hardware loop로 | 켬 |
 | `command_schedule` | system command 재배열 | 켬 |

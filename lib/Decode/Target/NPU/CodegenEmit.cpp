@@ -34,16 +34,6 @@ void Codegen::emit(uint32_t word) {
 }
 
 void Codegen::rec(const std::array<uint32_t, 4> &record) {
-  uint32_t opcode = record[0] & 63;
-  if (in.spec->npu.memoryDependencySchedule &&
-      (opcode == OP_M_LOAD || opcode == OP_M_WRITEOUT || opcode == OP_M_LOAD_ACC)) {
-    SmallVector<L2Range> ranges;
-    bool write = false;
-    if (matrixMemoryAccess(record, ranges, write)) guardLocalMemory(ranges, write);
-    else { waitInputLoad(); waitOutputStore(); }
-    w.appendRecord(record);
-    return;
-  }
   if ((record[0] & 63) == OP_M_LOAD || (record[0] & 63) == OP_M_WRITEOUT) {
     if (matrixTransferPending(record)) waitInputLoad();
   } else if ((record[0] & 63) != OP_V_TYPED) waitInputLoad();
@@ -87,19 +77,6 @@ bool Codegen::matrixMemoryAccess(const std::array<uint32_t,4> &r,
   uint64_t address = w.gpValue((r[0] >> (write ? 6 : 10)) & 15);
   ranges = rowRanges(address,uint64_t(r[2])*bytes,r[1],r[3]);
   return true;
-}
-
-void Codegen::guardLocalMemory(ArrayRef<L2Range> ranges, bool write) {
-  for (auto [s,e] : ranges) {
-    // Outstanding input DMA writes L1: both reads and writes must wait.
-    guardInputLoad(s, e-s);
-    // Outstanding output DMA reads L1: independent reads may proceed, but
-    // overwriting its source must wait. Row ranges retain strided holes.
-    if (write && pendingOutputStore &&
-        llvm::any_of(pendingOutputStore->sourceRanges,
-          [&](auto r) { return overlaps(s,e,r.first,r.second); }))
-      waitOutputStore();
-  }
 }
 
 bool Codegen::matrixTransferPending(const std::array<uint32_t,4> &r) const {
@@ -345,7 +322,6 @@ void Codegen::ldma(uint64_t l1, uint64_t l2, uint32_t rowBytes, uint32_t rows, u
   if (async) {
     pendingOutputStore = PendingOutputStore{rowRanges(l1, rowBytes, rows, srcStride), false, w.currentSource};
     ++asyncOutputStores;
-    if (!in.spec->npu.asyncOutputStoreVectorOverlap) waitOutputStore();
   }
 }
 

@@ -187,8 +187,8 @@ def main():
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+", help="Optional exact fixture names")
-    parser.add_argument("--modes", nargs="+", choices=("off", "release", "memory", "both", "blocking"),
-                        default=("off", "release", "memory", "both"))
+    parser.add_argument("--modes", nargs="+", choices=("off", "release", "blocking"),
+                        default=("off", "release"))
     args = parser.parse_args()
     if args.modes[0] not in ("off", "blocking"):
         parser.error("First mode must be a numerical control: off or blocking")
@@ -229,10 +229,9 @@ def main():
         modes = {}
         for mode in args.modes:
             spec = json.loads((root / "configs/target.json").read_text())
-            spec["npu"].update(staging_early_release=mode in ("release", "both"),
-                memory_dependency_schedule=mode in ("memory", "both"),
+            spec["npu"].update(staging_early_release=mode == "release",
                 async_input_loads=mode != "blocking",
-                async_output_stores=mode != "blocking", async_output_store_vector_overlap=True,
+                async_output_stores=mode != "blocking",
                 attention_fusion=False, projection_fusion=False, activation_residency=True,
                 input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False,
                 l2_staging_bytes_per_core=fixture["staging"], **fixture["options"])
@@ -263,7 +262,7 @@ def main():
             assert actual.tobytes() == control.tobytes(), (name, mode, "control byte mismatch")
             timing = json.loads((build / "timing.json").read_text())
             cuts = sum(p.get("dependency_schedule", {}).get("staging_release_cuts", 0) for p in io["phases"])
-            if mode in ("release", "both") and not name.startswith("stream_"):
+            if mode == "release" and not name.startswith("stream_"):
                 assert cuts > 0, (name, mode, "release option was a noop")
             observation = observe(build, io)
             modes[mode] = dict(total_us=timing["total_simulated_cycles"] / timing["npu_clock_mhz"],
@@ -275,17 +274,10 @@ def main():
         if name == "reduction_gamma" and "off" in modes:
             before = modes["off"]["observations"]
             assert before["reduction_events"] > 0 and before["gamma_gdma_events"] > 0
-            for mode in ("release", "both"):
-                if mode in modes:
-                    after = modes[mode]["observations"]
-                    assert after["gamma_reduction_overlap_cycles"] > 0, (mode, "no actual reuse of freed staging")
-                    assert after["gamma_first_begin"] < before["gamma_first_begin"], (mode, "gamma was not released earlier")
-        if name.startswith("stream_output_") and "off" in modes:
-            before = modes["off"]["observations"]["output_dma_matrix_overlap_cycles_by_core"]
-            for mode in ("memory", "both"):
-                if mode in modes:
-                    after = modes[mode]["observations"]["output_dma_matrix_overlap_cycles_by_core"]
-                    assert any(cycles > before.get(core, 0) for core, cycles in after.items()), (name, mode, "matrix DMA scheduling was a noop")
+            if "release" in modes:
+                after = modes["release"]["observations"]
+                assert after["gamma_reduction_overlap_cycles"] > 0, ("release", "no actual reuse of freed staging")
+                assert after["gamma_first_begin"] < before["gamma_first_begin"], ("release", "gamma was not released earlier")
         summary["cases"][name] = modes
         (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     assert provenance == {str(p): digest(p) for p in paths}, "Build/source changed during run"

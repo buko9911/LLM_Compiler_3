@@ -81,11 +81,9 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("async_output_stores", s.npu.asyncOutputStores) ||
       !booleanOption("async_input_loads", s.npu.asyncInputLoads) ||
       !booleanOption("staging_early_release", s.npu.stagingEarlyRelease) ||
-      !booleanOption("memory_dependency_schedule", s.npu.memoryDependencySchedule) ||
       !booleanOption("command_schedule", s.npu.commandSchedule) ||
       !booleanOption("gdma_lookahead_streams_only", s.npu.gdmaLookaheadStreamsOnly) ||
       !booleanOption("cross_phase_prefetch", s.npu.crossPhasePrefetch) ||
-      !booleanOption("staging_misc_fit_rings", s.npu.stagingMiscFitRings) ||
       !booleanOption("elementwise_distribution", s.npu.elementwiseDistribution) ||
       !booleanOption("row_distribution", s.npu.rowDistribution) ||
       !booleanOption("distribute_transposes", s.npu.distributeTransposes) ||
@@ -100,7 +98,6 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       !booleanOption("gemv_epilogue_pipeline", s.npu.gemvEpiloguePipeline) ||
       !booleanOption("matmul_rhs_packing", s.npu.matmulRhsPacking) ||
       !booleanOption("matmul_transpose_output", s.npu.matmulTransposeOutput) ||
-      !booleanOption("async_output_store_vector_overlap", s.npu.asyncOutputStoreVectorOverlap) ||
       !booleanOption("weight_stream_rotate_slots", s.npu.weightStreamRotateSlots) ||
       !booleanOption("flash_attention", s.npu.flashAttention) ||
       !booleanOption("flash_decoding", s.npu.flashDecoding) ||

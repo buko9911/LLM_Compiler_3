@@ -107,12 +107,8 @@ struct TargetSpec {
     // instruction touches the destination (loads) or the source (stores).
     bool asyncInputLoads = false;
     bool asyncOutputStores = false;
-    // false: wait right after every async store (same transport, no vector work in between).
-    bool asyncOutputStoreVectorOverlap = true;
     // End a staged input-copy block before unrelated compute so its staging slot frees early.
     bool stagingEarlyRelease = false;
-    // Use exact L1 read/write ranges for matrix / output-DMA hazards.
-    bool memoryDependencySchedule = false;
     // Reuse a row-invariant scalar reciprocal across vector chunks; interleave independent chunks.
     bool vectorScalarReuse = false, vectorChunkPipeline = false;
     // hyb.quant: keep max|x| of a row in a vector register (one V_MAX per chunk) instead of storing
@@ -128,9 +124,6 @@ struct TargetSpec {
     // Bytes at the end of each staging window for small LP6 <-> L1 transfers, used as a byte
     // ring; the weight ring stays below them. Zero stages every transfer at the window start.
     int64_t stagingMiscBytes = 0;
-    // Shrink that area to the window space no weight ring of the phase can use, so no ring loses a
-    // slot (transfers that no longer fit go to the window start).
-    bool stagingMiscFitRings = false;
     // GDMA loads of an NPU phase wait for the earlier phase's accesses to the same L2 / LP6
     // bytes instead of its exit barrier, so the next layer's weights stream in during its tail.
     bool crossPhasePrefetch = false;

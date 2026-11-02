@@ -166,7 +166,7 @@ def main():
             reuse, pipeline = mode in ("reuse","both","loops"), mode in ("pipeline","both","loops")
             spec["npu"].update(vector_scalar_reuse=reuse, vector_chunk_pipeline=pipeline, vector_loops=mode == "loops",
                 elementwise_distribution=False, staging_early_release=False,
-                memory_dependency_schedule=False, attention_fusion=False, projection_fusion=False,
+                attention_fusion=False, projection_fusion=False,
                 activation_residency=True,
                 input_tile_pipeline=False, matmul_rhs_packing=False, matmul_transpose_output=False)
             target = case/f"{mode}.json";target.write_text(json.dumps(spec,indent=2))

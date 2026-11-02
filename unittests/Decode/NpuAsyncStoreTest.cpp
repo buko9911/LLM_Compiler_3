@@ -26,8 +26,7 @@ struct Emission {
 };
 
 void emit(const std::string &body, bool enabled, Emission &result,
-          int64_t bOffset = 267264, bool strided = false, bool overlap = true, bool inputLoad = false,
-          bool memorySchedule = false) {
+          int64_t bOffset = 267264, bool strided = false, bool inputLoad = false) {
   DialectRegistry registry;
   registry.insert<arith::ArithDialect, func::FuncDialect, linalg::LinalgDialect,
                   memref::MemRefDialect, scf::SCFDialect>();
@@ -52,8 +51,6 @@ void emit(const std::string &body, bool enabled, Emission &result,
   TargetSpec spec;
   spec.npu.asyncOutputStores = enabled && !inputLoad;
   spec.npu.asyncInputLoads = enabled && inputLoad;
-  spec.npu.asyncOutputStoreVectorOverlap = overlap;
-  spec.npu.memoryDependencySchedule = memorySchedule;
   plena::ProgramBuilder program;
   program.beginPhase("async-store-test", {});
   NpuPhaseInput input;
@@ -168,33 +165,27 @@ TEST(NpuAsyncStore, DisabledRetainsBlockingStores) {
   EXPECT_EQ(e.stats.asyncOutputStores, 0);
 }
 
-TEST(NpuAsyncStore, ImmediateWaitAblationAllowsNoVectorStore) {
-  Emission e;
-  emit(fillB, true, e, 267264, false, false);
-  EXPECT_EQ(windows(e), (std::vector<int>{0}));
-  EXPECT_EQ(e.stats.outputStoresWithVectorWork, 0);
-}
 // The initial constant-table DMA is also scheduled and retired before use.
 TEST(NpuAsyncInput, IndependentVectorStoreCrossesWait) {
   Emission e;
-  emit(fillB, true, e, 267264, false, true, true);
+  emit(fillB, true, e, 267264, false, true);
   EXPECT_EQ(windows(e, true), (std::vector<int>{0, 1}));
 }
 TEST(NpuAsyncInput, PhysicalAliasWaitsBeforeOverwrite) {
   Emission e;
-  emit(fillB, true, e, 266304, false, true, true);
+  emit(fillB, true, e, 266304, false, true);
   EXPECT_EQ(windows(e, true), (std::vector<int>{0, 0}));
 }
 TEST(NpuAsyncInput, StridedDestinationProtectsRowsButNotHoles) {
   for (auto [offset, expected] : {std::pair{266304, 1}, std::pair{266368, 0}}) {
     Emission e;
-    emit(fillB, true, e, offset, true, true, true);
+    emit(fillB, true, e, offset, true, true);
     EXPECT_EQ(windows(e, true), (std::vector<int>{0, expected}));
   }
 }
 TEST(NpuAsyncInput, DisabledKeepsBlockingLoad) {
   Emission e;
-  emit(fillB, false, e, 267264, false, true, true);
+  emit(fillB, false, e, 267264, false, true);
   EXPECT_TRUE(windows(e, true).empty());
 }
 TEST(NpuAsyncInput, ReadyMatrixOperandLoadsBeforeDependentOperand) {
@@ -206,7 +197,7 @@ TEST(NpuAsyncInput, ReadyMatrixOperandLoadsBeforeDependentOperand) {
     linalg.fill ins(%zero : f16) outs(%c : memref<1x32xf16, 1>)
     linalg.matmul ins(%x, %a : memref<1x4xf16, 1>, memref<4x32xf16, 1>)
                   outs(%c : memref<1x32xf16, 1>)
-  )mlir", true, e, 267264, false, true, true);
+  )mlir", true, e, 267264, false, true);
   int before = 0, after = 0;
   bool pending = false;
   for (const auto &block : e.blocks)
@@ -220,36 +211,32 @@ TEST(NpuAsyncInput, ReadyMatrixOperandLoadsBeforeDependentOperand) {
   EXPECT_EQ(after, 1);
 }
 
-TEST(NpuMemoryDependencies, MatrixReadsMayOverlapOutputButAliasingWriteoutWaits) {
-  for (bool enabled : {false, true}) {
-    for (bool alias : {false, true}) {
-      Emission e;
-      std::string body = R"mlir(
-        %x = memref.alloc() {hyb.offset = 269312 : i64} : memref<1x4xf16, 1>
-        %c = memref.alloc() {hyb.offset = )mlir" + std::to_string(alias ? 266304 : 270336) + R"mlir( : i64} : memref<1x32xf16, 1>
-        linalg.fill ins(%one : f16) outs(%x : memref<1x4xf16, 1>)
-        linalg.fill ins(%zero : f16) outs(%c : memref<1x32xf16, 1>)
-        linalg.matmul ins(%x, %a : memref<1x4xf16, 1>, memref<4x32xf16, 1>)
-                      outs(%c : memref<1x32xf16, 1>)
-      )mlir";
-      emit(body, true, e, 267264, false, true, false, enabled);
-      int matrixReads = 0, compute = 0, writes = 0;
-      bool pending = false;
-      for (const auto &block : e.blocks) {
-        for (uint32_t word : block) {
-          unsigned op = word & 63, kind = (word >> 6) & 15;
-          if ((op == 0x38 || op == 0x39) && (kind == 11 || kind == 13)) pending = true;
-          if (op == 0x3f && kind == 4) pending = false;
-          if (pending && op == 0x37) ++matrixReads;
-          if (pending && op == 0x3b) ++compute;
-          if (pending && op == 0x3c) ++writes;
-        }
-        EXPECT_FALSE(pending);
+// While an output store is pending, matrix operand loads, MMAs and writeouts wait for it, whether
+// or not they touch its L1 source.
+TEST(NpuMemoryDependencies, MatrixOpsWaitForPendingOutputStore) {
+  for (bool alias : {false, true}) {
+    Emission e;
+    std::string body = R"mlir(
+      %x = memref.alloc() {hyb.offset = 269312 : i64} : memref<1x4xf16, 1>
+      %c = memref.alloc() {hyb.offset = )mlir" + std::to_string(alias ? 266304 : 270336) + R"mlir( : i64} : memref<1x32xf16, 1>
+      linalg.fill ins(%one : f16) outs(%x : memref<1x4xf16, 1>)
+      linalg.fill ins(%zero : f16) outs(%c : memref<1x32xf16, 1>)
+      linalg.matmul ins(%x, %a : memref<1x4xf16, 1>, memref<4x32xf16, 1>)
+                    outs(%c : memref<1x32xf16, 1>)
+    )mlir";
+    emit(body, true, e);
+    int matrixOps = 0;
+    bool pending = false;
+    for (const auto &block : e.blocks) {
+      for (uint32_t word : block) {
+        unsigned op = word & 63, kind = (word >> 6) & 15;
+        if ((op == 0x38 || op == 0x39) && (kind == 11 || kind == 13)) pending = true;
+        if (op == 0x3f && kind == 4) pending = false;
+        if (pending && (op == 0x37 || op == 0x3b || op == 0x3c)) ++matrixOps;
       }
-      EXPECT_EQ(matrixReads, enabled ? 2 : 0);
-      EXPECT_EQ(compute, enabled ? 1 : 0);
-      EXPECT_EQ(writes, enabled && !alias ? 1 : 0);
+      EXPECT_FALSE(pending);
     }
+    EXPECT_EQ(matrixOps, 0) << "alias " << alias;
   }
 }
 } // namespace

@@ -131,7 +131,7 @@ def main():
     ]:
         check(name, source, 'matrix_init_elision', enabled, expected)
     for key in ('matrix_init_elision','gemv_epilogue_fusion','weight_stream_rotate_slots',
-                'async_output_stores','async_output_store_vector_overlap',
+                'async_output_stores',
                 'async_input_loads','input_tile_pipeline','matmul_rhs_packing',
                 'matmul_transpose_output'):
         spec = output/'invalid.json'

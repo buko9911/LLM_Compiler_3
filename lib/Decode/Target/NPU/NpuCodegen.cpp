@@ -229,30 +229,10 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   return success();
 }
 
-void Codegen::planMiscStaging(func::FuncOp fn) {
+void Codegen::planMiscStaging(func::FuncOp) {
   int64_t misc = in.spec->npu.stagingMiscBytes;
   if (!misc) return;
-  misc = std::min(misc, window() / 2);
-  // The weight copy of every streamed loop: its L1 tile size is the ring slot (64-byte aligned).
-  fn.walk([&](scf::ForOp f) {
-    if (!in.spec->npu.stagingMiscFitRings || !f->hasAttr("hyb.stream")) return;
-    for (Operation &op : f.getBody()->without_terminator())
-      if (auto c = dyn_cast<memref::CopyOp>(op)) {
-        auto type = cast<MemRefType>(c.getTarget().getType());
-        Value root = c.getSource();
-        while (Operation *d = root.getDefiningOp()) {
-          if (!isViewOp(d)) break;
-          root = d->getOperand(0);
-        }
-        if (!root.getDefiningOp<hyb::WeightOp>() || spaceOf(type) != kL1 || !type.hasStaticShape()) continue;
-        const int64_t slot = (type.getNumElements() * type.getElementTypeBitWidth() / 8 + 63) / 64 * 64;
-        int64_t slots = window() / std::max<int64_t>(1, slot);
-        if (in.spec->npu.weightStreamMaxSlots) slots = std::min(slots, in.spec->npu.weightStreamMaxSlots);
-        misc = std::min(misc, window() - slots * slot);
-        break;
-      }
-  });
-  stagingMisc = misc / 64 * 64;
+  stagingMisc = std::min(misc, window() / 2) / 64 * 64;
 }
 
 } // namespace mlir::hybrid::codegen

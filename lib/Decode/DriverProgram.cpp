@@ -122,11 +122,9 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
   if (spec.npu.asyncOutputStores)
     report["async_output_stores"] = json::Object{
         {"issued", stats.asyncOutputStores},
-        {"vector_overlap_enabled", spec.npu.asyncOutputStoreVectorOverlap},
         {"stores_with_vector_work_before_wait", stats.outputStoresWithVectorWork}};
-  if (spec.npu.stagingEarlyRelease || spec.npu.memoryDependencySchedule)
-    report["dependency_schedule"] = json::Object{{"staging_release_cuts", stats.stagingReleaseCuts},
-                                                 {"matrix_dma_range_guards", spec.npu.memoryDependencySchedule}};
+  if (spec.npu.stagingEarlyRelease)
+    report["dependency_schedule"] = json::Object{{"staging_release_cuts", stats.stagingReleaseCuts}};
   if (spec.npu.vectorScalarReuse || spec.npu.vectorChunkPipeline)
     report["vector_schedule"] = json::Object{
         {"scalar_reuse_enabled", spec.npu.vectorScalarReuse},

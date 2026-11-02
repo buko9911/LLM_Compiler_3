@@ -46,7 +46,7 @@ def main():
     policies = {'off': (False, False), 'init': (True, False), 'epilogue': (False, True),
                 'both': (True, True), 'rotated': (True, True), 'batch1': (True, True),
                 'async': (False, False), 'both_async': (True, True),
-                'async_immediate': (False, False), 'release': (False, False),
+                'release': (False, False),
                 'pipeline': (True, True), 'pipeline_release': (True, True), 'round2': (True, True)}
     parser.add_argument('--modes', nargs='+', choices=list(policies),
                         default=['off', 'init', 'epilogue', 'both', 'rotated', 'batch1'])
@@ -96,10 +96,8 @@ def main():
                 spec['npu'].update(weight_stream_early_release=True, gemv_epilogue_pipeline=True,
                                    quant_fused_max=True, vector_loops=True, staging_misc_bytes=4096,
                                    gdma_lookahead=2, gdma_lookahead_streams_only=True, cross_phase_prefetch=True)
-            if mode in ('async', 'both_async', 'async_immediate'):
+            if mode in ('async', 'both_async'):
                 spec['npu']['async_output_stores'] = True
-            if mode == 'async_immediate':
-                spec['npu']['async_output_store_vector_overlap'] = False
             if name in ('one_core', 'column_chunks'):
                 spec['npu']['cores'] = 1
             if name == 'two_slots':

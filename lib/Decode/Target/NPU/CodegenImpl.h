@@ -126,8 +126,7 @@ private:
   /// window is too small to give up that much) and the part of the window left to weight rings.
   int64_t miscBytes() const { return stagingMisc; }
   int64_t ringWindow() const { return window() - miscBytes(); }
-  // npu.staging_misc_bytes (at most half the window); with npu.staging_misc_fit_rings only the
-  // window space no weight ring of the phase can use (the smallest remainder after whole slots).
+  // npu.staging_misc_bytes, at most half the window.
   int64_t stagingMisc = 0;
   void planMiscStaging(func::FuncOp fn);
   std::vector<uint64_t> miscCursor;                // per core: next free byte of the small-transfer ring
@@ -143,8 +142,7 @@ private:
   void matrixInputs(const std::array<uint32_t,4> &a, const std::array<uint32_t,4> &b);
   /// Load weight, load activation, then one fixed-tile M_MMA per 32-wide K slice.
   void mma(int64_t k, uint32_t funct) {
-    // MMA consumes the private SA operand buffers, not the pending store's L1 source.
-    if (!in.spec->npu.memoryDependencySchedule) waitOutputStore();
+    waitOutputStore();
     for (uint32_t word : matrixMma(uint32_t(k), funct, false)) w.append(word);
   }
   void load(uint32_t gp, uint32_t v) {
@@ -238,7 +236,6 @@ private:
   int64_t stagingReleaseCuts = 0;
   int64_t vectorScalarReciprocals = 0, vectorScalarReuses = 0;
   int64_t vectorPipelineGroups = 0, vectorPipelinedChunks = 0;
-  void guardLocalMemory(ArrayRef<L2Range> ranges, bool write);
   bool matrixMemoryAccess(const std::array<uint32_t,4> &record,
                           SmallVector<L2Range> &ranges, bool &write) const;
   void waitOutputStore();
