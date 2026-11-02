@@ -9,8 +9,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
+#include <functional>
 
 namespace mlir::hybrid {
 #define GEN_PASS_DEF_HYBNPUINPUTPIPELINE
@@ -89,6 +91,49 @@ linalg::FillOp privateZeroInit(Value output, Operation *matrix) {
 
 struct Tile { Value source, weight, activation, output; };
 
+/// Moves the first tile's copy (with the view and allocation ops it needs) above the pure compute
+/// ops right before it that touch neither its source nor its destination, so the asynchronous
+/// L2 -> L1 load overlaps them (e.g. V under the softmax). It stops at anything else: another copy
+/// or matrix op (DMA and SA hazards), a region op, or an op on the same storage. The destination
+/// lives longer; hyb-npu-memplan places it against the L1 capacity.
+void hoistFirstCopy(memref::CopyOp copy) {
+  Value sourceRoot = viewRoot(copy.getSource()), targetRoot = viewRoot(copy.getTarget());
+  auto touches = [&](Operation *op) {
+    for (Value v : op->getOperands())
+      if (isa<MemRefType>(v.getType()) && (viewRoot(v) == sourceRoot || viewRoot(v) == targetRoot)) return true;
+    return false;
+  };
+  // The copy's operand definitions in this block, in order (views and allocations only).
+  SmallVector<Operation *> defs;
+  std::function<bool(Value)> collect = [&](Value v) -> bool {
+    Operation *d = v.getDefiningOp();
+    if (!d || d->getBlock() != copy->getBlock()) return true;
+    if (!isa<memref::SubViewOp, memref::AllocOp, memref::ExpandShapeOp, memref::CollapseShapeOp, arith::ConstantOp,
+             affine::AffineApplyOp>(d))
+      return false;
+    for (Value o : d->getOperands())
+      if (!collect(o)) return false;
+    if (!llvm::is_contained(defs, d)) defs.push_back(d);
+    return true;
+  };
+  for (Value v : copy->getOperands())
+    if (!collect(v)) return;
+  Operation *at = copy.getOperation();
+  for (Operation *prev = copy->getPrevNode(); prev; prev = prev->getPrevNode()) {
+    if (llvm::is_contained(defs, prev)) continue;
+    if (isa<memref::SubViewOp, memref::AllocOp, memref::ExpandShapeOp, memref::CollapseShapeOp, arith::ConstantOp,
+            affine::AffineApplyOp>(prev))
+      continue;                                    // other views and index math: no effect, pass over them
+    if (!isa<linalg::GenericOp, linalg::FillOp>(prev) || prev->getNumRegions() > 1 || touches(prev)) break;
+    at = prev;
+  }
+  if (at == copy.getOperation()) return;
+  llvm::sort(defs, [](Operation *a, Operation *b) { return a->isBeforeInBlock(b); });
+  for (Operation *d : defs)
+    if (at->isBeforeInBlock(d)) d->moveBefore(at);
+  copy->moveBefore(at);
+}
+
 // Only an immediately consumed private copy can be moved. A/B/C allocation
 // roots must be distinct; later placement then protects their physical ranges.
 // Rank, positive strides and complete indexing maps are proved before editing.
@@ -150,9 +195,11 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
                        activation, slice(builder, copy.getLoc(), c, batched, batch, column, size)});
     }
   }
+  memref::CopyOp first;
   auto emitCopy = [&](const Tile &tile) {
     auto part = memref::CopyOp::create(builder, copy.getLoc(), tile.source, tile.weight);
     part->setAttr("hyb.input_pipeline_copy", builder.getUnitAttr());
+    if (!first) first = part;
   };
   emitCopy(tiles[0]);
   for (size_t i = 0; i < tiles.size(); ++i) {
@@ -172,6 +219,7 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
   copy.erase();
   zeroInit.erase();
   if (pingPong && b.use_empty()) b.getDefiningOp()->erase();
+  hoistFirstCopy(first);
   return count;
 }
 
