@@ -2,7 +2,8 @@
 """Native Ramulator/NPU validation against an independent integer GEMM oracle.
 
 The generated weights/activations have exact binary scales. Check selected
-compiler policies, rectangular/tail MMA shapes, stream wrap and no-stream paths.
+compiler policies, rectangular/tail MMA shapes, stream wrap and no-stream paths,
+and a core partition that the fused epilogue cuts into column chunks.
 """
 import argparse
 import hashlib
@@ -62,7 +63,10 @@ def main():
     for name,m,k,n,tile in [('m1',1,64,1152,4096),('m8',8,256,768,16384),
                            ('m33_rectangles',33,64,1152,6144),('single_tile',8,64,128,8192),
                            ('one_core',8,64,384,4096),('two_slots',8,64,1152,2048),
-                           ('m8_k1024',8,1024,256,32768)]:
+                           ('m8_k1024',8,1024,256,32768),
+                           # one core: its 16384-column partition (6.3 MB of INT32 + FP16) does not fit
+                           # L1, so the fused epilogue cuts it into column chunks
+                           ('column_chunks',64,64,16384,8192)]:
         case = output/name
         case.mkdir(); (case/'model').mkdir()
         rng = np.random.default_rng(917)
@@ -80,6 +84,8 @@ def main():
         modes = {}
         for mode in args.modes:
             init, fuse = policies[mode]
+            if name == 'column_chunks' and not fuse:
+                continue   # the unfused lowering keeps a core's whole INT32 output in L1 (no column split)
             spec = json.loads((workspace/'research/npu_schedule_audit/configs/off.json').read_text())
             spec['npu'].update(matrix_init_elision=init,gemv_epilogue_fusion=fuse,gemv_tile_bytes=tile)
             if mode in ('release', 'pipeline_release'):
@@ -94,7 +100,7 @@ def main():
                 spec['npu']['async_output_stores'] = True
             if mode == 'async_immediate':
                 spec['npu']['async_output_store_vector_overlap'] = False
-            if name == 'one_core':
+            if name in ('one_core', 'column_chunks'):
                 spec['npu']['cores'] = 1
             if name == 'two_slots':
                 spec['npu']['l2_staging_bytes_per_core'] = 4096
@@ -116,10 +122,14 @@ def main():
             assert actual['y'].tobytes()==expected.tobytes(),(name,mode,'integer oracle mismatch')
             io=json.loads((build/'io.json').read_text())
             streams=[s for phase in io['phases'] for s in phase.get('weight_streams',[])]
-            if name not in ('single_tile','two_slots') and (name != 'one_core' or fuse):
+            if name not in ('single_tile','two_slots') and (name not in ('one_core','column_chunks') or fuse):
                 assert streams and all(s['prefetch'] for s in streams),(name,mode,streams)
             elif name == 'two_slots':
                 assert streams and all(not s['prefetch'] for s in streams),(name,mode,streams)
+            if name == 'column_chunks' and fuse:
+                chunks = [d['chunks'] for phase in io['phases'] for d in phase.get('decisions', [])
+                          if d['kind'] == 'GEMV partition in L1']
+                assert chunks and all(c >= 2 for c in chunks),(name,mode,chunks)
             timing=json.loads((build/'timing.json').read_text())
             modes[mode]=dict(cycles=timing['total_simulated_cycles'],wall_seconds=wall,
                 independent_reference_byte_exact=True,output_sha256=hashlib.sha256(actual['y'].tobytes()).hexdigest(),

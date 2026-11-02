@@ -6,6 +6,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Matchers.h"
@@ -118,12 +119,12 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
       }
       int64_t count = 0;
       for (auto &group : groups)
-        if (group.size() > 1 && fuse(group, *target)) ++count;
+        if (group.size() > 1 && fuse(fn, group, *target)) ++count;
       fn->setAttr("hyb.projection_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), count));
     }
   }
 
-  bool fuse(SmallVector<Projection> &ps, const TargetSpec &target) {
+  bool fuse(func::FuncOp fn, SmallVector<Projection> &ps, const TargetSpec &target) {
     // Place the fused GEMV before the earliest contraction so even early Q-norm users remain
     // dominated. All new runtime inputs must already be available there.
     llvm::sort(ps, [](auto &a, auto &b) { return a.gemv->isBeforeInBlock(b.gemv); });
@@ -132,12 +133,27 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
     if (!dom.dominates(first.dequant.getScale(), first.gemv)) return false;
     int64_t n = 0;
     for (auto &p : ps) n += p.n;
-    // Bound the private accumulator / output growth; hyb-npu-memplan makes the final check.
+    // Bound the accumulator / output growth; hyb-npu-memplan makes the final check. A core's L1
+    // holds the INT32 and FP16 of its `columns`, the INT8 input, the row scales and two weight tiles.
+    // With gemv_epilogue_fusion a core partition that does not fit L1 is cut into column chunks
+    // (hyb-npu-gemv-epilogue), so the fused GEMV needs no more memory than the separate ones and
+    // only one SA column block per core must fit. Without it the INT32 accumulator and the FP16
+    // output of all n columns also live in L2.
     int64_t cores = largestDivisorAtMost(n / 32, target.npu.cores);
-    int64_t local = first.m * (n / cores) * 6 + first.m * first.k + n / cores * 4 +
-                    2 * std::max<int64_t>(target.npu.gemvTileBytes, first.k * 32) +
-                    target.npu.l1ReservedBytes + 4096;
-    if (local > target.npu.l1Bytes || first.m * n * 6 > target.npu.l2Bytes) return false;
+    auto local = [&](int64_t columns) {
+      return first.m * columns * 6 + first.m * first.k + columns * 4 +
+             2 * std::max<int64_t>(target.npu.gemvTileBytes, first.k * 32) + target.npu.l1ReservedBytes + 4096;
+    };
+    const int64_t l1Need = target.npu.gemvEpilogueFusion ? local(32) : local(n / cores);
+    const int64_t l2Need = target.npu.gemvEpilogueFusion ? 0 : first.m * n * 6;
+    const bool fits = l1Need <= target.npu.l1Bytes && l2Need <= target.npu.l2Bytes;
+    std::string label = "fused[";
+    for (auto &p : ps) label += (label.size() > 6 ? ";" : "") + p.weight.getName().str();
+    label += "] " + std::to_string(first.m) + "x" + std::to_string(n);
+    cost::recordDecision(fn, "fuse projections", label, fits ? "fused" : "separate",
+                         {{"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(target.npu.l1Bytes) / 1024.0},
+                          {"l2_need_kib", double(l2Need) / 1024.0}, {"l2_kib", double(target.npu.l2Bytes) / 1024.0}});
+    if (!fits) return false;
 
     OpBuilder b(first.gemv);
     Location loc = first.gemv.getLoc();

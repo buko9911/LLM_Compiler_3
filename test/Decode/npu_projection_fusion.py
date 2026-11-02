@@ -51,6 +51,11 @@ def main():
         ('different_math',source().replace('arith.muli','arith.addi'),{},0,3),
         ('pim',source().replace('hyb.phase="npu"','hyb.phase="pim"'),{},0,3),
         ('small_sram',source(),{'l1_bytes':270336},0,3),
+        # With gemv_epilogue_fusion a core partition that does not fit L1 is cut into column chunks,
+        # so only one SA column block per core must fit: 532480 B holds one block (530560 B) but not
+        # the whole 160-column partition (537216 B); 516096 B holds neither.
+        ('chunked_epilogue',source(),{'gemv_epilogue_fusion':True,'l1_bytes':532480},1,1),
+        ('chunked_epilogue_too_small',source(),{'gemv_epilogue_fusion':True,'l1_bytes':516096},0,3),
     ]
     for name,text,options,groups,contractions in cases:
         sp=out/f'{name}.json'; src=out/f'{name}.mlir'
@@ -63,6 +68,9 @@ def main():
         assert p.stdout.count('hyb.npu_gemv =')==contractions,(name,p.stdout)
         if groups: assert f'hyb.projection_fusions = {groups}' in p.stdout,(name,p.stdout)
         else: assert 'hyb.weight_segments' not in p.stdout
+        if name.startswith('chunked_epilogue'):
+            choice = 'fused' if groups else 'separate'
+            assert f'choice = "{choice}", kind = "fuse projections"' in p.stdout,(name,p.stdout)
         checks[name]={'groups':groups,'contractions':contractions}
     for key in ['projection_fusion','weight_stream_early_release']:
         sp=out/'invalid.json';sp.write_text(json.dumps({'npu':{key:'true'}}))

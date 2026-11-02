@@ -95,7 +95,7 @@ PY=$LP6/toolchain/pyenv-qpim/bin/python
 $PY frontend/export.py --model /home/jongjip/models/qwen-3-4b --tokens 1 --capacity 512 --out ir   # --layers N: 앞 N층만
 #   --tokens 8 --capacity 512: verify(8토큰, cache 있음)   --tokens 64 --capacity 0: prefill(cache 없음, 마지막 위치 logits)
 build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/target.json -o out              # NPU+PIM 자동 분할
-build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/baselines/qwen3_4b_m1_c512.json \
+build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/baselines/npu_only_lp6_4ch.json \
   --force=npu -o out-npu                                                                                     # NPU-only
 $PY -B runtime/decode.py out-npu --prompt "..." --steps 8 --check                                            # 시뮬레이터로 토큰 생성
 ```
@@ -116,12 +116,15 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 ## Target spec의 `npu.*` 선택 기능
 
-모두 기본 false(꺼짐)다. `configs/baselines/`의 세 설정(1토큰 decode `qwen3_4b_m1_c512.json`, 8토큰 verify
-`qwen3_4b_m8_c512.json`, 64토큰 prefill `qwen3_4b_prefill64.json`)은 Qwen3-4B에서 측정으로 골랐고, 2026-10-31부터
-`npu.*` 스위치가 셋 모두 같다(아래 표의 "켬"). 예외는 `pair_consumer_pipeline`으로 prefill만 끈다. 36층 전체는
-`--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`에 있다.
+모두 기본 false(꺼짐)다. NPU-only 기준 설정은 `configs/baselines/npu_only_lp6_4ch.json` 하나이고, 1토큰 decode·
+8토큰 verify·64토큰 prefill을 모두 이 파일로 컴파일한다(아래 표의 "켬"). step은 export의 `--tokens`/`--capacity`로만
+정해진다. 켠 pass를 어느 op에 적용할지(코어에 나눌지, SiLU×up을 up 타일마다 둘지, projection을 합칠지, GEMV 코어 몫을
+열 묶음으로 나눌지)는 텐서 크기와 이 파일의 하드웨어 수치로 계산한 시간·용량으로 정하고(`include/npu/Decode/Transforms/
+NpuCost.h`), 모든 결정과 근거 숫자를 `io.json`의 `phases[].decisions`에 남긴다. 그래서 크기가 같으면 step이 달라도
+프로그램이 같다. 36층 전체는 `--npu-phase-split=layer`로 컴파일한다. 측정과 남은 차이는
+`../../docs/research/NPU_ONLY_BASELINE.md`에 있다. 2026-11-02 이전의 step별 설정 세 개는 git 이력(`a19bf01`)에 있다.
 
-| 키 | 담당 | 세 설정 |
+| 키 | 담당 | 기준 설정 |
 |---|---|:-:|
 | `projection_fusion`, `attention_fusion`, `gemv_epilogue_fusion`, `elementwise_distribution`, `activation_residency`, `matrix_init_elision` | pass | 켬 |
 | `flash_attention`, `flash_decoding`, `flash_kv_slicing` (+ `attention_query_tile`, `attention_key_tile`, `attention_splits`) | pass: online-softmax attention | |
@@ -138,15 +141,17 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `cross_phase_prefetch` | 다음 phase GDMA load가 barrier 대신 같은 주소의 앞 접근만 기다림 | 켬 |
 | `quant_fused_max`, `vector_loops` | codegen: quant max를 register에서, 반복 VPU 묶음을 hardware loop로 | 켬 |
 | `command_schedule` | system command 재배열 | 켬 |
-| `rope_split` (+ `rope_split_min_elements` 정수) | pass `hyb-npu-rope`: rotate-half RoPE를 head 축으로 코어에 나눈 반쪽 generic 둘로, 뒤 전치는 head 단위 출력에 접음 | 켬, 65536 |
+| `rope_split` | pass `hyb-npu-rope`: rotate-half RoPE를 head 축으로 코어에 나눈 반쪽 generic 둘로, 뒤 전치는 head 단위 출력에 접음. 나눠서 아끼는 시간이 `core_split_us`보다 클 때만 | 켬 |
 | `distribute_transposes` | `hyb-npu-elementwise-distribute`: 맨 위 FP16 전치를 코어에 나눔 | 켬 |
-| `pair_gate_up` | `hyb-npu-gemv-epilogue`: gate·up 두 반쪽의 같은 열을 한 코어가 계산하고 SiLU×up까지 | 켬 |
-| `pair_consumer_pipeline` | `hyb-npu-epilogue-pipeline`: 짝지은 루프에서 SiLU×up을 up 타일마다 dequant 뒤에 | 켬(prefill만 끔) |
+| `pair_gate_up` | `hyb-npu-gemv-epilogue`: gate·up 두 반쪽의 같은 열을 한 코어가 계산하고 SiLU×up까지. 코어 몫이 L1에 안 들어가면 열 묶음으로 나눔 | 켬 |
+| `pair_consumer_pipeline` | `hyb-npu-epilogue-pipeline`: 짝지은 루프에서 SiLU×up을 up 타일마다 dequant 뒤에. 루프가 weight 읽기를 기다릴 때(타일당 읽기 시간 ≥ SA + dequant)만 | 켬 |
+| 하드웨어 수치(`l1_read_bytes_per_cycle`, `mma_k_per_cycle`, `vector_*`, `gdma_read_gbps`, `core_split_us` 등) | 위 결정의 시간 계산(`NpuCost.h`). 값과 출처는 `configs/baselines/README.md` | |
 
-정수 옵션(`gemv_tile_bytes`, `distribute_min_elements`, `dequant_min_elements`, `l2_staging_bytes_per_core`,
-`weight_stream_max_slots`, `weight_prefetch_batch_tiles`, `input_tile_columns`)과 하드웨어 값은
-`include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 정리되어 있다. 각 기능이 실제로 몇 번
-적용됐는지는 출력 `io.json`의 `phases[]`에 기록된다.
+정수 옵션(`gemv_tile_bytes`, `l2_staging_bytes_per_core`, `weight_stream_max_slots`, `weight_prefetch_batch_tiles`,
+`input_tile_columns`)과 하드웨어 값은 `include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 정리되어 있다.
+`distribute_min_elements`, `dequant_min_elements`, `rope_split_min_elements`는 실험용 바닥값이다(기본 0: 없음).
+각 기능이 실제로 몇 번 적용됐는지는 출력 `io.json`의 `phases[]`에, 결정 하나하나와 근거 숫자는 `phases[].decisions`에
+기록된다.
 
 ## 테스트
 
