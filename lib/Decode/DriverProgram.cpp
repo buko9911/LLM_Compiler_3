@@ -255,7 +255,8 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
 // INT8 PIM inputs from partition parts[0] / PU 0, the INT32 PIM outputs in [M, nPad] rows).
 bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::ProgramBuilder &program,
                          const std::vector<int> &exit, bool noOutputCollect, bool debugCollect,
-                         const std::string &debugPhases, json::Array &outputs) {
+                         const std::string &debugPhases, json::Array &outputs, int64_t l2Bytes,
+                         std::vector<std::string> &uncollected) {
   program.beginPhase("collect", exit);
   plena::ProgramBuilder &w = program;
   std::map<int, uint32_t> cfg;
@@ -299,11 +300,33 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
       ldma(at + o, n);
     }
   };
+  // Step outputs go to core 0's L1 (staged through L2 [0, 4 MiB)), then to the upper half of L2,
+  // which the simulator also dumps. An output that fits neither (a model's recurrent states can be
+  // tens of MiB) stays in LP6 and is listed as uncollected.
+  const uint64_t l2Limit = uint64_t(std::max<int64_t>(4 << 20, l2Bytes));
+  uint64_t l2 = 4u << 20;
+  auto collectToL2 = [&](const std::string &name, Value v, DictionaryAttr a) {
+    uint64_t addr = uint64_t(a.getAs<IntegerAttr>("addr").getInt());
+    uint64_t bytes = uint64_t(a.getAs<IntegerAttr>("bytes").getInt());
+    if (l2 + bytes > l2Limit) return false;
+    outputs.push_back(json::Object{{"name", name}, {"memory", "l2"}, {"l2", int64_t(l2)}, {"bytes", int64_t(bytes)},
+                                   {"dtype", dtypeName(cast<ShapedType>(v.getType()).getElementType())},
+                                   {"shape", shapeOf(v.getType())}, {"layout", "dense"}});
+    constexpr uint64_t chunk = (1 << 20) - 64;
+    for (uint64_t o = 0; o < bytes; o += chunk) w.gdmaLoad(addr + o, l2 + o, uint32_t(std::min(chunk, bytes - o)));
+    l2 = (l2 + bytes + 63) / 64 * 64;
+    return true;
+  };
   auto ret = cast<func::ReturnOp>(step.getBody().front().getTerminator());
   if (!noOutputCollect)
     for (auto [i, v] : llvm::enumerate(ret.getOperands())) {
       auto name = step.getResultAttrOfType<StringAttr>(unsigned(i), kName);
-      collectDense(name ? name.str() : "out" + std::to_string(i), v, lp6Of(step, v));
+      std::string label = name ? name.str() : "out" + std::to_string(i);
+      DictionaryAttr placement = lp6Of(step, v);
+      collectDense(label, v, placement);
+      if (!overflow) continue;
+      overflow = false;
+      if (!collectToL2(label, v, placement)) uncollected.push_back(label);
     }
   if (debugCollect) {
     // A buffer is named after its producer: the first call that has it as an operand.

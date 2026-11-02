@@ -166,6 +166,20 @@ def HybNpuAttentionFusion : Pass<"hyb-npu-attention-fusion", "ModuleOp"> {
                            "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
 }
 
+def HybNpuStateFusion : Pass<"hyb-npu-state-fusion", "ModuleOp"> {
+  let summary = "Run a recurrent state's per-token updates on the cores by head blocks";
+  let description = [{
+    An FP32 state argument (a Gated DeltaNet layer's [heads, dv, dk] state) is updated token by
+    token by generics that are all parallel along its leading head axis. The chain from the
+    state to the ops that read the new state becomes one scf.forall over the cores: each core
+    keeps its heads' state slice in L1 for every token, and the per-token inputs are sliced to
+    its heads. Bodies, element types and reduction order are unchanged.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
+                           "scf::SCFDialect"];
+}
+
 def HybNpuGemvEpilogue : Pass<"hyb-npu-gemv-epilogue", "ModuleOp"> {
   let summary = "Dequantize each core's GEMV columns on that core (npu.gemv_epilogue_fusion)";
   let description = [{

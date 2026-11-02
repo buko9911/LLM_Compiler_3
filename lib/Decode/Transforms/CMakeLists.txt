@@ -15,6 +15,7 @@ add_mlir_library(NPUDecodeTransforms
   NpuMatrixInit.cpp
   NpuActivationResidency.cpp
   NpuAttentionFusion.cpp
+  NpuStateFusion.cpp
   NpuElementwiseDistribution.cpp
   NpuRope.cpp
   NpuCost.cpp

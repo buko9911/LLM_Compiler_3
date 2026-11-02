@@ -4,6 +4,9 @@
 // only when it is a row-reduction result, or computed from such values alone (the per-row
 // scalar chain of RMSNorm / softmax). linalg bodies extend their inputs to f32 and truncate
 // the yielded value, so reductions still accumulate in FP32.
+// State the manifest declares FP32 (dtype "f32", e.g. a Gated DeltaNet recurrent state) stays
+// f32: the argument, the returned new state, and every update between them (an elementwise op
+// that updates a kept tensor of its own shape).
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/Passes.h"
@@ -96,16 +99,40 @@ struct HybStorageF16Pass : mlir::hybrid::impl::HybStorageF16Base<HybStorageF16Pa
       if (!isF32Tensor(v.getType()) || classes.findLeader(v) == classes.member_end()) return false;
       return keptLeaders.insert(classes.getLeaderValue(v)).second;
     };
+    // The declared FP32 states and their updates (a subset of the kept values: a row reduction of
+    // a state is kept but is not itself a state).
+    DenseSet<Value> stateLeaders;
+    auto isState = [&](Value v) {
+      return isF32Tensor(v.getType()) && classes.findLeader(v) != classes.member_end() &&
+             stateLeaders.contains(classes.getLeaderValue(v));
+    };
+    auto markState = [&](Value v) {
+      bool changed = markKept(v);
+      if (isF32Tensor(v.getType()) && classes.findLeader(v) != classes.member_end())
+        changed |= stateLeaders.insert(classes.getLeaderValue(v)).second;
+      return changed;
+    };
+    auto declaredF32 = [](DictionaryAttr attrs) {
+      auto dtype = attrs ? attrs.getAs<StringAttr>("hyb.dtype") : StringAttr();
+      return dtype && dtype.getValue() == "f32";
+    };
+    auto ret = cast<func::ReturnOp>(body.getTerminator());
+    for (BlockArgument a : step.getArguments())
+      if (declaredF32(step.getArgAttrDict(a.getArgNumber()))) markState(a);
+    for (auto [i, v] : llvm::enumerate(ret.getOperands()))
+      if (declaredF32(step.getResultAttrDict(unsigned(i)))) markState(v);
     for (bool changed = true; changed;) {
       changed = false;
       body.walk([&](Operation *op) {
         if (auto g = dyn_cast<linalg::GenericOp>(op)) {
-          bool any = false, all = true;
+          bool any = false, all = true, updatesState = false;
           for (Value v : g.getDpsInputs()) {
             if (!isF32Tensor(v.getType())) continue;
             any = true;
             all &= kept(v);
+            updatesState |= isState(v) && g->getNumResults() == 1 && v.getType() == g->getResult(0).getType();
           }
+          if (updatesState) changed |= markState(g->getResult(0));
           if (isReduction(g) || (any && all))
             for (Value r : g->getResults()) changed |= markKept(r);
         } else if (auto q = dyn_cast<hyb::QuantOp>(op)) {
@@ -123,7 +150,7 @@ struct HybStorageF16Pass : mlir::hybrid::impl::HybStorageF16Base<HybStorageF16Pa
 
     // Retype block arguments and results.
     for (BlockArgument a : step.getArguments())
-      if (isF32Tensor(a.getType())) a.setType(toF16(a.getType()));
+      if (isF32Tensor(a.getType()) && !kept(a)) a.setType(toF16(a.getType()));
     SmallVector<Operation *> ops;
     body.walk([&](Operation *op) {
       if (op->getParentOp() == step.getOperation()) ops.push_back(op);
@@ -172,7 +199,6 @@ struct HybStorageF16Pass : mlir::hybrid::impl::HybStorageF16Base<HybStorageF16Pa
       if (auto g = dyn_cast<linalg::GenericOp>(op)) fixGenericBody(g, b);
     }
     // Function type follows the return operands.
-    auto ret = cast<func::ReturnOp>(body.getTerminator());
     step.setType(FunctionType::get(&getContext(), body.getArgumentTypes(), ret.getOperandTypes()));
   }
 

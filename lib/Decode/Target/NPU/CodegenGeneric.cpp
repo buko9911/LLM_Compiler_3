@@ -6,10 +6,10 @@
 // register (the vector unit is FP16). A reduction over the innermost loop folds each tile
 // with V_REDUCE (FP16 -> FP32; a product of two vectors uses the dot mode, so x*x never
 // rounds to FP16) and an FP32 scalar accumulator.
-// Generics explicitly marked hyb.flash_math use the separate typed path below:
-// FP32 vector state, real casts, comparisons and masked selection. Keeping the
-// dispatch explicit preserves the numerical and instruction contract of old
-// programs while online attention opts into the existing typed ISA.
+// Generics explicitly marked hyb.flash_math, and generics with FP32 vector operands (a recurrent
+// state kept in FP32), use the separate typed path below: FP32 vector state, real casts,
+// comparisons and masked selection. Generics the legacy path accepts keep its numerical and
+// instruction contract.
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
@@ -103,7 +103,11 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
 
   SmallVector<Operation *> operations;
   for (Operation &op : body.without_terminator()) {
-    if (skip.contains(&op) || isa<arith::ConstantOp>(op)) continue;
+    // A cast of a constant (an exported f64 epsilon truncated to f32) is a constant of its
+    // result type: materialize() loads it from the pool.
+    if (skip.contains(&op) || isa<arith::ConstantOp>(op) ||
+        (op.getNumResults() == 1 && constValue(op.getResult(0))))
+      continue;
     if (op.getNumResults() != 1) return fail("scalar body operation must have one result");
     operations.push_back(&op);
   }
@@ -114,9 +118,88 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
 
   SmallVector<int64_t> outer(ranges.begin(), ranges.begin() + inner);
   SmallVector<uint64_t> bases(views.size());
+  // Rows: as in the legacy path, one hardware loop over the trailing outer dims in which every
+  // operand advances by a fixed stride per row (zero for a broadcast operand). The body is one row,
+  // its 16-lane chunks unrolled; operands are addressed as a row pointer plus the offset in the row.
+  SmallVector<unsigned> rowOperands;
+  for (unsigned i = 0; i < inputs; ++i)
+    if (!body.getArgument(i).use_empty()) rowOperands.push_back(i);
+  rowOperands.push_back(inputs);
+  auto dimStride = [&](unsigned i, unsigned d) {
+    int64_t elements = 0;
+    for (unsigned r = 0; r < maps[i].getNumResults(); ++r)
+      if (auto de = dyn_cast<AffineDimExpr>(maps[i].getResult(r)); de && de.getPosition() == d)
+        elements += views[i].strides[r];
+    return elements;
+  };
+  unsigned loopFrom = inner;
+  int64_t loopRows = 1;
+  SmallVector<int64_t> rowBytes(views.size(), 0);
+  if (inner > 0 && rowOperands.size() <= std::size(kLoopPointers)) {
+    bool fits = true;
+    for (unsigned i : rowOperands) {
+      int64_t stride = dimStride(i, inner - 1);
+      rowBytes[i] = stride * views[i].eb;
+      fits &= stride >= 0 && rowBytes[i] < (int64_t(1) << 18);
+    }
+    if (fits) {
+      loopFrom = inner - 1;
+      loopRows = ranges[inner - 1];
+      while (loopFrom > 0 && llvm::all_of(rowOperands, [&](unsigned i) {
+               return dimStride(i, loopFrom - 1) * views[i].eb == rowBytes[i] * loopRows;
+             })) {
+        --loopFrom;
+        loopRows *= ranges[loopFrom];
+      }
+      if (loopRows < 2) loopFrom = inner;
+    }
+  }
+  // Rows per loop iteration. Unrolled rows address every operand at a constant offset from a base
+  // register, so they need no scalar instructions; a loop body pays one pointer update per operand
+  // and the loop end per iteration. As in the legacy long-row loop (four chunks per iteration), the
+  // body takes the most whole rows, a divisor of the row count, that stay within four 16-lane
+  // chunks (one row when a row has four or more). Operands whose row stride is a multiple of 16 bytes are addressed at
+  // row * stride from their pointer and advance once per iteration; the others (a per-row FP32
+  // scalar, the reduction output) advance after every row. When the whole row range fits one body,
+  // the rows stay unrolled.
+  auto perRowAdvance = [&](unsigned i) { return rowBytes[i] % 16 != 0 || (reduction && i == inputs); };
+  int64_t bodyRows = 1;
+  if (loopFrom < inner) {
+    const int64_t chunks = (ranges[inner] + 15) / 16;
+    auto addressable = [&](int64_t rows) {
+      return llvm::all_of(rowOperands, [&](unsigned i) {
+        if (perRowAdvance(i)) return true;
+        const int64_t span = rowBytes[i] * (rows - 1) + (contiguous[i] ? ranges[inner] * views[i].eb : views[i].eb);
+        return span < int64_t(::npu::isa2::kVectorMemoryOffsetLimit) && rowBytes[i] * rows < (int64_t(1) << 18);
+      });
+    };
+    for (int64_t rows = 1; rows <= loopRows && rows * chunks <= std::max<int64_t>(chunks, 4); ++rows)
+      if (loopRows % rows == 0 && addressable(rows)) bodyRows = rows;
+    if (bodyRows == loopRows) {   // one body holds every row: no loop
+      loopFrom = inner;
+      bodyRows = 1;
+    }
+  }
+  const bool rowLoop = loopFrom < inner;
+  // A row body runs with one vector length unless it has a tail chunk or loads a broadcast lane;
+  // only then must a loop body set its lengths again in every iteration.
+  const bool varyingVL = (ranges[inner] > 16 && ranges[inner] % 16 != 0) ||
+                         llvm::any_of(rowOperands, [&](unsigned i) { return i < inputs && !contiguous[i]; });
+  DenseMap<unsigned, uint32_t> pointers;
+  if (rowLoop)
+    for (auto [k, i] : llvm::enumerate(rowOperands)) pointers[i] = kLoopPointers[k];
+  int64_t row = 0;   // the row of the loop body being emitted
+  auto rowOffset = [&](unsigned n) { return perRowAdvance(n) ? 0 : row * rowBytes[n]; };
+  auto loadOperand = [&](uint32_t reg, unsigned n, int64_t byteOffset, uint32_t kind) {
+    if (rowLoop) vloadAt(reg, pointers.lookup(n), uint64_t(rowOffset(n) + byteOffset), kind);
+    else vload(reg, bases[n] + uint64_t(byteOffset), kind);
+  };
+  SmallVector<int64_t> loopOuter(outer.begin(), outer.begin() + loopFrom);
   LogicalResult status = success();
-  forEachOuter(outer, 0, [&](ArrayRef<int64_t> index) {
+  forEachOuter(loopOuter, 0, [&](ArrayRef<int64_t> prefix) {
     if (failed(status)) return;
+    SmallVector<int64_t> index(prefix.begin(), prefix.end());
+    index.resize(inner, 0);
     for (size_t i = 0; i < views.size(); ++i) {
       int64_t offset = 0;
       for (auto [axis, expression] : llvm::enumerate(maps[i].getResults())) {
@@ -128,7 +211,28 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
       }
       bases[i] = addr(views[i], offset);
     }
-    if (reduction) sload(11, bases.back());
+    if (rowLoop) {
+      for (unsigned i : rowOperands) {
+        const bool rowVector = contiguous[i] && !(reduction && i == inputs);
+        const uint64_t last = uint64_t(rowBytes[i]) * uint64_t(loopRows - 1) +
+                              (rowVector ? uint64_t(ranges[inner] * views[i].eb) : uint64_t(views[i].eb));
+        guardLoopRange(bases[i], bases[i] + last, i == inputs);
+      }
+      for (unsigned i : rowOperands) load(pointers[i], uint32_t(bases[i]));
+      if (!varyingVL) setVL(uint32_t(std::min<int64_t>(16, ranges[inner])));
+      loopBegin(uint32_t(loopRows / bodyRows));
+      // The body's first chunk sets the length again (the last iteration's length stays in cfg).
+      if (varyingVL) cfg.erase(3);
+    }
+    for (row = 0; row < bodyRows; ++row) {
+    if (reduction) {
+      if (rowLoop) {
+        noteOutputStoreVectorWork();
+        w.append(rform(OP_V_MEM, 11, pointers.lookup(inputs), 0, 0, 9));
+      } else {
+        sload(11, bases.back());
+      }
+    }
     for (int64_t start = 0; start < ranges[inner]; start += 16) {
       const uint32_t lanes = uint32_t(std::min<int64_t>(16, ranges[inner] - start));
       setVL(lanes);
@@ -156,10 +260,10 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
           }
           const unsigned n = arg.getArgNumber();
           uint32_t loadKind = views[n].et.isF32() ? 3 : 1;
-          if (contiguous[n]) vload(*reg, bases[n] + uint64_t(start * views[n].eb), loadKind);
+          if (contiguous[n]) loadOperand(*reg, n, start * views[n].eb, loadKind);
           else {
             setVL(1);
-            vload(*reg, bases[n], loadKind);
+            loadOperand(*reg, n, 0, loadKind);
             setVL(lanes);
             vector(T_BCAST, typeCode(views[n].et), *reg, *reg);
           }
@@ -235,11 +339,30 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
         uint32_t function = combine == 1 ? (f32 ? 4 : 1) : (f32 ? 5 : 2);
         emit(rform(OP_V_RED, 3, *result, 0, 0, function));
         emit(rform(OP_S_ALU, 11, 11, 3, 0, combine));
+      } else if (rowLoop) {
+        vstoreAt(pointers.lookup(inputs), uint64_t(rowOffset(inputs) + start * views.back().eb), *result,
+                 views.back().et.isF32() ? 4 : 2);
       } else {
         vstore(bases.back() + uint64_t(start * views.back().eb), *result, views.back().et.isF32() ? 4 : 2);
       }
     }
-    if (reduction) sstore(bases.back(), 11);
+    if (reduction) {
+      if (rowLoop) {
+        noteOutputStoreVectorWork();
+        w.append(rform(OP_V_MEM, pointers.lookup(inputs), 11, 0, 0, 10));
+      } else {
+        sstore(bases.back(), 11);
+      }
+    }
+    if (rowLoop)
+      for (unsigned i : rowOperands)
+        if (rowBytes[i] && perRowAdvance(i)) advance(pointers[i], uint32_t(rowBytes[i]));
+    }
+    if (rowLoop) {
+      for (unsigned i : rowOperands)
+        if (rowBytes[i] && !perRowAdvance(i)) advance(pointers[i], uint32_t(rowBytes[i] * bodyRows));
+      loopEnd();
+    }
   });
   return status;
 }
@@ -277,6 +400,9 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
         }
         isVec = true;
       }
+    // FP32 vector operands (a recurrent state kept in FP32) take the typed path: the legacy
+    // vectorizer holds FP16 lanes only.
+    if (isVec && v->et.isF32()) return lowerTypedGeneric(g, err);   // == typedGeneric(g)
     if (isVec && !v->et.isF16()) {
       err = "vector operand must be f16";
       return failure();

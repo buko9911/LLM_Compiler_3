@@ -136,9 +136,16 @@ class Device:
             print(res.stderr[-3000:])
             raise SystemExit(f"emulator failed ({res.returncode})")
         dump = (self.out / self.dump_name).read_bytes()
+        l2 = None
         outs = {}
         for name, o in self.outputs.items():
-            outs[name] = np.frombuffer(dump[o["l1"]:o["l1"] + o["bytes"]], dtype=DT[o["dtype"]]).reshape(o["shape"]).copy()
+            # Outputs past core 0's L1 are collected into the upper half of L2 ("memory": "l2").
+            if o.get("memory") == "l2":
+                l2 = l2 if l2 is not None else (self.out / "l2_sram_dump.bin").read_bytes()
+                data, at = l2, o["l2"]
+            else:
+                data, at = dump, o["l1"]
+            outs[name] = np.frombuffer(data[at:at + o["bytes"]], dtype=DT[o["dtype"]]).reshape(o["shape"]).copy()
         rep = json.loads((self.out / "commands.json").read_text())
         return outs, rep, time.time() - t0
 

@@ -92,7 +92,8 @@ json::Array driver::argumentsJSON(func::FuncOp step) {
 
 void driver::writeIO(const std::string &outDir, const std::string &manifestFile, ModuleOp mod,
                      const std::string &model, uint64_t imageBytes, const LP6Extra &extra, const pim::Program &prog,
-                     uint32_t pimCommandCount, json::Array args, json::Array outputs, json::Array report) {
+                     uint32_t pimCommandCount, json::Array args, json::Array outputs, json::Array report,
+                     json::Array uncollected) {
   auto manifest = llvm::MemoryBuffer::getFile(manifestFile);
   json::Value dims = nullptr;
   if (manifest)
@@ -110,6 +111,7 @@ void driver::writeIO(const std::string &outDir, const std::string &manifestFile,
                   {"args", std::move(args)},
                   {"outputs", std::move(outputs)},
                   {"phases", std::move(report)}};
+  if (!uncollected.empty()) io["uncollected"] = std::move(uncollected);
   std::error_code ec;
   llvm::raw_fd_ostream os(outDir + "/io.json", ec);
   os << llvm::formatv("{0:1}", json::Value(std::move(io))) << "\n";

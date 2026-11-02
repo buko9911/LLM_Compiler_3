@@ -35,7 +35,8 @@ bool emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
 /// `debugCollect` the buffers passed between phases. `outputs` gets their io.json entries.
 bool emitCollect(func::FuncOp step, const pim::Program &prog, plena::ProgramBuilder &program,
                  const std::vector<int> &exit, bool noOutputCollect, bool debugCollect,
-                 const std::string &debugPhases, llvm::json::Array &outputs);
+                 const std::string &debugPhases, llvm::json::Array &outputs, int64_t l2Bytes,
+                 std::vector<std::string> &uncollected);
 
 } // namespace mlir::hybrid::driver
 

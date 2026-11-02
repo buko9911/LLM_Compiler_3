@@ -116,6 +116,8 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.flash_attention", "hyb.flash_tile", "hyb.flash_decoding", "hyb.flash_math", "hyb.flash_merge",
     // hyb-npu-attention-fusion
     "hyb.attention_fusion", "hyb.attention_fused",
+    // hyb-npu-state-fusion
+    "hyb.state_fused", "hyb.state_fusions",
     // hyb-npu-gemv-epilogue
     "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions", "hyb.gemv_pair",
     // hyb-npu-elementwise-distribute
@@ -167,6 +169,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
       "hyb-npu-rope" + spec + ","                             // rotate-half RoPE per core, head-major
       "hyb-npu-flash-attention" + spec + ","                  // online softmax where full rows do not fit
       "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
+      "hyb-npu-state-fusion" + spec + ","                     // a recurrent state's updates by head blocks
       "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core
       "hyb-npu-tile" + spec + ","                             // scf.forall over cores, scf.for over tiles
       "hyb-npu-elementwise-distribute" + spec + ",cse,canonicalize,";
@@ -323,8 +326,12 @@ int compileDecode(int argc, char **argv) {
 
   // ---- collect: the step outputs into L1 (read back from the SRAM dump) --------------------
   json::Array outputs;
-  if (!driver::emitCollect(step, prog, program, exit, noOutputCollect, debugCollect, debugPhases, outputs))
+  std::vector<std::string> uncollected;
+  if (!driver::emitCollect(step, prog, program, exit, noOutputCollect, debugCollect, debugPhases, outputs,
+                           spec->npu.l2Bytes, uncollected))
     return 1;
+  for (const std::string &name : uncollected)
+    llvm::errs() << "output " << name << " does not fit the collected SRAM; it stays in LP6 (io.json uncollected)\n";
   if (!program.finish(outDir, logicalCores)) {
     llvm::errs() << "cannot write " << outDir << "/program.bin\n";
     return 1;
@@ -334,8 +341,10 @@ int compileDecode(int argc, char **argv) {
   uint64_t imageBytes = std::max(prog.endAddress(), extra.limit);
   json::Array args = driver::argumentsJSON(step);
   std::string model = modelDir.empty() ? mod->getAttrOfType<StringAttr>("hyb.model").str() : modelDir.getValue();
+  json::Array missing;
+  for (const std::string &name : uncollected) missing.push_back(name);
   driver::writeIO(outDir, manifestFile, mod, model, imageBytes, extra, prog, pimCommandCount, std::move(args),
-                  std::move(outputs), std::move(report));
+                  std::move(outputs), std::move(report), std::move(missing));
   llvm::outs() << llvm::formatv("codegen: {0:f1} s, {1} PIM commands, LP6 image {2:f2} GB\n", seconds(t0),
                                 pimCommandCount, double(imageBytes) / 1e9);
   // This checked plan is produced during ISA emission, after the initial IR dump.

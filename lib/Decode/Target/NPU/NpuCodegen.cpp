@@ -117,6 +117,20 @@ std::optional<double> Codegen::constValue(Value v) {
   return std::nullopt;
 }
 
+/// Generics lowered by the typed vector path (lowerTypedGeneric): online-attention math and
+/// generics with an FP32 operand along the innermost loop.
+bool Codegen::typedGeneric(linalg::GenericOp g) {
+  if (g->hasAttr("hyb.flash_math")) return true;
+  const unsigned loops = g.getNumLoops();
+  if (!loops) return false;
+  AffineExpr inner = getAffineDimExpr(loops - 1, g.getContext());
+  return llvm::any_of(g->getOpOperands(), [&](OpOperand &o) {
+    AffineMap map = g.getMatchingIndexingMap(&o);
+    return map.getNumResults() && map.getResults().back() == inner &&
+           getElementTypeOrSelf(o.get().getType()).isF32();
+  });
+}
+
 void Codegen::collectConstants(func::FuncOp fn) {
   scalarConst(1.0f / 127.0f);
   scalarConst(0.0f);
@@ -126,9 +140,9 @@ void Codegen::collectConstants(func::FuncOp fn) {
         for (Value o : b->getOperands())
           if (auto c = constValue(o)) {
             scalarConst(float(*c));
-            // Online attention uses the typed vector ISA: its constants also need vector slots
-            // of their actual element type.
-            if (g->hasAttr("hyb.flash_math"))
+            // The typed vector ISA (online attention, FP32 state) needs vector slots of the
+            // constants' actual element type.
+            if (typedGeneric(g))
               vectorConst(*c, o.getType().isInteger(1) ? int(DT_I8) : dtypeOf(o.getType()));
           }
       });

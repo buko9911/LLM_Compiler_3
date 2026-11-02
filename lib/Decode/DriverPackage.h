@@ -32,7 +32,8 @@ llvm::json::Array argumentsJSON(func::FuncOp step);
 /// io.json: LP6 addresses of inputs / states / weights, L1 offsets of outputs, the phase report.
 void writeIO(const std::string &outDir, const std::string &manifestFile, ModuleOp mod, const std::string &model,
              uint64_t imageBytes, const LP6Extra &extra, const pim::Program &prog, uint32_t pimCommandCount,
-             llvm::json::Array args, llvm::json::Array outputs, llvm::json::Array report);
+             llvm::json::Array args, llvm::json::Array outputs, llvm::json::Array report,
+             llvm::json::Array uncollected = {});
 /// Records the verified PIM weight storage in the generated io.json.
 bool addStorageToIO(const std::string &outDir, const std::string &layoutHash, const std::string &manifestHash,
                     std::string &err);

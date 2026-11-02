@@ -5,6 +5,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/Passes.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -64,11 +65,13 @@ struct HybAnnotatePass : mlir::hybrid::impl::HybAnnotateBase<HybAnnotatePass> {
       step.setArgAttr(i, kName, str(*o->getString("name")));
       if (auto layer = o->getInteger("layer"))
         step.setArgAttr(i, "hyb.layer", IntegerAttr::get(IntegerType::get(ctx, 64), *layer));
+      if (auto dtype = o->getString("dtype")) step.setArgAttr(i, "hyb.dtype", str(*dtype));
     }
     for (auto [i, r] : llvm::enumerate(*results)) {
       llvm::json::Object *o = r.getAsObject();
       step.setResultAttr(i, kKind, str("output"));
       step.setResultAttr(i, kName, str(*o->getString("name")));
+      if (auto dtype = o->getString("dtype")) step.setResultAttr(i, "hyb.dtype", str(*dtype));
     }
     module->setAttr("hyb.model", str(*root->getString("model")));
     module->setAttr("hyb.tokens", IntegerAttr::get(IntegerType::get(ctx, 64), *root->getInteger("tokens")));
@@ -91,20 +94,45 @@ struct FPowIToMul : OpRewritePattern<math::FPowIOp> {
   }
 };
 
+/// torch-mlir guards a division by a tensor with cf.assert (divisor != 0). The NPU has no runtime
+/// checks; the division gives inf as it would without the guard.
+struct DropAssert : OpRewritePattern<cf::AssertOp> {
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(cf::AssertOp op, PatternRewriter &rewriter) const override {
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+/// A consumer that reads `operand` broadcast along a loop other than its innermost one would
+/// evaluate a fused producer once per point of that loop. Along the innermost loop the NPU
+/// vectorizer computes it once per row, which is once per producer point.
+bool broadcastsOuterLoop(OpOperand *operand) {
+  auto consumer = dyn_cast<linalg::LinalgOp>(operand->getOwner());
+  if (!consumer) return false;
+  AffineMap map = consumer.getMatchingIndexingMap(operand);
+  const unsigned loops = consumer.getNumLoops();
+  for (unsigned d = 0; d + 1 < loops; ++d)
+    if (!map.isFunctionOfDim(d)) return true;
+  return false;
+}
+
 struct HybSimplifyPass : mlir::hybrid::impl::HybSimplifyBase<HybSimplifyPass> {
   void runOnOperation() override {
     MLIRContext *ctx = &getContext();
     RewritePatternSet patterns(ctx);
-    patterns.add<FPowIToMul>(ctx);
+    patterns.add<FPowIToMul, DropAssert>(ctx);
     linalg::populateEraseUnusedOperandsAndResultsPatterns(patterns);
     linalg::ControlDropUnitDims unitDims;
     linalg::populateFoldUnitExtentDimsPatterns(patterns, unitDims);
     // Fuse elementwise producers with a single use into their consumer (including into
     // reductions), so every row-wise chain becomes one generic without recomputing a shared
     // producer; the NPU vectorizer hoists row-invariant sub-expressions out of the column loop.
+    // A producer the consumer broadcasts along an outer loop stays separate (it would be
+    // recomputed for every point of that loop, e.g. a per-head decay over a head's whole state).
     linalg::populateElementwiseOpsFusionPatterns(patterns, [](OpOperand *operand) {
       Operation *producer = operand->get().getDefiningOp();
-      return producer && producer->hasOneUse();
+      return producer && producer->hasOneUse() && !broadcastsOuterLoop(operand);
     });
     for (Dialect *d : ctx->getLoadedDialects()) d->getCanonicalizationPatterns(patterns);
     for (RegisteredOperationName op : ctx->getRegisteredOperations()) op.getCanonicalizationPatterns(patterns, ctx);
