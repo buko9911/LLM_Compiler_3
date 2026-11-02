@@ -779,15 +779,16 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   // Interleave only independent output coordinates. Exact in-place maps are
   // safe; shifted/uncertain aliases and overlapping destination rows are not.
   // This is checked against the final physical views, not operand names.
-  bool pipelineSafe = !reduction && vec.back();
+  // A reduction has no vector output: its chunks only read, and it folds them in chunk order below.
+  bool pipelineSafe = reduction || vec.back();
   uint64_t outputSpan = views.back().eb;
-  for (int d = int(views.back().shape.size()) - 1; pipelineSafe && d >= 0; --d) {
+  for (int d = int(views.back().shape.size()) - 1; pipelineSafe && !reduction && d >= 0; --d) {
     const View &out = views.back();
     if (out.shape[d] <= 0 || out.strides[d] <= 0 ||
         uint64_t(out.strides[d] * out.eb) < outputSpan) pipelineSafe = false;
     else outputSpan += uint64_t((out.shape[d] - 1) * out.strides[d] * out.eb);
   }
-  for (unsigned i = 0; pipelineSafe && i < nIn; ++i) {
+  for (unsigned i = 0; pipelineSafe && !reduction && i < nIn; ++i) {
     if (body.getArgument(i).use_empty()) continue;
     const View &src = views[i], &dst = views.back();
     bool sameCoordinates = addr(src) == addr(dst) && src.shape == dst.shape &&
@@ -910,9 +911,11 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
         sload(accReg, base[nIn]);
       }
     }
+    // Scalar registers no constant, row value or reciprocal holds: per-chunk reduction results.
+    SmallVector<uint32_t> spareScalars(std::begin(kPool) + nextPool, std::end(kPool));
     if (failed(emitTiles(body, nIn, vec, kind, vops, aliasOf, lastUse, base, n, reduction, pre, dotA, dotB,
                          redFunct, combFunct, result, constReg, rowReg, reciprocals, pipelineSafe,
-                         accReg, tmpReg, err))) {
+                         accReg, tmpReg, spareScalars, err))) {
       status = failure();
       rowPointers = nullptr;
       return;
@@ -942,7 +945,8 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
                                  Value pre, Value dotA, Value dotB, uint32_t redFunct, uint32_t combFunct, Value result,
                                  DenseMap<Value, uint32_t> &constReg, DenseMap<Value, uint32_t> &rowReg,
                                  DenseMap<Value, uint32_t> &reciprocals, bool pipelineSafe,
-                                 uint32_t accReg, uint32_t tmpReg, std::string &err) {
+                                 uint32_t accReg, uint32_t tmpReg, ArrayRef<uint32_t> spareScalars,
+                                 std::string &err) {
   auto rootOfV = [&](Value v) {
     auto it = aliasOf.find(v);
     return it == aliasOf.end() ? v : it->second;
@@ -951,9 +955,11 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
     if (auto it = constReg.find(v); it != constReg.end()) return it->second;
     return rowReg.lookup(v);
   };
-  // Prove each chunk fits in one half of the existing 16-register file. A
-  // separate register namespace makes interleaving legal without renaming
-  // hardware or hidden storage. No arithmetic or reduction order is changed.
+  // B chunks are interleaved, each in its own slice of the 16-register file (16 / B registers),
+  // so B = 16 / one chunk's peak. A separate register namespace makes interleaving legal without
+  // renaming hardware or hidden storage. A reduction's chunks reduce into separate scalar
+  // registers and fold into the accumulator in chunk order. No arithmetic or reduction order
+  // changes.
   unsigned nArgs = reduction ? nIn : nIn + 1;
   DenseSet<Value> live;
   for (unsigned i = 0; i < nArgs; ++i)
@@ -974,8 +980,10 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
         div && kind.lookup(div.getLhs()) == K::Vector && kind.lookup(div.getRhs()) != K::Vector &&
         !reciprocals.count(div.getRhs())) pipelineSafe = false;
   }
-  pipelineSafe &= !reduction && peak <= 8;
-  const int64_t batch = pipelineSafe ? 2 : 1;
+  pipelineSafe &= peak > 0 && peak <= 8;
+  const int64_t maxBatch = reduction ? int64_t(spareScalars.size()) + 1 : 16;
+  const int64_t batch = pipelineSafe ? std::max<int64_t>(1, std::min<int64_t>(16 / int64_t(peak), maxBatch)) : 1;
+  const int width = int(16 / batch);
   struct Chunk {
     uint32_t lanes;
     SmallVector<std::function<void()>> instructions;
@@ -986,8 +994,9 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
   for (unsigned i = 0; i < nArgs; ++i)
     if (!(i < nIn && !vec[i]) && lastUse.count(body.getArgument(i))) addressed.push_back(i);
   if (!reduction) addressed.push_back(nIn);
-  // Four chunks per iteration spread the pointer updates and the loop end over more work.
-  const int64_t perIteration = std::max<int64_t>(batch, 4) * 32;
+  // At least four chunks per iteration (a whole number of batches) spread the pointer updates and
+  // the loop end over more work.
+  const int64_t perIteration = batch * ((4 + batch - 1) / batch) * 32;
   int64_t iterations = !rowPointers ? n / perIteration : 0;
   if (iterations < 2 || addressed.size() > std::size(kLoopPointers)) iterations = 0;
   DenseMap<unsigned, uint32_t> pointer;
@@ -1003,7 +1012,7 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
     loopBegin(uint32_t(iterations));
     looped = true;
   }
-  for (int64_t first = 0; first < n; first += batch * 32) {
+  for (int64_t first = 0, count = 0; first < n; first += count * 32) {
     if (looped && first == perIteration) {
       for (unsigned i : addressed) advance(pointer[i], uint32_t(perIteration * 2));
       loopEnd();
@@ -1011,8 +1020,11 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
       first = iterations * perIteration;
       if (first >= n) break;
     }
-    SmallVector<Chunk, 2> chunks;
-    const int64_t count = std::min<int64_t>(batch, (n - first + 31) / 32);
+    SmallVector<Chunk, 4> chunks;
+    // A short tail chunk runs alone: interleaved with full chunks it would switch the vector
+    // length at every instruction.
+    const int64_t full = (n - first) / 32;
+    count = full > 0 ? std::min<int64_t>(batch, full) : 1;
     for (int64_t chunk = 0; chunk < count; ++chunk) {
       const int64_t s = first + chunk * 32;
       chunks.push_back({uint32_t(std::min<int64_t>(32, n - s)), {}});
@@ -1021,8 +1033,8 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
       DenseMap<Value, uint32_t> vreg;
       std::array<bool, 16> used{};
       auto takeV = [&]() -> int {
-        const int begin = pipelineSafe ? int(chunk) * 8 : 0;
-        const int end = pipelineSafe ? begin + 8 : 16;
+        const int begin = int(chunk) * width;
+        const int end = begin + width;
         for (int r = begin; r < end; ++r)
           if (!used[r]) {
             used[r] = true;
@@ -1109,9 +1121,10 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
         release(int(index));
       }
       if (reduction) {
-        if (dotA) word(rform(OP_V_RED, tmpReg, regOf(dotA), regOf(dotB), 0, 3));
-        else word(rform(OP_V_RED, tmpReg, regOf(pre), 0, 0, redFunct));
-        word(rform(OP_S_ALU, accReg, accReg, tmpReg, 0, combFunct));
+        const uint32_t partial = chunk == 0 ? tmpReg : spareScalars[size_t(chunk - 1)];
+        if (dotA) word(rform(OP_V_RED, partial, regOf(dotA), regOf(dotB), 0, 3));
+        else word(rform(OP_V_RED, partial, regOf(pre), 0, 0, redFunct));
+        word(rform(OP_S_ALU, accReg, accReg, partial, 0, combFunct));
       } else if (looped || rowPointers) {
         const uint32_t gp = rowPointers ? rowPointers->lookup(nIn) : pointer.lookup(nIn), value = regOf(result);
         const uint64_t offset = uint64_t(s) * 2;
@@ -1122,7 +1135,7 @@ LogicalResult Codegen::emitTiles(Block &body, unsigned nIn, ArrayRef<bool> vec, 
         instructions.push_back([this, address, value] { vstore(address, value, 2); });
       }
     }
-    if (count == 2) { ++vectorPipelineGroups; vectorPipelinedChunks += 2; }
+    if (count > 1) { ++vectorPipelineGroups; vectorPipelinedChunks += count; }
     // Corresponding instructions in each chunk have identical dependences.
     // Alternate them while preserving the original order within each chunk.
     // Input loads precede output stores; stores retain increasing chunk order.

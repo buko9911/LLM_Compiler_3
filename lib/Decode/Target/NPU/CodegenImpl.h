@@ -375,7 +375,8 @@ private:
                           ArrayRef<uint64_t> base, int64_t n, bool reduction, Value pre, Value dotA, Value dotB,
                           uint32_t redFunct, uint32_t combFunct, Value result, DenseMap<Value, uint32_t> &constReg,
                           DenseMap<Value, uint32_t> &rowReg, DenseMap<Value, uint32_t> &reciprocals,
-                          bool pipelineSafe, uint32_t accReg, uint32_t tmpReg, std::string &err);
+                          bool pipelineSafe, uint32_t accReg, uint32_t tmpReg, ArrayRef<uint32_t> spareScalars,
+                          std::string &err);
 };
 
 } // namespace mlir::hybrid::codegen
