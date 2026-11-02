@@ -94,6 +94,8 @@ ctest --test-dir build -j6 --output-on-failure
 PY=$LP6/toolchain/pyenv-qpim/bin/python
 $PY frontend/export.py --model /home/jongjip/models/qwen-3-4b --tokens 1 --capacity 512 --out ir   # --layers N: 앞 N층만
 #   --tokens 8 --capacity 512: verify(8토큰, cache 있음)   --tokens 64 --capacity 0: prefill(cache 없음, 마지막 위치 logits)
+$PY frontend/compile_model.py --model /home/jongjip/models/qwen-3-4b --max-length 4096 --chunk 64 --verify 8 \
+  --force npu --out programs     # 모델 + max length + chunk + verify → decode·verify·chunk 세 프로그램(모두 L 위치에 attention)
 build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/target.json -o out              # NPU+PIM 자동 분할
 build/bin/npu-compile ir/step.mlir --manifest ir/manifest.json --spec configs/baselines/npu_only_lp6_4ch.json \
   --force=npu -o out-npu                                                                                     # NPU-only
