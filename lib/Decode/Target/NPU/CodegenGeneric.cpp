@@ -15,6 +15,7 @@
 #include "CodegenImpl.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Math/IR/Math.h"
+#include "llvm/ADT/SetVector.h"
 #include <algorithm>
 #include <functional>
 
@@ -194,6 +195,200 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
     if (rowLoop) vloadAt(reg, pointers.lookup(n), uint64_t(rowOffset(n) + byteOffset), kind);
     else vload(reg, bases[n] + uint64_t(byteOffset), kind);
   };
+
+  using Thunk = std::function<void()>;
+  auto typeCode = [&](Type type) { return type.isInteger(1) ? uint32_t(DT_I8) : uint32_t(dtypeOf(type)); };
+  const uint32_t rowLanes = uint32_t(std::min<int64_t>(16, ranges[inner]));
+  auto take = [&](std::array<bool, 16> &regs, uint32_t begin, uint32_t end) -> FailureOr<uint32_t> {
+    for (uint32_t r = begin; r < end; ++r)
+      if (!regs[r]) { regs[r] = true; return r; }
+    err = "typed generic: out of vector registers";
+    return failure();
+  };
+  // One body operation as instructions (thunks, so that chunks can be interleaved).
+  auto opWords = [&](Operation *op, uint32_t dst, ArrayRef<uint32_t> args, uint32_t lanes,
+                     SmallVectorImpl<Thunk> &out) -> LogicalResult {
+    const uint32_t dtype = typeCode(op->getOperand(0).getType());
+    auto vector = [&](uint32_t code, uint32_t type, uint32_t d, uint32_t a, uint32_t b = 0, uint32_t c = 0) {
+      auto record = typedVector(code, type, d, a, b, c, lanes);
+      out.push_back([this, record] { rec(record); });
+    };
+    auto binary = [&](uint32_t code) { vector(code, dtype, dst, args[0], args[1]); };
+    auto unary = [&](uint32_t code) { vector(code, dtype, dst, args[0]); };
+    if (isa<arith::AddFOp>(op)) binary(T_ADD);
+    else if (isa<arith::SubFOp>(op)) binary(T_SUB);
+    else if (isa<arith::MulFOp>(op)) binary(T_MUL);
+    else if (isa<arith::MaximumFOp, arith::MaxNumFOp>(op)) binary(T_MAX);
+    else if (isa<arith::MinimumFOp, arith::MinNumFOp>(op)) binary(T_MIN);
+    else if (isa<arith::DivFOp>(op)) {
+      vector(T_RCP, dtype, dst, args[1]);
+      vector(T_MUL, dtype, dst, args[0], dst);
+    } else if (isa<arith::NegFOp>(op)) unary(T_NEG);
+    else if (isa<math::AbsFOp>(op)) unary(T_ABS);
+    else if (isa<math::ExpOp>(op)) unary(T_EXP);
+    else if (isa<math::SqrtOp>(op)) unary(T_SQRT);
+    else if (isa<math::RsqrtOp>(op)) unary(T_RSQRT);
+    else if (isa<arith::ExtFOp>(op)) unary(T_CAST_F32);
+    else if (isa<arith::TruncFOp>(op)) unary(T_CAST_F16);
+    else if (auto compare = dyn_cast<arith::CmpFOp>(op)) {
+      switch (compare.getPredicate()) {
+      case arith::CmpFPredicate::OEQ: binary(T_CMP_EQ); break;
+      case arith::CmpFPredicate::OLT: binary(T_CMP_LT); break;
+      case arith::CmpFPredicate::OLE: binary(T_CMP_LE); break;
+      case arith::CmpFPredicate::OGT: vector(T_CMP_LT, dtype, dst, args[1], args[0]); break;
+      case arith::CmpFPredicate::OGE: vector(T_CMP_LE, dtype, dst, args[1], args[0]); break;
+      default: return fail("unsupported floating-point predicate");
+      }
+    } else if (isa<arith::SelectOp>(op)) {
+      vector(T_SELECT, typeCode(op->getResult(0).getType()), dst, args[1], args[2], args[0]);
+    } else {
+      err = "typed generic: unsupported operation " + op->getName().getStringRef().str();
+      return failure();
+    }
+    return success();
+  };
+
+  // Row-invariant values: broadcast operands, constants and operations of them only. The ones the
+  // per-chunk work reads (or the result itself) are hoisted out of the chunks when they and their
+  // temporaries need at most half of the 16 vector registers.
+  DenseSet<Value> invariant;
+  for (unsigned i = 0; i < inputs; ++i)
+    if (!contiguous[i]) invariant.insert(body.getArgument(i));
+  auto isInvariant = [&](Value v) { return invariant.contains(v) || bool(constValue(v)); };
+  for (Operation *op : operations)
+    if (llvm::all_of(op->getOperands(), isInvariant)) invariant.insert(op->getResult(0));
+  const Value result = reduction ? pre : yielded;
+  llvm::SetVector<Value> needed;
+  for (Operation *op : operations)
+    if (!invariant.contains(op->getResult(0)))
+      for (Value v : op->getOperands())
+        if (isInvariant(v)) needed.insert(v);
+  if (isInvariant(result)) needed.insert(result);
+  bool hoist = !needed.empty();
+  if (hoist) {
+    DenseSet<Value> lifted;
+    std::function<void(Value)> visit = [&](Value v) {
+      if (!lifted.insert(v).second) return;
+      if (Operation *op = v.getDefiningOp(); op && !constValue(v))
+        for (Value operand : op->getOperands()) visit(operand);
+    };
+    for (Value v : needed) visit(v);
+    hoist = lifted.size() <= 8;
+  }
+  // Interleaving issues later chunks' loads before earlier chunks' stores: only when no input
+  // overlaps the output except at exactly the same coordinates (an in-place update).
+  bool interleave = true;
+  for (unsigned i = 0; i < inputs && interleave; ++i) {
+    if (body.getArgument(i).use_empty()) continue;
+    const View &src = views[i], &dst = views.back();
+    const bool same = addr(src) == addr(dst) && src.shape == dst.shape && src.strides == dst.strides &&
+                      src.eb == dst.eb && maps[i] == maps.back();
+    if (src.space == dst.space && !same &&
+        overlaps(addr(src), addr(src) + spanBytes(src), addr(dst), addr(dst) + spanBytes(dst)))
+      interleave = false;
+  }
+  // Without hoisting a chunk sets the vector length for its broadcast loads; keep those one at a time.
+  if (!hoist && llvm::any_of(rowOperands, [&](unsigned i) { return i < inputs && !contiguous[i]; }))
+    interleave = false;
+
+  // One chunk's instructions in the registers of `pool`; `peak` is the most it holds at once.
+  auto recordChunk = [&](int64_t start, uint32_t lanes, ArrayRef<uint32_t> pool, std::array<bool, 16> &regs,
+                         const DenseMap<Value, uint32_t> &lifted, SmallVectorImpl<Thunk> &out,
+                         uint32_t &peak) -> LogicalResult {
+    DenseMap<Value, uint32_t> registers;
+    uint32_t live = 0;
+    auto allocate = [&]() -> FailureOr<uint32_t> {
+      for (uint32_t r : pool)
+        if (!regs[r]) {
+          regs[r] = true;
+          peak = std::max(peak, ++live);
+          return r;
+        }
+      err = "typed generic: out of vector registers";
+      return failure();
+    };
+    std::function<FailureOr<uint32_t>(Value)> materialize = [&](Value value) -> FailureOr<uint32_t> {
+      if (auto found = lifted.find(value); found != lifted.end()) return found->second;
+      if (auto found = registers.find(value); found != registers.end()) return found->second;
+      auto reg = allocate();
+      if (failed(reg)) return failure();
+      const uint32_t r = *reg;
+      if (auto arg = dyn_cast<BlockArgument>(value)) {
+        if (arg.getOwner() != &body || arg.getArgNumber() >= views.size()) {
+          err = "typed generic: unsupported captured block argument";
+          return failure();
+        }
+        const unsigned n = arg.getArgNumber();
+        const uint32_t kind = views[n].et.isF32() ? 3 : 1;
+        if (contiguous[n]) {
+          const int64_t offset = start * views[n].eb;
+          out.push_back([&, r, n, offset, kind] { loadOperand(r, n, offset, kind); });
+        } else {
+          auto record = typedVector(T_BCAST, typeCode(views[n].et), r, r, 0, 0, lanes);
+          out.push_back([&, r, n, kind, lanes, record] {
+            setVL(1);
+            loadOperand(r, n, 0, kind);
+            setVL(lanes);
+            rec(record);
+          });
+        }
+      } else if (auto constant = constValue(value)) {
+        const uint32_t dtype = typeCode(value.getType());
+        const uint64_t address = uint64_t(poolL1 + vectorConst(*constant, dtype));
+        const uint32_t kind = dtype == DT_F32 ? 3 : dtype == DT_I8 ? 5 : 1;
+        out.push_back([this, r, address, kind] { vload(r, address, kind); });
+      } else {
+        err = "typed generic: operand was not emitted in SSA order";
+        return failure();
+      }
+      registers[value] = r;
+      return r;
+    };
+    auto release = [&](int instruction) {
+      SmallVector<Value> dead;
+      for (auto [value, reg] : registers)
+        if (!lastUse.contains(value) || lastUse.lookup(value) <= instruction) {
+          regs[reg] = false;
+          --live;
+          dead.push_back(value);
+        }
+      for (Value value : dead) registers.erase(value);
+    };
+    for (auto [instruction, op] : llvm::enumerate(operations)) {
+      if (hoist && invariant.contains(op->getResult(0))) continue;
+      SmallVector<uint32_t> args;
+      for (Value operand : op->getOperands()) {
+        auto reg = materialize(operand);
+        if (failed(reg)) return failure();
+        args.push_back(*reg);
+      }
+      auto dst = allocate();
+      if (failed(dst)) return failure();
+      if (failed(opWords(op, *dst, args, lanes, out))) return failure();
+      registers[op->getResult(0)] = *dst;
+      release(int(instruction));
+    }
+    auto value = materialize(result);
+    if (failed(value)) return failure();
+    const uint32_t r = *value;
+    if (reduction) {
+      const bool f32 = pre.getType().isF32();
+      const uint32_t function = combine == 1 ? (f32 ? 4 : 1) : (f32 ? 5 : 2);
+      out.push_back([this, r, function] { emit(rform(OP_V_RED, 3, r, 0, 0, function)); });
+      out.push_back([this, c = combine] { emit(rform(OP_S_ALU, 11, 11, 3, 0, c)); });
+    } else {
+      const uint64_t offset = uint64_t(start * views.back().eb);
+      const uint32_t kind = views.back().et.isF32() ? 4 : 2;
+      if (rowLoop)
+        out.push_back([&, r, offset, kind] {
+          vstoreAt(pointers.lookup(inputs), uint64_t(rowOffset(inputs)) + offset, r, kind);
+        });
+      else
+        out.push_back([&, r, offset, kind] { vstore(bases.back() + offset, r, kind); });
+    }
+    return success();
+  };
+
   SmallVector<int64_t> loopOuter(outer.begin(), outer.begin() + loopFrom);
   LogicalResult status = success();
   forEachOuter(loopOuter, 0, [&](ArrayRef<int64_t> prefix) {
@@ -225,138 +420,111 @@ LogicalResult Codegen::lowerTypedGeneric(linalg::GenericOp g, std::string &err) 
       if (varyingVL) cfg.erase(3);
     }
     for (row = 0; row < bodyRows; ++row) {
-    if (reduction) {
-      if (rowLoop) {
-        noteOutputStoreVectorWork();
-        w.append(rform(OP_V_MEM, 11, pointers.lookup(inputs), 0, 0, 9));
-      } else {
-        sload(11, bases.back());
-      }
-    }
-    for (int64_t start = 0; start < ranges[inner]; start += 16) {
-      const uint32_t lanes = uint32_t(std::min<int64_t>(16, ranges[inner] - start));
-      setVL(lanes);
-      std::array<bool, 16> used{};
-      DenseMap<Value, uint32_t> registers;
-      auto allocate = [&]() -> FailureOr<uint32_t> {
-        for (uint32_t r = 0; r < used.size(); ++r)
-          if (!used[r]) { used[r] = true; return r; }
-        err = "typed generic: out of vector registers";
-        return failure();
-      };
-      auto vector = [&](uint32_t op, uint32_t dtype, uint32_t dst,
-                        uint32_t a, uint32_t b = 0, uint32_t c = 0) {
-        rec(typedVector(op, dtype, dst, a, b, c, lanes));
-      };
-      auto typeCode = [&](Type type) { return type.isInteger(1) ? uint32_t(DT_I8) : uint32_t(dtypeOf(type)); };
-      std::function<FailureOr<uint32_t>(Value)> materialize = [&](Value value) -> FailureOr<uint32_t> {
-        if (auto found = registers.find(value); found != registers.end()) return found->second;
-        auto reg = allocate();
-        if (failed(reg)) return failure();
-        if (auto arg = dyn_cast<BlockArgument>(value)) {
-          if (arg.getOwner() != &body || arg.getArgNumber() >= views.size()) {
-            err = "typed generic: unsupported captured block argument";
-            return failure();
-          }
-          const unsigned n = arg.getArgNumber();
-          uint32_t loadKind = views[n].et.isF32() ? 3 : 1;
-          if (contiguous[n]) loadOperand(*reg, n, start * views[n].eb, loadKind);
-          else {
-            setVL(1);
-            loadOperand(*reg, n, 0, loadKind);
-            setVL(lanes);
-            vector(T_BCAST, typeCode(views[n].et), *reg, *reg);
-          }
-        } else if (auto constant = constValue(value)) {
-          uint32_t dtype = typeCode(value.getType());
-          uint32_t loadKind = dtype == DT_F32 ? 3 : dtype == DT_I8 ? 5 : 1;
-          vload(*reg, uint64_t(poolL1 + vectorConst(*constant, dtype)), loadKind);
-        } else {
-          err = "typed generic: operand was not emitted in SSA order";
-          return failure();
-        }
-        registers[value] = *reg;
-        return *reg;
-      };
-      auto release = [&](int instruction) {
-        SmallVector<Value> dead;
-        for (auto [value, reg] : registers)
-          if (!lastUse.contains(value) || lastUse.lookup(value) <= instruction) {
-            used[reg] = false;
-            dead.push_back(value);
-          }
-        for (Value value : dead) registers.erase(value);
-      };
-      for (auto [instruction, op] : llvm::enumerate(operations)) {
-        SmallVector<uint32_t> args;
-        for (Value operand : op->getOperands()) {
-          auto reg = materialize(operand);
-          if (failed(reg)) { status = failure(); return; }
-          args.push_back(*reg);
-        }
-        auto dst = allocate();
-        if (failed(dst)) { status = failure(); return; }
-        uint32_t dtype = typeCode(op->getOperand(0).getType());
-        auto binary = [&](uint32_t code) { vector(code, dtype, *dst, args[0], args[1]); };
-        auto unary = [&](uint32_t code) { vector(code, dtype, *dst, args[0]); };
-        if (isa<arith::AddFOp>(op)) binary(T_ADD);
-        else if (isa<arith::SubFOp>(op)) binary(T_SUB);
-        else if (isa<arith::MulFOp>(op)) binary(T_MUL);
-        else if (isa<arith::MaximumFOp, arith::MaxNumFOp>(op)) binary(T_MAX);
-        else if (isa<arith::MinimumFOp, arith::MinNumFOp>(op)) binary(T_MIN);
-        else if (isa<arith::DivFOp>(op)) {
-          vector(T_RCP, dtype, *dst, args[1]);
-          vector(T_MUL, dtype, *dst, args[0], *dst);
-        } else if (isa<arith::NegFOp>(op)) unary(T_NEG);
-        else if (isa<math::AbsFOp>(op)) unary(T_ABS);
-        else if (isa<math::ExpOp>(op)) unary(T_EXP);
-        else if (isa<math::SqrtOp>(op)) unary(T_SQRT);
-        else if (isa<math::RsqrtOp>(op)) unary(T_RSQRT);
-        else if (isa<arith::ExtFOp>(op)) unary(T_CAST_F32);
-        else if (isa<arith::TruncFOp>(op)) unary(T_CAST_F16);
-        else if (auto compare = dyn_cast<arith::CmpFOp>(op)) {
-          switch (compare.getPredicate()) {
-          case arith::CmpFPredicate::OEQ: binary(T_CMP_EQ); break;
-          case arith::CmpFPredicate::OLT: binary(T_CMP_LT); break;
-          case arith::CmpFPredicate::OLE: binary(T_CMP_LE); break;
-          case arith::CmpFPredicate::OGT: vector(T_CMP_LT, dtype, *dst, args[1], args[0]); break;
-          case arith::CmpFPredicate::OGE: vector(T_CMP_LE, dtype, *dst, args[1], args[0]); break;
-          default: status = fail("unsupported floating-point predicate"); return;
-          }
-        } else if (isa<arith::SelectOp>(op)) {
-          vector(T_SELECT, typeCode(op->getResult(0).getType()), *dst, args[1], args[2], args[0]);
-        } else {
-          err = "typed generic: unsupported operation " + op->getName().getStringRef().str();
-          status = failure(); return;
-        }
-        registers[op->getResult(0)] = *dst;
-        release(int(instruction));
-      }
-      auto result = materialize(reduction ? pre : yielded);
-      if (failed(result)) { status = failure(); return; }
       if (reduction) {
-        bool f32 = pre.getType().isF32();
-        uint32_t function = combine == 1 ? (f32 ? 4 : 1) : (f32 ? 5 : 2);
-        emit(rform(OP_V_RED, 3, *result, 0, 0, function));
-        emit(rform(OP_S_ALU, 11, 11, 3, 0, combine));
-      } else if (rowLoop) {
-        vstoreAt(pointers.lookup(inputs), uint64_t(rowOffset(inputs) + start * views.back().eb), *result,
-                 views.back().et.isF32() ? 4 : 2);
-      } else {
-        vstore(bases.back() + uint64_t(start * views.back().eb), *result, views.back().et.isF32() ? 4 : 2);
+        if (rowLoop) {
+          noteOutputStoreVectorWork();
+          w.append(rform(OP_V_MEM, 11, pointers.lookup(inputs), 0, 0, 9));
+        } else {
+          sload(11, bases.back());
+        }
       }
-    }
-    if (reduction) {
-      if (rowLoop) {
-        noteOutputStoreVectorWork();
-        w.append(rform(OP_V_MEM, pointers.lookup(inputs), 11, 0, 0, 10));
-      } else {
-        sstore(bases.back(), 11);
+      // Row-invariant values: computed once per row (with the row's vector length) and kept in
+      // registers for all of its chunks.
+      std::array<bool, 16> used{};
+      DenseMap<Value, uint32_t> hoisted;
+      if (hoist) {
+        std::function<LogicalResult(Value)> lift = [&](Value value) -> LogicalResult {
+          if (hoisted.count(value)) return success();
+          auto reg = take(used, 0, 16);
+          if (failed(reg)) return failure();
+          if (auto arg = dyn_cast<BlockArgument>(value)) {
+            const unsigned n = arg.getArgNumber();
+            setVL(1);
+            loadOperand(*reg, n, 0, views[n].et.isF32() ? 3 : 1);
+            setVL(rowLanes);
+            rec(typedVector(T_BCAST, typeCode(views[n].et), *reg, *reg, 0, 0, rowLanes));
+          } else if (auto constant = constValue(value)) {
+            const uint32_t dtype = typeCode(value.getType());
+            setVL(rowLanes);
+            vload(*reg, uint64_t(poolL1 + vectorConst(*constant, dtype)), dtype == DT_F32 ? 3 : dtype == DT_I8 ? 5 : 1);
+          } else {
+            Operation *op = value.getDefiningOp();
+            SmallVector<uint32_t> args;
+            for (Value operand : op->getOperands()) {
+              if (failed(lift(operand))) return failure();
+              args.push_back(hoisted.lookup(operand));
+            }
+            SmallVector<Thunk> words;
+            if (failed(opWords(op, *reg, args, rowLanes, words))) return failure();
+            for (Thunk &word : words) word();
+          }
+          hoisted[value] = *reg;
+          return success();
+        };
+        for (Value value : needed)
+          if (failed(lift(value))) { status = failure(); return; }
+        SmallVector<Value> temporaries;   // values only the hoisted ones read
+        for (auto [value, reg] : hoisted)
+          if (!needed.contains(value)) temporaries.push_back(value);
+        for (Value value : temporaries) {
+          used[hoisted.lookup(value)] = false;
+          hoisted.erase(value);
+        }
       }
-    }
-    if (rowLoop)
-      for (unsigned i : rowOperands)
-        if (rowBytes[i] && perRowAdvance(i)) advance(pointers[i], uint32_t(rowBytes[i]));
+      // Chunks: B full chunks at a time, each in its own register range, their instructions
+      // interleaved one by one so that a chunk's dependent operations overlap the others'. B is
+      // the free registers over the registers one chunk needs at its peak. A reduction keeps its
+      // per-chunk V_REDUCE and scalar accumulation in chunk order (the same sums as one at a time).
+      SmallVector<uint32_t> spareRegs;
+      for (uint32_t r = 0; r < 16; ++r)
+        if (!used[r]) spareRegs.push_back(r);
+      const uint32_t spare = uint32_t(spareRegs.size());
+      int64_t batchLimit = 1;
+      if (interleave && spare > 0) {
+        SmallVector<Thunk> probe;
+        uint32_t peak = 0;
+        std::array<bool, 16> scratch = used;
+        if (failed(recordChunk(0, rowLanes, spareRegs, scratch, hoisted, probe, peak))) { status = failure(); return; }
+        batchLimit = std::max<int64_t>(1, int64_t(spare / std::max<uint32_t>(peak, 1)));
+      }
+      for (int64_t start = 0; start < ranges[inner];) {
+        const uint32_t lanes = uint32_t(std::min<int64_t>(16, ranges[inner] - start));
+        const int64_t batch = lanes == 16 ? std::min<int64_t>(batchLimit, (ranges[inner] - start) / 16) : 1;
+        const uint32_t width = batch > 1 ? spare / uint32_t(batch) : spare;
+        setVL(lanes);
+        SmallVector<SmallVector<Thunk>> lists(batch);
+        for (int64_t b = 0; b < batch; ++b) {
+          std::array<bool, 16> scratch = used;
+          uint32_t peak = 0;
+          ArrayRef<uint32_t> pool = ArrayRef<uint32_t>(spareRegs).slice(size_t(b) * width, width);
+          if (failed(recordChunk(start + 16 * b, lanes, pool, scratch, hoisted, lists[b], peak))) {
+            status = failure();
+            return;
+          }
+        }
+        const size_t count = lists.front().size(), tail = reduction ? 2 : 0;
+        if (llvm::all_of(lists, [&](auto &list) { return list.size() == count; })) {
+          for (size_t i = 0; i + tail < count; ++i)
+            for (auto &list : lists) list[i]();
+          for (auto &list : lists)
+            for (size_t i = count - tail; i < count; ++i) list[i]();
+        } else {
+          for (auto &list : lists)
+            for (Thunk &word : list) word();
+        }
+        start += 16 * batch;
+      }
+      if (reduction) {
+        if (rowLoop) {
+          noteOutputStoreVectorWork();
+          w.append(rform(OP_V_MEM, pointers.lookup(inputs), 11, 0, 0, 10));
+        } else {
+          sstore(bases.back(), 11);
+        }
+      }
+      if (rowLoop)
+        for (unsigned i : rowOperands)
+          if (rowBytes[i] && perRowAdvance(i)) advance(pointers[i], uint32_t(rowBytes[i]));
     }
     if (rowLoop) {
       for (unsigned i : rowOperands)
