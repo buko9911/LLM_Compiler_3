@@ -43,9 +43,10 @@ double oneCoreCycles(Operation *op, const TargetSpec &target) {
   if (auto g = dyn_cast<linalg::GenericOp>(op)) return cost::genericCycles(target.npu, g);
   auto elements = [](Value v) { return double(cast<ShapedType>(v.getType()).getNumElements()); };
   if (auto q = dyn_cast<hyb::QuantOp>(op)) return elements(q->getOperand(0)) * cost::quantCyclesPerElement(target.npu);
-  if (auto t = dyn_cast<linalg::TransposeOp>(op))
-    return elements(t.getInit()) *
-           cost::copyCyclesPerElement(target.npu, cast<ShapedType>(t.getInit().getType()).getElementTypeBitWidth() / 8);
+  if (auto t = dyn_cast<linalg::TransposeOp>(op)) {
+    auto type = cast<ShapedType>(t.getInit().getType());
+    return cost::transposeCycles(target.npu, type.getShape(), t.getPermutation(), type.getElementTypeBitWidth() / 8);
+  }
   return 0;
 }
 

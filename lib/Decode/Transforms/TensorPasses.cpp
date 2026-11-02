@@ -66,6 +66,8 @@ struct HybAnnotatePass : mlir::hybrid::impl::HybAnnotateBase<HybAnnotatePass> {
       if (auto layer = o->getInteger("layer"))
         step.setArgAttr(i, "hyb.layer", IntegerAttr::get(IntegerType::get(ctx, 64), *layer));
       if (auto dtype = o->getString("dtype")) step.setArgAttr(i, "hyb.dtype", str(*dtype));
+      // How the host's array is laid out in the argument (e.g. a K cache stored [KVH, D, P]).
+      if (auto layout = o->getString("layout")) step.setArgAttr(i, "hyb.layout", str(*layout));
     }
     for (auto [i, r] : llvm::enumerate(*results)) {
       llvm::json::Object *o = r.getAsObject();

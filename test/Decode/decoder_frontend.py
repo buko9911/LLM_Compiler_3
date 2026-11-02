@@ -9,7 +9,7 @@ import torch
 from transformers import LlamaConfig, LlamaForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "frontend"))
-from decoder import DecoderDims, DecodeStep, rope_tables, step_mask, weight_names
+from decoder import DecoderDims, DecodeStep, rope_tables, step_mask, weight_names, step_cache
 from prefill import prefill_kv
 
 
@@ -53,7 +53,7 @@ def main():
                 x = hf.model.embed_tokens(new)[0]
                 cos, sin = rope_tables(d, list(range(5, 5 + m)))
                 got, nk, nv = DecodeStep(d, m, 7)(x, cos, sin, step_mask(m, 7, 5),
-                                                list(pk), list(pv), weights)
+                                                list(step_cache(pk)), list(pv), weights)
                 torch.testing.assert_close(got, ref.logits[0, -m:], rtol=2e-5, atol=2e-5)
                 for i in range(d.layers):
                     torch.testing.assert_close(nk[i], ref.past_key_values.layers[i].keys[0, :, -m:],

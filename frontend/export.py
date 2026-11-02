@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from torch_mlir import fx
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from decoder import DecoderDims, DecodeStep, weight_names
+from decoder import DecoderDims, DecodeStep, weight_names, K_CACHE_LAYOUT
 import qwen35
 
 ap = argparse.ArgumentParser()
@@ -36,7 +36,8 @@ R = d.rope_dim if hybrid else D                                  # rotary dims (
 x, cos, sin, mask = meta(M, H), meta(M, R), meta(M, R), meta(M, P + M)
 kv_layers = d.attention_layers() if hybrid else list(range(d.layers))
 gdn_layers = d.gdn_layers() if hybrid else []
-pk = [meta(KVH, P, D) for _ in kv_layers] if P else []
+# Qwen3/Llama store K as [KVH, D, P] (decoder.K_CACHE_LAYOUT); the Qwen3.5 step keeps [KVH, P, D].
+pk = [meta(KVH, P, D) if hybrid else meta(KVH, D, P) for _ in kv_layers] if P else []
 pv = [meta(KVH, P, D) for _ in kv_layers] if P else []
 conv = [meta(d.conv_kernel - 1, d.conv_dim) for _ in gdn_layers]
 state = [meta(d.v_heads, d.v_dim, d.k_dim) for _ in gdn_layers]
@@ -56,7 +57,9 @@ a.out.mkdir(parents=True, exist_ok=True)
 (a.out / "step.mlir").write_text(module.operation.get_asm(print_generic_op_form=False, large_elements_limit=16))
 args = [dict(kind="input", name=n, shape=list(t.shape)) for n, t in (("x", x), ("cos", cos), ("sin", sin), ("mask", mask))]
 if P:
-    args += [dict(kind="state", name=f"past_k.{i}", layer=i, shape=[KVH, P, D]) for i in kv_layers]
+    args += [dict(kind="state", name=f"past_k.{i}", layer=i, shape=[KVH, P, D]) if hybrid else
+             dict(kind="state", name=f"past_k.{i}", layer=i, shape=[KVH, D, P], layout=K_CACHE_LAYOUT)
+             for i in kv_layers]
     args += [dict(kind="state", name=f"past_v.{i}", layer=i, shape=[KVH, P, D]) for i in kv_layers]
 # GDN layers: the last K-1 conv inputs (FP16 like the activations) and the FP32 recurrent state.
 args += [dict(kind="state", name=f"conv.{i}", layer=i, shape=[d.conv_kernel - 1, d.conv_dim]) for i in gdn_layers]

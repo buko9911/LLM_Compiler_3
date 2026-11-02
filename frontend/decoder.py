@@ -8,7 +8,11 @@ decode (M = 1), verify (M > 1 against the cache, e.g. a speculative block) and p
   inputs   x        [M, H]              token embeddings (the host gathers the rows)
            cos, sin [M, D]              rotary tables of the M positions (host)
            mask     [M, P + M]          additive attention mask (0 or MASK_MIN; host)
-           past_k/v [NL][KVH, P, D]     KV cache, P = cache capacity (read only in the step)
+           past_k   [NL][KVH, D, P]     K cache, P = cache capacity (read only in the step). Keys are
+                                        columns, so Q·Kᵀ is a plain matmul on the NPU (no transpose
+                                        of K, Q or the scores; NPU LLM runtimes store K this way).
+                                        Host code keeps [KVH, P, D] and converts with step_cache().
+           past_v   [NL][KVH, P, D]     V cache
            weights  as named tensors    (see weight_names)
   outputs  logits   [M, V]
            new_k/v  [NL][KVH, M, D]     K/V rows of the M tokens; the host writes them into
@@ -27,6 +31,12 @@ from pathlib import Path
 import torch
 
 MASK_MIN = -30000.0      # additive mask for invalid positions (finite in FP16)
+K_CACHE_LAYOUT = "kvh_d_p"   # past_k as stored by the step: [KVH, D, P] (manifest/io.json "layout")
+
+
+def step_cache(k):
+    """A host K cache [KVH, P, D] (or a stack [NL, KVH, P, D]) in the step's layout [.., D, P]."""
+    return k.transpose(-1, -2)
 
 
 @dataclass
@@ -153,12 +163,12 @@ class DecodeStep(torch.nn.Module):
             v = v.transpose(0, 1)
             new_k.append(k); new_v.append(v)
             if self.P:
-                K = torch.cat((past_k[i], k), dim=1)       # [KVH, P + M, D]
+                KT = torch.cat((past_k[i], k.transpose(1, 2)), dim=2)   # [KVH, D, P + M]
                 V = torch.cat((past_v[i], v), dim=1)
             else:                                          # prefill from an empty cache
-                K, V = k, v
+                KT, V = k.transpose(1, 2), v
             qg = q.transpose(0, 1).reshape(KVH, G * M, D)  # query rows of a KV group: head-major
-            sc = (qg @ K.transpose(1, 2)) * (1.0 / D ** 0.5)
+            sc = (qg @ KT) * (1.0 / D ** 0.5)
             sc = sc.reshape(KVH, G, M, -1) + mask          # mask [M, P + M] broadcast
             p = torch.softmax(sc, dim=-1).reshape(KVH, G * M, -1)
             o = (p @ V).reshape(QH, M, D).transpose(0, 1).reshape(M, QH * D)

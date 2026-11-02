@@ -20,7 +20,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "frontend"))
-from decoder import DecoderDims, DecodeStep, weight_names, rope_tables, step_mask  # noqa: E402
+from decoder import DecoderDims, DecodeStep, weight_names, rope_tables, step_mask, step_cache  # noqa: E402
 from weights import SafetensorStore  # noqa: E402
 from prefill import prefill_kv  # noqa: E402
 
@@ -106,6 +106,8 @@ class Device:
 
     def write(self, name: str, array: np.ndarray):
         a = self.args[name]
+        if a.get("layout") == "kvh_d_p":           # host K caches are [KVH, P, D]; stored [KVH, D, P]
+            array = np.swapaxes(np.asarray(array), 1, 2)
         data = np.ascontiguousarray(array, dtype=DT[a["dtype"]]).reshape(a["shape"])
         assert data.nbytes == a["bytes"], (name, data.nbytes, a["bytes"])
         with open(self.out / "lp6.bin", "r+b") as f:
@@ -268,7 +270,7 @@ def main():
             cm = torch.tensor(mask)
             for name, stepm in refs.items():
                 with torch.no_grad():
-                    rl, rk, rv = stepm(xin, cos, sin, cm, [torch.tensor(K[i]) for i in range(d.layers)],
+                    rl, rk, rv = stepm(xin, cos, sin, cm, [step_cache(torch.tensor(K[i])) for i in range(d.layers)],
                                        [torch.tensor(V[i]) for i in range(d.layers)], reference_weights(name == "w8a8"))
                 rl = rl[0].numpy()
                 rel = np.linalg.norm(logits - rl) / np.linalg.norm(rl)

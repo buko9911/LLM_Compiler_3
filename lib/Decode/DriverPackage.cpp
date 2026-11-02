@@ -85,6 +85,7 @@ json::Array driver::argumentsJSON(func::FuncOp step) {
                    {"dtype", dtypeName(cast<ShapedType>(a.getType()).getElementType())},
                    {"shape", shapeOf(a.getType())}};
     if (auto layer = step.getArgAttrOfType<IntegerAttr>(a.getArgNumber(), "hyb.layer")) o["layer"] = layer.getInt();
+    if (auto layout = step.getArgAttrOfType<StringAttr>(a.getArgNumber(), "hyb.layout")) o["layout"] = layout.str();
     args.push_back(std::move(o));
   }
   return args;

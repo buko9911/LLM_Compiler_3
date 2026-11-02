@@ -101,6 +101,22 @@ double cost::copyCyclesPerElement(const TargetSpec::Npu &npu, int64_t bytes) {
   return double(bytes) / double(npu.l1ReadBytesPerCycle) + double(bytes) / double(npu.l1WriteBytesPerCycle);
 }
 
+double cost::transposeCycles(const TargetSpec::Npu &npu, ArrayRef<int64_t> outputShape, ArrayRef<int64_t> permutation,
+                             int64_t elementBytes) {
+  if (outputShape.empty()) return 0.0;
+  double elements = 1.0;
+  for (int64_t d : outputShape) elements *= double(d);
+  const int64_t rank = int64_t(outputShape.size());
+  const bool innerKept = permutation.empty() || permutation.back() == rank - 1;
+  const double runElements = innerKept ? double(outputShape.back()) : 1.0;
+  const double runBytes = runElements * double(elementBytes);
+  const double port = double(std::min(npu.l1ReadBytesPerCycle, npu.l1WriteBytesPerCycle));
+  const double runs = elements / runElements;
+  // Kept innermost axis: one command per row of the next axis; moved: one per output row.
+  const double commands = innerKept ? runs / double(rank > 1 ? outputShape[rank - 2] : 1) : elements / double(outputShape.back());
+  return runs * std::max(1.0, std::ceil(runBytes / port)) + 2.0 * commands;
+}
+
 void cost::recordDecision(func::FuncOp phase, StringRef kind, StringRef op, StringRef choice,
                           ArrayRef<std::pair<StringRef, double>> numbers) {
   MLIRContext *ctx = phase.getContext();

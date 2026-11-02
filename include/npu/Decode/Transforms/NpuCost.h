@@ -50,6 +50,14 @@ double dequantCyclesPerElement(const TargetSpec::Npu &npu);
 /// Cycles per element of a layout copy of `bytes`-wide elements through L1 (read and write).
 double copyCyclesPerElement(const TargetSpec::Npu &npu, int64_t bytes);
 
+/// Cycles of an L1 transpose (a strided L1 copy). The backend copies one row of the output's
+/// innermost axis per command; each contiguous run is one L1 access (at least a cycle, more for
+/// runs wider than the L1 port), and a command costs two cycles to issue. A permutation that keeps
+/// the innermost axis moves whole rows; one that moves it copies element by element (measured on
+/// the simulator: 1 cycle per 2-byte element plus 2 per command).
+double transposeCycles(const TargetSpec::Npu &npu, ArrayRef<int64_t> outputShape, ArrayRef<int64_t> permutation,
+                       int64_t elementBytes);
+
 /// Splitting work of `cycles` on one core over `cores` cores saves (1 - 1/cores) of it; it pays when
 /// that saving exceeds the fixed cost of a split (coreSplitUs).
 inline double splitSavingUs(const TargetSpec::Npu &npu, double cycles, int64_t cores) {

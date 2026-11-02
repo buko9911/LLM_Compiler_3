@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from decoder import DecoderDims, DecodeStep, weight_names, rope_tables, step_mask
+from decoder import DecoderDims, DecodeStep, weight_names, rope_tables, step_mask, step_cache
 from weights import SafetensorStore
 
 ap = argparse.ArgumentParser()
@@ -40,7 +40,7 @@ cos, sin = rope_tables(d, [T - 1])
 x = W[-1][ids[0, -1]][None] if d.tied else store.get("model.embed_tokens.weight").float()[ids[0, -1]][None]
 step = DecodeStep(d, 1, P)
 with torch.no_grad():
-    logits, nk, nv = step(x, cos, sin, step_mask(1, P, T - 1), list(pk), list(pv), W)
+    logits, nk, nv = step(x, cos, sin, step_mask(1, P, T - 1), list(step_cache(pk)), list(pv), W)
 full = ref.past_key_values
 err = (logits[0] - ref.logits[0, -1]).abs().max().item() / ref.logits[0, -1].abs().max().item()
 kerr = max((nk[i][:, 0] - full.layers[i].keys[0, :, -1]).abs().max().item() for i in range(d.layers))
