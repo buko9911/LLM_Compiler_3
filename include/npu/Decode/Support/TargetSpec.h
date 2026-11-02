@@ -53,9 +53,6 @@ struct TargetSpec {
     // Ring slots in the L2 staging window; zero removes the cap (capacity and trip count still bound it).
     int64_t weightStreamMaxSlots = 8;
     int64_t inputTileColumns = 128;        // hyb-npu-input-pipeline: columns per pipelined input tile
-    // hyb-npu-flash-attention: query and key tile of the online softmax (used when the full-row
-    // attention does not fit, NpuFlashAttention.cpp).
-    int64_t attentionQueryTile = 32, attentionKeyTile = 128;
 
     // ---- backend scheduling -------------------------------------------------------------------------
     // Per-core weight-stream GDMA commands in flight within a phase; zero is unlimited. Small staged

@@ -128,9 +128,9 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 - projection을 합칠지, GEMV 코어 몫을 열 묶음으로 나눌지: L1에 들어가는지로.
 
 target 파일(`configs/baselines/npu_only_lp6_4ch.json`, NPU+PIM은 `configs/target.json`)에는 하드웨어 수치만 둔다. 하드웨어 수치가
-아닌 키(옛 스위치 등)는 오류다. 아직 고정값으로 남은 정수(`gemv_tile_bytes`, `l2_staging_bytes_per_core`(0이면 phase마다 남는
-L2로), `weight_stream_max_slots`, `input_tile_columns`, `attention_query_tile`, `attention_key_tile`, `gdma_lookahead`,
-`staging_misc_bytes`)는 `include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 있다. step은 export의 `--tokens`/`--capacity`로만
+아닌 키(옛 스위치 등)는 오류다. online softmax의 query·key 조각은 L1 용량으로 정한다(head 하나의 query 행 전체, 그다음 들어가는
+가장 큰 key 조각). 아직 고정값으로 남은 정수(`gemv_tile_bytes`, `l2_staging_bytes_per_core`(0이면 phase마다 남는
+L2로), `weight_stream_max_slots`, `input_tile_columns`, `gdma_lookahead`, `staging_misc_bytes`)는 `include/npu/Decode/Support/TargetSpec.h`에 기본값과 함께 있다. step은 export의 `--tokens`/`--capacity`로만
 정해진다. 측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`, 스위치가 있던 때(2026-11-02 이전)의 스위치별 기여는
 `../../docs/architecture/COMPILER.md` 부록 A에 있다.
 

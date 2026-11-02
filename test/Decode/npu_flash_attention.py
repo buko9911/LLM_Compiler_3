@@ -163,7 +163,6 @@ def main():
         source = output / f"{name}.mlir"
         source.write_text(text)
         target = json.loads((root / "configs/target.json").read_text())
-        target["npu"].update(attention_query_tile=2, attention_key_tile=8)
         target["npu"].update(config_options)
         target_file = output / f"{name}.json"
         target_file.write_text(json.dumps(target, indent=2))
@@ -221,7 +220,7 @@ def main():
     source = output / "online_gqa_mask_tail.mlir"
     for name, overrides in invalid:
         target = json.loads((root / "configs/target.json").read_text())
-        target["npu"].update(attention_query_tile=2, attention_key_tile=8, **small)
+        target["npu"].update(**small)
         target["npu"].update(overrides)
         target_file = output / f"invalid_{name}.json"
         target_file.write_text(json.dumps(target, indent=2))

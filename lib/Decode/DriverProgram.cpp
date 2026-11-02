@@ -51,7 +51,7 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
   // Passes, in pipeline order.
   report["projection_fusion"] = json::Object{{"groups", count("hyb.projection_fusions")}};
   if (auto attr = phase->getAttrOfType<DictionaryAttr>("hyb.flash_attention")) {
-    json::Object flash{{"query_tile", spec.npu.attentionQueryTile}, {"key_tile", spec.npu.attentionKeyTile}};
+    json::Object flash;
     for (NamedAttribute field : attr) {
       if (auto value = dyn_cast<IntegerAttr>(field.getValue())) flash[field.getName().str()] = value.getInt();
       else if (auto value = dyn_cast<StringAttr>(field.getValue()))

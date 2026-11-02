@@ -67,8 +67,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       "l1_read_bytes_per_cycle", "l1_write_bytes_per_cycle", "mma_k_per_cycle", "mma_pipeline_cycles",
       "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps",
       "core_split_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
-      "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns",
-      "attention_query_tile", "attention_key_tile"};
+      "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
   if (n)
     for (auto &kv : *n) {
       llvm::StringRef key = kv.first;
@@ -95,10 +94,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     dst = *value;
     return true;
   };
-  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns) ||
-      !positiveIntegerOption("attention_query_tile", s.npu.attentionQueryTile) ||
-      !positiveIntegerOption("attention_key_tile", s.npu.attentionKeyTile))
-    return failure();
+  if (!positiveIntegerOption("input_tile_columns", s.npu.inputTileColumns)) return failure();
   if (s.npu.stagingMiscBytes < 0 || s.npu.stagingMiscBytes % 64) {
     error = "npu.staging_misc_bytes must be a nonnegative multiple of 64";
     return failure();

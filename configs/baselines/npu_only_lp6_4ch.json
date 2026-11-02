@@ -24,8 +24,6 @@
   "gemv_tile_bytes": 131072,
   "completion_event_slots": 65536,
   "weight_stream_max_slots": 0,
-  "attention_query_tile": 32,
-  "attention_key_tile": 128,
   "input_tile_columns": 128,
   "gdma_lookahead": 2,
   "staging_misc_bytes": 65536

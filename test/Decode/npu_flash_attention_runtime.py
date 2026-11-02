@@ -8,7 +8,7 @@ never hardware measurements or complete language-model throughput.
 """
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
@@ -63,6 +63,9 @@ CASES = (
 PERFORMANCE_CASES = (
     Case("long_decode_h1", 1, 4, 1, 4096, 32, key_tile=128, query_tile=32),
     Case("long_decode_h8", 8, 4, 1, 4096, 32, key_tile=128, query_tile=32),
+    # Qwen3-4B attention of a 64-token chunk (8 KV heads, 4 query heads each, depth 128) over a short
+    # cache, small enough for a full timeline.
+    Case("qwen3_chunk64_short", 8, 4, 64, 192, 128, kv_prefix=128),
 )
 ALL_CASES = CASES + PERFORMANCE_CASES
 
@@ -240,11 +243,17 @@ def make_spec(root, mode, case):
     1 MiB L2, smaller than a three-slot weight ring per core, so the compiler chooses online softmax
     (and, with fewer KV heads than the 4 cores, splits the keys over the idle cores)."""
     target = json.loads((root / "configs/target.json").read_text())
-    target["npu"].update(attention_query_tile=case.query_tile, attention_key_tile=case.key_tile,
-                         l2_staging_bytes_per_core=0)
+    target["npu"].update(l2_staging_bytes_per_core=0)
     if mode == "online":
         target["npu"]["l2_bytes"] = 1 << 20
     return target
+
+
+def compiled_key_tile(io):
+    """The key tile the compiler chose from L1 (the "online softmax tiles" decision)."""
+    tiles = [d["key_tile"] for phase in io["phases"] for d in phase.get("decisions", [])
+             if d["kind"] == "online softmax tiles"]
+    return int(tiles[0]) if tiles else None
 
 
 def online_splits(case, cores=4):
@@ -411,8 +420,9 @@ def main():
                     "total_us": timing["total_simulated_cycles"] / timing["npu_clock_mhz"],
                     "wall_seconds": wall, "fp64_reference": errors(actual, expected),
                     "dense_rounded_score_reference": errors(actual, contracted),
-                    "online_contract_reference": errors(actual, online_contract_reference(inputs, case, online_splits(case)),
-                                                        ONLINE_ATOL, ONLINE_RTOL),
+                    "online_contract_reference": errors(actual, online_contract_reference(
+                        inputs, replace(case, key_tile=compiled_key_tile(io) or case.key_tile), online_splits(case)),
+                        ONLINE_ATOL, ONLINE_RTOL),
                     "legacy_reference": errors(actual, legacy), "elements": int(actual.size),
                     "lp6_read_bytes": timing["lp6_bytes_read"], "lp6_write_bytes": timing["lp6_bytes_written"],
                     "l1_peak_bytes": max(phase.get("l1_peak", 0) for phase in io["phases"]),

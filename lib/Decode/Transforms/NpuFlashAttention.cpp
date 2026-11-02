@@ -336,8 +336,10 @@ struct KVSegment {
 
 class OnlineEmitter {
 public:
-  OnlineEmitter(IRRewriter &rewriter, Attention &attention, const TargetSpec &target, int64_t splits)
-      : b(rewriter), a(attention), t(target), loc(a.pv.getLoc()), ctx(b.getContext()), splits(splits) {}
+  OnlineEmitter(IRRewriter &rewriter, Attention &attention, const TargetSpec &target, int64_t splits,
+                int64_t queryTile, int64_t keyTile)
+      : b(rewriter), a(attention), t(target), loc(a.pv.getLoc()), ctx(b.getContext()), splits(splits),
+        queryTile(queryTile), keyTile(keyTile) {}
 
   Value emit() {
     segments.push_back({a.qk.getDpsInputs()[1], a.pv.getDpsInputs()[1], a.keys, 0});
@@ -427,7 +429,7 @@ private:
   const TargetSpec &t;
   Location loc;
   MLIRContext *ctx;
-  int64_t splits, headCores = 1, headsPerCore = 1;
+  int64_t splits, queryTile, keyTile, headCores = 1, headsPerCore = 1;
   SmallVector<KVSegment, 2> segments;
 
   void findKVSegments() {
@@ -533,16 +535,16 @@ private:
       // Pack complete GQA groups when the query sequence is short. The score
       // view remains [1, Gtile, M, Ktile], so one token mask is broadcast to
       // every group while the SA sees Gtile*M rows rather than tiny M rows.
-      if (a.groups > 1 && a.tokens <= t.npu.attentionQueryTile) {
-        int64_t groupsPerTile = std::max<int64_t>(1, t.npu.attentionQueryTile / a.tokens);
+      if (a.groups > 1 && a.tokens <= queryTile) {
+        int64_t groupsPerTile = std::max<int64_t>(1, queryTile / a.tokens);
         for (int64_t group = 0; group < a.groups; group += groupsPerTile) {
           int64_t groupCount = std::min(groupsPerTile, a.groups - group);
           fn(add(first, h), h, group, 0, groupCount * a.tokens);
         }
       } else {
         for (int64_t group = 0; group < a.groups; ++group)
-          for (int64_t query = 0; query < a.tokens; query += t.npu.attentionQueryTile)
-            fn(add(first, h), h, group, query, std::min(t.npu.attentionQueryTile, a.tokens - query));
+          for (int64_t query = 0; query < a.tokens; query += queryTile)
+            fn(add(first, h), h, group, query, std::min(queryTile, a.tokens - query));
       }
     }
   }
@@ -748,7 +750,7 @@ private:
 
   State run(const KVSegment &segment, Value head, int64_t group, int64_t query, int64_t count,
             Value start, int64_t length, State state) {
-    int64_t tileSize = t.npu.attentionKeyTile;
+    int64_t tileSize = keyTile;
     int64_t full = length / tileSize;
     if (full) {
       auto loop = scf::ForOp::create(b, loc, index(0), index(full), index(1),
@@ -794,6 +796,36 @@ bool fullRowFits(func::FuncOp fn, const Attention &a, const TargetSpec &t) {
   return fits;
 }
 
+/// Query and key tile of the online softmax, from a core's L1. Every query tile reads all keys and
+/// values of its head again, so the query tile takes every query row of a KV head (all GQA groups
+/// of the M tokens) when it fits; then the key tile, whose rescale of the output and per-tile fixed
+/// cost are paid once per tile, is the largest of 512, 256, ..., 32 keys that fits. The working set
+/// of one key tile (memplan double-buffers the loop's buffers): the K and V tiles, the score, mask,
+/// FP32 and FP16 probability tiles, and per query row the Q row, the running output, the PV product
+/// and its init. It must fit half of the free L1; the other half stays for the buffers live around
+/// the attention (activations, the weight stream's L1 slots).
+std::pair<int64_t, int64_t> onlineTiles(func::FuncOp fn, const Attention &a, const TargetSpec &t) {
+  const auto &npu = t.npu;
+  const int64_t budget = (npu.l1Bytes - npu.l1ReservedBytes - 4096) / 2;
+  auto need = [&](int64_t rows, int64_t keys) {
+    return 2 * (keys * (a.depth + a.valueDepth) * 2 + rows * keys * (2 + 2 + 4 + 2)) +
+           rows * (a.depth * 2 + 3 * a.valueDepth * 4);
+  };
+  int64_t rows = a.rows, keys = 32;
+  while (rows > 1 && need(rows, keys) > budget) rows = (rows + 1) / 2;
+  if (rows < a.rows && rows > a.tokens) rows = rows / a.tokens * a.tokens;    // whole groups per tile
+  for (int64_t candidate : {512, 256, 128, 64})
+    if (candidate <= a.keys && need(rows, candidate) <= budget) { keys = candidate; break; }
+  std::string label;
+  llvm::raw_string_ostream os(label);
+  os << "attention " << a.heads << "x" << a.rows << "x" << a.keys << "x" << a.depth;
+  cost::recordDecision(fn, "online softmax tiles", label, std::to_string(rows) + "x" + std::to_string(keys),
+                       {{"query_rows", double(rows)}, {"key_tile", double(keys)},
+                        {"l1_need_kib", double(need(rows, keys)) / 1024.0}, {"l1_budget_kib", double(budget) / 1024.0},
+                        {"query_tiles_per_head", double((a.rows + rows - 1) / rows)}});
+  return {rows, keys};
+}
+
 struct HybNpuFlashAttentionPass
     : mlir::hybrid::impl::HybNpuFlashAttentionBase<HybNpuFlashAttentionPass> {
   using Base::Base;
@@ -815,7 +847,7 @@ struct HybNpuFlashAttentionPass
             (hasExpAncestor(mm.getDpsInputs()[0]) || hasMatmulAncestor(mm.getDpsInputs()[0]))) candidates.push_back(mm);
       });
       IRRewriter rewriter(&getContext());
-      int64_t transformed = 0, segmented = 0, splits = 1;
+      int64_t transformed = 0, segmented = 0, splits = 1, queryRows = 0, keyTile = 0;
       for (auto candidate : llvm::reverse(candidates)) {
         Attention attention;
         if (!attention.match(candidate) || fullRowFits(fn, attention, *target)) continue;
@@ -823,8 +855,9 @@ struct HybNpuFlashAttentionPass
         const int64_t cores = target->npu.cores;
         splits = attention.heads < cores ? std::max<int64_t>(1, cores / attention.heads) : 1;
         while (splits > 1 && attention.keys < splits) --splits;
+        std::tie(queryRows, keyTile) = onlineTiles(fn, attention, *target);
         rewriter.setInsertionPoint(candidate);
-        OnlineEmitter emitter(rewriter, attention, *target, splits);
+        OnlineEmitter emitter(rewriter, attention, *target, splits, queryRows, keyTile);
         rewriter.replaceOp(candidate, emitter.emit());
         segmented += emitter.slicedKV();
         ++transformed;
@@ -839,8 +872,8 @@ struct HybNpuFlashAttentionPass
           rewriter.getNamedAttr("algorithm", rewriter.getStringAttr(splits > 1 ? "flash_decoding" : "flash_attention")),
           rewriter.getNamedAttr("transformed_chains", rewriter.getI64IntegerAttr(transformed)),
           rewriter.getNamedAttr("segmented_kv_chains", rewriter.getI64IntegerAttr(segmented)),
-          rewriter.getNamedAttr("query_tile", rewriter.getI64IntegerAttr(target->npu.attentionQueryTile)),
-          rewriter.getNamedAttr("key_tile", rewriter.getI64IntegerAttr(target->npu.attentionKeyTile)),
+          rewriter.getNamedAttr("query_tile", rewriter.getI64IntegerAttr(queryRows)),
+          rewriter.getNamedAttr("key_tile", rewriter.getI64IntegerAttr(keyTile)),
           rewriter.getNamedAttr("splits", rewriter.getI64IntegerAttr(splits))}));
     }
   }
