@@ -127,10 +127,12 @@ def HybNpuProjectionFusion : Pass<"hyb-npu-projection-fusion", "ModuleOp"> {
 def HybNpuFlashAttention : Pass<"hyb-npu-flash-attention", "ModuleOp"> {
   let summary = "Tile attention with online softmax and optional parallel KV splits (npu.flash_attention)";
   let description = [{
-    Keeps only Q/K tiles and FP32 running maximum, sum and output state on chip. Flash-Decoding
-    (npu.flash_decoding) computes independent KV splits and stably merges their states. This
-    opt-in changes the softmax rounding: it is not a bit-identical replacement for the
-    materialized FP16 path. Unsupported attention is diagnosed.
+    Applied to an attention whose full-row softmax does not fit: the L2 copy of [past; new] K and V
+    with the activations and a three-slot weight ring per core exceeds L2, or a KV head's keys,
+    values and score rows exceed a core's L1 (decision "attention softmax" in io.json). Keeps only
+    Q/K tiles and FP32 running maximum, sum and output state on chip; the query and key tiles are
+    the largest that fit half of the free L1. Its rounding differs from the materialized FP16
+    softmax (FP32 running state). Unsupported attention is diagnosed.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
   let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
@@ -201,7 +203,8 @@ def HybNpuTile : Pass<"hyb-npu-tile", "ModuleOp"> {
       * attention: the last batch_matmul of a chain is tiled over its batch (KV group) dim with
         one scf.forall iteration per core, and its producers (scores, mask, softmax) are fused
         into the loop, so a core runs whole KV groups;
-      * hyb.dequant with at least `npu.dequant_min_elements` elements is split over the cores.
+      * hyb.dequant is split over the cores when the split saves more than `npu.core_split_us`
+        (NpuCost.h splitPays; decision "split dequant").
     Splits are only made when the dimension divides evenly (static shapes throughout).
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
@@ -211,8 +214,9 @@ def HybNpuTile : Pass<"hyb-npu-tile", "ModuleOp"> {
 def HybNpuElementwiseDistribute : Pass<"hyb-npu-elementwise-distribute", "ModuleOp"> {
   let summary = "Split large independent elementwise ops over the cores (npu.elementwise_distribution)";
   let description = [{
-    Top-level, all-parallel FP16 linalg.generic ops with an identity output map and at least
-    `npu.distribute_min_elements` elements are tiled over the cores, preferring an outer axis.
+    Top-level, all-parallel FP16 linalg.generic ops with an identity output map are tiled over the
+    cores, preferring an outer axis, when the split saves more than `npu.core_split_us` (NpuCost.h
+    splitPays).
     Scalar bodies are unchanged; reductions and ops already inside a forall are left alone.
     Not applied to modules with PIM phases.
   }];

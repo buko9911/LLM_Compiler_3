@@ -51,6 +51,7 @@ public:
   /// share a core's window. Aggregate admission is bounded by N * logical cores;
   /// histories are separate because core streams are emitted sequentially.
   uint32_t gdmaLookahead = 0;
+  uint64_t l1Bytes = 4 * 1024 * 1024;  // one core's L1 (target spec npu.l1_bytes; the driver sets it)
   bool commandSchedule = false;  // reorder system commands by their first consumer (the driver sets it)
   struct ScheduleStats {
     uint64_t commands = 0, reordered = 0, redundantEdges = 0;

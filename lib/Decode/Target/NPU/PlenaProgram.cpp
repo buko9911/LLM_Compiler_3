@@ -286,8 +286,7 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
       body = std::move(lowered.value);
       if (!fits(body.size(), 24) || c.logicalCore < 0 || c.logicalCore >= int(isa2::kCoreAny))
         return bad("core block does not fit CORE_BEGIN", id);
-      uint64_t l1 = 4 * 1024 * 1024;
-      auto record = isa2::coreBeginRecord(uint32_t(id), deps, uint32_t(body.size()), uint32_t(c.logicalCore), l1);
+      auto record = isa2::coreBeginRecord(uint32_t(id), deps, uint32_t(body.size()), uint32_t(c.logicalCore), l1Bytes);
       if (!record) return bad(record.error, id);
       out.insert(out.end(), record.value.begin(), record.value.end());
       if (traceOperations) {
