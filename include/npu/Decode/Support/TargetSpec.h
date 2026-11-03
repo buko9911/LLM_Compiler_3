@@ -80,6 +80,9 @@ struct TargetSpec {
     double sweepCK = 0, streamCK = 0;
     /// NPU gather of INT32 PIM outputs (per K piece) and scatter of INT8 activations (per token).
     double readbackGBps = 32, readbackPieceUs = 0, actWriteGBps = 96, actWritePieceUs = 0;
+    /// NPU time per PIM output per token to bring it back and dequantize it (hyb-partition; the NPU
+    /// path dequantizes behind its own GEMV, so this is extra PIM-side work).
+    double readbackNsPerOutput = 0;
     /// Accumulator counts a stream may use (even, 2..16) and the largest split-K.
     std::vector<int> streamAccs = {2, 4, 6, 8, 10, 12, 14, 16};
     int maxSplitK = 8;
