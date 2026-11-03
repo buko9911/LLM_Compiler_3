@@ -295,10 +295,9 @@ std::string Codegen::parallelActivationPlanJSON() const {
 
 /// INT8 activation rows (L1) -> every consuming PU's bank.
 /// Subchannel and bank group sit below the column in the address, so one column of the
-/// 4 bank groups x C subchannels of a bank is colBytes() = 128 C contiguous bytes: when every
-/// subchannel of a rank reads the vector, each packet is copied 4 C times in L1 scratch and
-/// the even-bank PUs (0,2,4,6) and odd-bank PUs (1,3,5,7) take one linear store each.
-/// Other partitions are written per PU.
+/// 4 bank groups x C subchannels of a bank is colBytes() = 128 C contiguous bytes: each packet is
+/// copied 4 C times in L1 scratch and, for every rank that reads the vector, the even-bank PUs
+/// (0,2,4,6) and odd-bank PUs (1,3,5,7) take one linear store each.
 LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &err) {
   if (s.space != kL1 || s.strides.back() != 1) {
     err = "PIM activation copy needs contiguous L1 rows";
@@ -319,18 +318,16 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     err = "PIM activation replication needs one column of L1 scratch and L2 staging";
     return failure();
   }
-  const int64_t dupBytes = colBytes * batchPackets;
   for (auto [m, ai] : llvm::enumerate(acts)) {
     const pim::Activation &a = in.pim->activations[size_t(cast<IntegerAttr>(ai).getInt())];
     uint64_t row = addr(s, int64_t(m) * sRow);
-    std::set<int> ranks, pairRanks;
-    for (int p : a.parts) ranks.insert(in.pim->partRank(p));
-    for (int rk : ranks) {
-      bool both = true;
-      for (int c = 0; c < channels; ++c)
-        both &= std::find(a.parts.begin(), a.parts.end(), rk * channels + c) != a.parts.end();
-      if (both) pairRanks.insert(rk);
-    }
+    // Every rank with a consuming partition takes the whole-column store, also when only some of
+    // its subchannels read the vector: an activation's packet rows are reserved in every partition
+    // (the same rows, PimLayout::baseRows), so the extra copies land in unused slots. Per-PU stores
+    // move 32 B at a time and were 17x slower per byte (Qwen3-4B O and down inputs, 5 of 8
+    // subchannels: 389 KB in 71 us, against 164 KB in 1.7 us for a full rank; measured 2026-11-03).
+    std::set<int> pairRanks;
+    for (int p : a.parts) pairRanks.insert(in.pim->partRank(p));
     if (!pairRanks.empty()) {
       for (int64_t begin = 0; begin < a.packets(); begin += batchPackets) {
         const int64_t count = std::min(batchPackets, a.packets() - begin);
@@ -351,19 +348,6 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
           }
         }
       }
-    }
-    uint64_t single = win + uint64_t(dupBytes);
-    for (int part : a.parts) {
-      if (pairRanks.count(in.pim->partRank(part))) continue;
-      for (int pu = 0; pu < pim::kPUs; ++pu)
-        for (int64_t first = 0; first < a.packets();) {
-          int64_t pk = a.packetBase() + first;
-          int64_t n = std::min(a.packets() - first, pim::kPacketsPerRow - pk % pim::kPacketsPerRow);
-          ldma(row + uint64_t(first * 32), single, uint32_t(32 * n), 1, 0, 0, false);
-          gdmaStore(single, in.pim->activationPacketAddress(a, first, pu, part), 32, uint32_t(n), 32,
-                    uint32_t(colBytes));
-          first += n;
-        }
     }
   }
   return success();
