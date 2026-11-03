@@ -167,6 +167,8 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
   p.computeFirst = int64_t(commands.size());
   const int64_t streams = p.streams(), blocks = p.blocks();
   auto validAccs = [](int a) { return a >= 2 && a <= kAccs && a % 2 == 0; };
+  if (p.k <= 0 || p.k % kKPerSweep)
+    return Result<bool>::failure(p.name + ": PIM stream needs K a multiple of 256");
   if (!validAccs(p.accs) || (p.tailBlocks && !validAccs(p.tailAccs)) || p.splitK < 1 || p.sweeps() % p.splitK)
     return Result<bool>::failure(p.name + ": PIM stream needs an even accumulator count 2..16 and whole-sweep K pieces");
   for (int m = 0; m < p.tokens(); ++m) {

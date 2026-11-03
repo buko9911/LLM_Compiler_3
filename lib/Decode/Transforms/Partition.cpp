@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
+#include "npu/Target/PimLayout.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
@@ -83,6 +84,9 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       // compares the two estimates.
       x.target = x.c.pimUs + x.c.pimBoundaryUs <= x.c.npuUs ? "pim" : "npu";
       x.why = "cost";
+      // A PIM stream reads K in 256-wide sweeps; other K stay on the NPU (any policy or override).
+      bool pimable = true;
+      for (const GemvShape &sh : shapes) pimable = pimable && sh.k > 0 && sh.k % ::npu::pim::kKPerSweep == 0;
       if (specOr->mapping.policy != "cost") {
         x.target = specOr->mapping.policy;
         x.why = "policy";
@@ -98,6 +102,10 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       if (!force.empty()) {
         x.target = force;
         x.why = "force";
+      }
+      if (!pimable && x.target == "pim") {
+        x.target = "npu";
+        x.why = "K not a multiple of 256";
       }
       if (x.target != "npu" && x.target != "pim") {
         module.emitError() << "unknown target '" << x.target << "'";
