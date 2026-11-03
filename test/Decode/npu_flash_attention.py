@@ -86,12 +86,12 @@ def flash_source(*, score_scale=1.0, kv_prefix=0, key_sequence_major=False,
     return source
 
 
-def invoke(optimizer, source, target=None, canonicalize=False):
+def invoke(optimizer, source, target=None, canonicalize=False, mode=None):
     command = [str(optimizer), str(source)]
     if canonicalize:
         command.extend(["--hyb-simplify", "--canonicalize"])
     if target is not None:
-        command.append(f"--hyb-npu-flash-attention=spec={target}")
+        command.append(f"--hyb-npu-flash-attention=spec={target}" + (f" mode={mode}" if mode else ""))
     return subprocess.run(command, text=True, capture_output=True)
 
 
@@ -228,6 +228,30 @@ def main():
         (output / f"invalid_{name}.log").write_text(result.stdout + result.stderr)
         assert result.returncode != 0, (name, "invalid configuration accepted")
         summary["cases"][f"invalid_{name}"] = {"rejected": True, "passed": True}
+
+    # npu-compile --flash-attention: on applies online softmax where the full row fits, off keeps the
+    # full row and fails where it does not fit, any other value is rejected.
+    source = output / "mode.mlir"
+    source.write_text(flash_source(**base))
+    default_target = output / "full_row_fits.json"
+    small_target = output / "online_gqa_mask_tail.json"
+    for name, target_file, mode, ok, transformed in (
+        ("mode_on_full_row_fits", default_target, "on", True, 1),
+        ("mode_auto_full_row_fits", default_target, "auto", True, 0),
+        ("mode_off_full_row_fits", default_target, "off", True, 0),
+        ("mode_on_online", small_target, "on", True, 1),
+        ("mode_off_online", small_target, "off", False, 0),
+        ("mode_invalid", default_target, "yes", False, 0),
+    ):
+        result = invoke(args.optimizer.resolve(), source, target_file, mode=mode)
+        (output / f"{name}.log").write_text(result.stdout + result.stderr)
+        assert (result.returncode == 0) == ok, (name, result.stderr)
+        if ok:
+            count = sum(map(int, re.findall(r"transformed_chains = (\d+) : i64", result.stdout)))
+            assert count == transformed, (name, count)
+        elif mode == "off":
+            assert "--flash-attention=auto or on" in result.stderr, (name, result.stderr)
+        summary["cases"][name] = {"mode": mode, "passed": True}
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
 

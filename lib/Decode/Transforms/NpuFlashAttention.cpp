@@ -777,8 +777,9 @@ private:
 /// appendix A), so online softmax over key tiles, which reads the tiles straight from the cache and
 /// keeps only a running maximum, sum and output, is used when that L2 copy with the activations
 /// around it and a three-slot weight ring per core does not fit L2, or a head's keys, values and
-/// score rows do not fit a core's L1.
-bool fullRowFits(func::FuncOp fn, const Attention &a, const TargetSpec &t) {
+/// score rows do not fit a core's L1. `mode` on / off (npu-compile --flash-attention) overrides the
+/// choice; the record keeps the capacity numbers.
+bool fullRowFits(func::FuncOp fn, const Attention &a, const TargetSpec &t, StringRef mode) {
   const auto &npu = t.npu;
   const int64_t kv = a.heads * a.keys * (a.depth + a.valueDepth) * 2;
   const int64_t activations = a.heads * a.rows * (a.depth + a.valueDepth) * 2;
@@ -790,9 +791,14 @@ bool fullRowFits(func::FuncOp fn, const Attention &a, const TargetSpec &t) {
   std::string label;
   llvm::raw_string_ostream os(label);
   os << "attention " << a.heads << "x" << a.rows << "x" << a.keys << "x" << a.depth;
-  cost::recordDecision(fn, "attention softmax", label, fits ? "full row" : "online (key tiles)",
+  const std::string choice = mode == "on"    ? "online (key tiles; --flash-attention=on)"
+                           : mode == "off"   ? "full row (--flash-attention=off)"
+                           : fits            ? "full row"
+                                             : "online (key tiles)";
+  cost::recordDecision(fn, "attention softmax", label, choice,
                        {{"l2_need_kib", double(l2Need) / 1024.0}, {"l2_kib", double(npu.l2Bytes) / 1024.0},
-                        {"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(npu.l1Bytes) / 1024.0}});
+                        {"l1_need_kib", double(l1Need) / 1024.0}, {"l1_kib", double(npu.l1Bytes) / 1024.0},
+                        {"full_row_fits", fits ? 1.0 : 0.0}});
   return fits;
 }
 
@@ -834,9 +840,19 @@ struct HybNpuFlashAttentionPass
     std::string error;
     auto target = TargetSpec::load(spec, error);
     if (failed(target)) { getOperation().emitError(error); return signalPassFailure(); }
+    if (mode != "auto" && mode != "on" && mode != "off") {
+      getOperation().emitError("flash attention mode must be auto, on or off, not '" + mode + "'");
+      return signalPassFailure();
+    }
     // NPU-only, like hyb-npu-attention-fusion (mixed programs keep the full-row path).
     for (auto fn : getOperation().getOps<func::FuncOp>())
-      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() != "npu") return;
+      if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() != "npu") {
+        if (mode == "on") {
+          getOperation().emitError("--flash-attention=on needs an NPU-only program (this one has PIM phases)");
+          return signalPassFailure();
+        }
+        return;
+      }
     for (auto fn : getOperation().getOps<func::FuncOp>()) {
       auto phase = fn->getAttrOfType<StringAttr>(kPhase);
       if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
@@ -850,7 +866,14 @@ struct HybNpuFlashAttentionPass
       int64_t transformed = 0, segmented = 0, splits = 1, queryRows = 0, keyTile = 0;
       for (auto candidate : llvm::reverse(candidates)) {
         Attention attention;
-        if (!attention.match(candidate) || fullRowFits(fn, attention, *target)) continue;
+        if (!attention.match(candidate)) continue;
+        const bool fits = fullRowFits(fn, attention, *target, mode);
+        if (mode == "off" && !fits) {
+          candidate.emitError("full-row attention does not fit L2 or a core's L1 (decision \"attention softmax\"); "
+                              "it needs --flash-attention=auto or on");
+          return signalPassFailure();
+        }
+        if (mode == "off" || (mode == "auto" && fits)) continue;
         // Flash-Decoding: with fewer KV heads than cores, the keys are split over the idle cores.
         const int64_t cores = target->npu.cores;
         splits = attention.heads < cores ? std::max<int64_t>(1, cores / attention.heads) : 1;

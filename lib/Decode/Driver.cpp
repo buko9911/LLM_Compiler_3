@@ -56,6 +56,10 @@ static cl::opt<std::string> outDir("o", cl::desc("output directory"), cl::Requir
 static cl::opt<std::string> modelDir("model", cl::desc("checkpoint directory (default: the module's hyb.model)"),
                                      cl::init(""));
 static cl::opt<std::string> forceTarget("force", cl::desc("npu | pim: override the partition"), cl::init(""));
+static cl::opt<std::string> flashAttention("flash-attention",
+    cl::desc("auto (default): online-softmax attention only where the full-row attention does not fit "
+             "L2 / L1; on: every attention; off: none (compile error where the full row does not fit)"),
+    cl::init("auto"));
 static cl::list<std::string> mapOverrides("map", cl::desc("substring:target, e.g. --map=o_proj:npu (repeatable)"));
 static cl::opt<bool> noImage("no-image", cl::desc("do not write lp6.bin"), cl::init(false));
 static cl::opt<std::string> weightStorageExport("pim-weight-storage-export",
@@ -85,6 +89,10 @@ double seconds(std::chrono::steady_clock::time_point t0) {
 
 /// Combinations of the experimental PIM options that the driver supports.
 bool checkOptions(bool fixedStorage) {
+  if (flashAttention != "auto" && flashAttention != "on" && flashAttention != "off") {
+    llvm::errs() << "--flash-attention must be auto, on or off\n";
+    return false;
+  }
   if ((pimActivationCores != 1 && pimActivationCores != 4) ||
       (pimActivationCores == 4 &&
        (forceTarget != "pim" || !mapOverrides.empty() || !packetNpu.empty()))) {
@@ -167,7 +175,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
   const std::string fusion =
       "hyb-npu-projection-fusion" + spec + ","                // q/k/v and gate/up -> one GEMV each
       "hyb-npu-rope" + spec + ","                             // rotate-half RoPE per core, head-major
-      "hyb-npu-flash-attention" + spec + ","                  // online softmax where full rows do not fit
+      "hyb-npu-flash-attention{spec=" + specFile + " mode=" + flashAttention + "},"   // online softmax (--flash-attention)
       "hyb-npu-attention-fusion" + spec + ","                 // QK..PV of a head on one core
       "hyb-npu-state-fusion" + spec + ","                     // a recurrent state's updates by head blocks
       "hyb-npu-gemv-epilogue" + spec + ","                    // dequantize on the GEMV's own core

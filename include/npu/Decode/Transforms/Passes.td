@@ -127,14 +127,17 @@ def HybNpuProjectionFusion : Pass<"hyb-npu-projection-fusion", "ModuleOp"> {
 def HybNpuFlashAttention : Pass<"hyb-npu-flash-attention", "ModuleOp"> {
   let summary = "Tile attention with online softmax and optional parallel KV splits (npu.flash_attention)";
   let description = [{
-    Applied to an attention whose full-row softmax does not fit: the L2 copy of [past; new] K and V
-    with the activations and a three-slot weight ring per core exceeds L2, or a KV head's keys,
-    values and score rows exceed a core's L1 (decision "attention softmax" in io.json). Keeps only
+    `mode` (npu-compile --flash-attention): auto (default) applies it to an attention whose
+    full-row softmax does not fit: the L2 copy of [past; new] K and V with the activations and a
+    three-slot weight ring per core exceeds L2, or a KV head's keys, values and score rows exceed a
+    core's L1 (decision "attention softmax" in io.json). on applies it to every supported
+    attention; off never, and fails where the full row does not fit. Keeps only
     Q/K tiles and FP32 running maximum, sum and output state on chip; the query and key tiles are
     the largest that fit half of the free L1. Its rounding differs from the materialized FP16
     softmax (FP32 running state). Unsupported attention is diagnosed.
   }];
-  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">,
+                 Option<"mode", "mode", "std::string", "\"auto\"", "auto | on | off">];
   let dependentDialects = ["linalg::LinalgDialect", "tensor::TensorDialect", "arith::ArithDialect",
                            "scf::SCFDialect", "affine::AffineDialect", "math::MathDialect"];
 }
