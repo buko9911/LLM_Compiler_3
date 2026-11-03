@@ -263,6 +263,7 @@ private:
             bool toL1);
   void prefetchWeight(uint64_t l1, uint64_t l2, uint32_t bytes);
   void l1Copy(uint64_t dst, uint64_t src, uint32_t rowBytes, uint32_t rows, uint32_t srcStride, uint32_t dstStride);
+  void replicateColumns(uint64_t dup, uint64_t src, int64_t packets);
   void copyLP6ToL1(uint64_t lp6, uint64_t l1, uint32_t rowBytes, uint32_t rows, uint32_t lp6Stride, uint32_t l1Stride);
   void copyL1ToLP6(uint64_t l1, uint64_t lp6, uint32_t rowBytes, uint32_t rows, uint32_t l1Stride, uint32_t lp6Stride);
 

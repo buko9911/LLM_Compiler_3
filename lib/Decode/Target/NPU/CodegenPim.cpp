@@ -250,10 +250,7 @@ LogicalResult Codegen::scatterPimActParallel(const View &s, const View &, std::s
       if (core != 0) ldma(row, p.sharedQ + uint64_t(m * p.k), uint32_t(p.k), 1, 0, 0, true);
       for (int64_t begin = 0; begin < a.packets(); begin += p.batchPackets) {
         int64_t count = std::min(p.batchPackets, a.packets() - begin);
-        for (int bg = 0; bg < 4; ++bg)
-          for (int ch = 0; ch < 8; ++ch)
-            l1Copy(scratchBase + uint64_t(bg * in.pim->bgBytes() + ch * pim::kChBytes),
-                   row + uint64_t(begin * 32), 32, uint32_t(count), 32, uint32_t(in.pim->colBytes()));
+        replicateColumns(scratchBase, row + uint64_t(begin * 32), count);
         const uint64_t win = windowBase(core);
         // Existing L2 hazard tracking waits for the preceding GDMA readers
         // before this core overwrites its window for another batch/token.
@@ -318,6 +315,18 @@ std::string Codegen::parallelActivationPlanJSON() const {
   return llvm::formatv("{0}", json::Value(std::move(object))).str();
 }
 
+/// L1 scratch columns for `packets` activation packets at `src`: column p (colBytes() = 4 bank groups x
+/// C subchannels x 32 B) holds 4 C copies of packet p. The first copy is placed, then the filled part of
+/// every column is doubled. Rows of 32 B with the column stride all fall on the same 8 of the 32 SRAM
+/// banks (one row per cycle); the doubling copies 64..colBytes/2-byte rows, which use every bank.
+void Codegen::replicateColumns(uint64_t dup, uint64_t src, int64_t packets) {
+  const int64_t colBytes = in.pim->colBytes();
+  l1Copy(dup, src, 32, uint32_t(packets), 32, uint32_t(colBytes));
+  for (int64_t have = 32; have < colBytes; have *= 2)
+    l1Copy(dup + uint64_t(have), dup, uint32_t(std::min(have, colBytes - have)), uint32_t(packets),
+           uint32_t(colBytes), uint32_t(colBytes));
+}
+
 /// INT8 activation rows (L1) -> every consuming PU's bank.
 /// Subchannel and bank group sit below the column in the address, so one column of the
 /// 4 bank groups x C subchannels of a bank is colBytes() = 128 C contiguous bytes: each packet is
@@ -339,7 +348,7 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     return failure();
   }
   uint64_t dup = scratchBase, win = windowBase(curCore);
-  const int64_t colBytes = in.pim->colBytes(), bgBytes = in.pim->bgBytes();
+  const int64_t colBytes = in.pim->colBytes();
   const int channels = in.pim->channels;
   // Replication is scratch, not a planned L1 allocation. Bound it by both the
   // L1 reserve and L2 window; a wide FFN vector otherwise overwrites live L1
@@ -364,10 +373,7 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     if (!pairRanks.empty()) {
       for (int64_t begin = 0; begin < a.packets(); begin += batchPackets) {
         const int64_t count = std::min(batchPackets, a.packets() - begin);
-        for (int bg = 0; bg < 4; ++bg)
-          for (int ch = 0; ch < channels; ++ch)
-            l1Copy(dup + uint64_t(bg * bgBytes + ch * pim::kChBytes), row + uint64_t(begin * 32),
-                   32, uint32_t(count), 32, uint32_t(colBytes));
+        replicateColumns(dup, row + uint64_t(begin * 32), count);
         ldma(dup, win, uint32_t(colBytes * count), 1, 0, 0, false);
         for (int rk : pairRanks) {
           int part0 = rk * channels;
