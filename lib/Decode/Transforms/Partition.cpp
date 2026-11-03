@@ -1,10 +1,11 @@
 //===- Partition.cpp - hyb-partition ----------------------------------------===//
 //
-// For every group of qmatmuls reading one quantized input, compare the PIM cost (LdMAC
-// streams balanced over the partitions, plus the NPU boundary work: activation written in PIM
-// layout, INT32 outputs read back) with the NPU cost (weights streamed from LP6) and set the
-// `target` attribute. The group is the decision unit because its members share one
-// activation broadcast (PIM) or one weight stream pass (NPU).
+// For every group of qmatmuls reading one quantized input, compare the PIM cost (the fastest
+// stream layout of npu/Decode/Support/PimCost.h, plus the NPU boundary work: activation written
+// in PIM layout, INT32 outputs and split-K partial sums read back) with the NPU cost (weights
+// streamed from LP6 at the sustained GDMA rate) and set the `target` attribute. The group is the
+// decision unit because its members share one activation broadcast (PIM) or one weight stream
+// pass (NPU).
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -55,7 +56,9 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
         names.push_back(op.getWeight().str());
         dims.push_back(llvm::json::Array{t.getDimSize(1), in.getDimSize(1)});
       }
-      GemvCost c = estimateGemvGroup(*specOr, M, shapes);
+      // Tokens of this group: the rows of its input (the LM head of a prefill reads one row).
+      const int64_t rows = cast<ShapedType>(ops.front().getInput().getType()).getDimSize(0);
+      GemvCost c = estimateGemvGroup(*specOr, rows > 0 ? rows : M, shapes);
       // Precedence: --force, then the longest matching override, then the policy; "cost"
       // compares the two estimates.
       std::string target = c.pimUs + c.pimBoundaryUs <= c.npuUs ? "pim" : "npu", why = "cost";
@@ -81,7 +84,7 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       }
       (target == "pim" ? pim : npu)++;
       for (hyb::QMatmulOp op : ops) op.setTargetAttr(b.getStringAttr(target));
-      table.push_back(llvm::json::Object{{"group", g}, {"weights", std::move(names)}, {"pim_us", c.pimUs},
+      table.push_back(llvm::json::Object{{"group", g}, {"weights", std::move(names)}, {"tokens", rows}, {"pim_us", c.pimUs},
                                          {"pim_boundary_us", c.pimBoundaryUs}, {"npu_us", c.npuUs},
                                          {"target", target}, {"reason", why}, {"shapes", std::move(dims)}});
     }

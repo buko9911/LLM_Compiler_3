@@ -1,4 +1,5 @@
 #include "npu/Decode/Support/TargetSpec.h"
+#include "npu/Decode/Support/PimCost.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -144,31 +145,28 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
 
 GemvCost mlir::hybrid::estimateGemvGroup(const TargetSpec &spec, int64_t tokens, llvm::ArrayRef<GemvShape> group) {
   GemvCost c{};
-  // PIM (W8A8): a stream is 512 output rows (8 PUs x 16 accumulators x 4 lanes); a sweep of a
-  // stream is 32 LdMACs x 16 outputs over 256 inputs. Streams of the group are balanced over
-  // the partitions; every token repeats every stream.
-  const int64_t rowsPerStream = spec.pim.pus * 16 * spec.pim.lanes;
-  std::vector<int64_t> load(spec.pim.parallelPartitions(), 0);
-  int64_t actBytes = 0, outBytes = 0;
-  for (const GemvShape &g : group) {
-    int64_t streams = (g.n + rowsPerStream - 1) / rowsPerStream, sweeps = g.k / 256;
-    for (int64_t s = 0; s < streams; ++s) *std::min_element(load.begin(), load.end()) += sweeps;
-    actBytes = std::max(actBytes, g.k);
-    outBytes += g.n * 4;
-  }
-  double ldmacs = double(*std::max_element(load.begin(), load.end())) * 16 * 32 * tokens;
-  c.pimUs = ldmacs * spec.pim.nlldCK / spec.pim.clockMHz / spec.pim.efficiency + spec.pim.phaseFixedUs;
-  // Boundary work done by the NPU: write the INT8 activation into the PIM layout of every
-  // partition, read the INT32 outputs back.
-  c.pimBoundaryUs = tokens * (spec.pim.actWriteFixedUs + spec.pim.actWriteUsPerKiB * actBytes / 1024.0 +
-                              spec.pim.readbackFixedUs + spec.pim.readbackUsPerKiB * outBytes / 1024.0);
-  // NPU: weights streamed from LP6 once for all tokens (memory bound at M <= 32).
+  if (group.empty()) return c;
+  // PIM (W8A8): the fastest stream layout of the group (PimCost.h: accumulators per stream and
+  // split-K per projection, streams balanced over one phase's partitions, every token repeating
+  // every stream). Boundary work done by the NPU: the INT8 activation written as whole columns to
+  // every PU of the rank (K x PUs x subchannels bytes per token), the INT32 outputs gathered and the
+  // split-K partial sums added.
+  std::vector<int64_t> rows;
+  for (const GemvShape &g : group) rows.push_back(g.n);
+  pimcost::Estimate e;
+  pimcost::choose(spec, tokens, group.front().k, rows, pimcost::phasePartitions(spec), true, e);
+  c.pimUs = e.pimUs;
+  const double actBytes = double(group.front().k) * spec.pim.pus * spec.pim.channels * double(tokens);
+  c.pimBoundaryUs = actBytes / (spec.pim.actWriteGBps * 1e3) + double(tokens) * spec.pim.actWritePieceUs +
+                    e.gatherUs + e.sumUs;
+  // NPU: weights and row scales streamed from LP6 once for all tokens at the sustained GDMA read rate,
+  // or the systolic array time when that is longer.
   double bytes = 0, macs = 0;
   for (const GemvShape &g : group) {
     bytes += double(g.n) * g.k + g.n * 4.0;
     macs += double(g.n) * g.k * tokens;
   }
-  double streamUs = bytes / (spec.npu.lp6ReadGBps * 1e3);
+  double streamUs = bytes / (spec.npu.gdmaReadGBps * 1e3);
   double mmaUs = macs / (double(spec.npu.cores) * spec.npu.saRows * spec.npu.saCols * 2 * spec.npu.clockMHz);
   c.npuUs = std::max(streamUs, mmaUs) + spec.npu.gemvFixedUs * group.size();
   return c;

@@ -330,6 +330,14 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
   }
   auto acts = d.lp6.getAs<ArrayAttr>("acts");
   int64_t K = d.shape[1], sRow = s.shape.size() == 2 ? s.strides[0] : K;
+  // The copy may cover a row range of the activation buffer (a core's rows after the quant was
+  // split by token rows): row r of the source is token row0 + r, one activation vector each.
+  const int64_t row0 = d.strides.size() == 2 && d.strides[0] ? d.offset / d.strides[0] : 0;
+  const int64_t rows = d.shape.size() == 2 ? d.shape[0] : 1;
+  if (d.strides.size() != 2 || d.offset % std::max<int64_t>(1, d.strides[0]) || row0 + rows > int64_t(acts.size())) {
+    err = "PIM activation copy must cover whole token rows of the activation buffer";
+    return failure();
+  }
   uint64_t dup = scratchBase, win = windowBase(curCore);
   const int64_t colBytes = in.pim->colBytes(), bgBytes = in.pim->bgBytes();
   const int channels = in.pim->channels;
@@ -343,9 +351,9 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     err = "PIM activation replication needs one column of L1 scratch and L2 staging";
     return failure();
   }
-  for (auto [m, ai] : llvm::enumerate(acts)) {
-    const pim::Activation &a = in.pim->activations[size_t(cast<IntegerAttr>(ai).getInt())];
-    uint64_t row = addr(s, int64_t(m) * sRow);
+  for (int64_t m = 0; m < rows; ++m) {
+    const pim::Activation &a = in.pim->activations[size_t(cast<IntegerAttr>(acts[size_t(row0 + m)]).getInt())];
+    uint64_t row = addr(s, m * sRow);
     // Every rank with a consuming partition takes the whole-column store, also when only some of
     // its subchannels read the vector: an activation's packet rows are reserved in every partition
     // (the same rows, PimLayout::baseRows), so the extra copies land in unused slots. Per-PU stores
