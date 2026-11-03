@@ -16,7 +16,9 @@ namespace mlir::hybrid::codegen {
 
 /// INT32 GEMV results [rows, cols] of a PIM output -> contiguous L1 rows. A stored tile holds
 /// 8 consecutive outputs of one PU; runs split at DRAM rows and partition boundaries are
-/// gathered in the staging window, one LDMA per chunk.
+/// gathered in the staging window, one LDMA per chunk. A split-K projection stores one partial
+/// sum per K piece: piece 0 lands in the destination, every further piece in the L1 scratch,
+/// and the VPU adds it (INT32, so the sum is exact and independent of the split).
 LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &err) {
   const pim::Projection &p = in.pim->projections[size_t(s.lp6.getAs<IntegerAttr>("proj").getInt())];
   if (s.shape.size() != 2 || s.strides[1] != 1 || d.space != kL1 || d.strides.back() != 1) {
@@ -29,32 +31,55 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     return failure();
   }
   int64_t dRow = d.shape.size() == 2 ? d.strides[0] : cols;
-  int64_t T = p.tilesPerPU(), npu = p.rowsPerPU();
-  auto partEnd = [&](int64_t t) {
-    int64_t g = t / 8;
-    while (g < p.streams() && p.streamPart[size_t(g)] == p.streamPart[size_t(t / 8)]) ++g;
-    return g * 8;
+  const int64_t T = p.tilesPerPU(), npu = p.rowsPerPU(), per = p.tilesPerStream(), blocks = p.blocks();
+  // First PU-local tile after t whose stream lives in another partition (inside one K piece).
+  auto partEnd = [&](int64_t t, int piece) {
+    int64_t b = t / per;
+    const int part = p.streamPart[size_t(piece * blocks + b)];
+    while (b < blocks && p.streamPart[size_t(piece * blocks + b)] == part) ++b;
+    return b * per;
   };
   uint64_t win = windowBase(curCore);
   int64_t chunk = window() / 4 / 8 * 8;
+  const uint64_t partial = scratchBase;
+  if (p.splitK > 1) {
+    const int64_t scratch = (in.spec->npu.l1ReservedBytes - kPoolMax) / 4 / 16 * 16;
+    if (scratch < 16) {
+      err = "split-K PIM output needs L1 scratch for one partial-sum chunk";
+      return failure();
+    }
+    chunk = std::min(chunk, scratch);
+  }
   for (int64_t r = 0; r < rows; ++r) {
     int m = int(m0 + r);
     for (int64_t c0 = n0; c0 < n0 + cols; c0 += chunk) {
       int64_t c1 = std::min(n0 + cols, c0 + chunk);
-      for (int pu = 0; pu < pim::kPUs; ++pu) {
-        int64_t lo = std::max(c0, int64_t(pu) * npu), hi = std::min(c1, int64_t(pu + 1) * npu);
-        if (lo >= hi) continue;
-        int64_t ta = (lo - pu * npu) / 8, tb = (hi - pu * npu) / 8;
-        for (int64_t t = ta; t < tb && t < T;) {
-          int64_t tile = p.tokenOutputTile(m, t);
-          int64_t pk = p.outputBase + tile;
-          int64_t n = std::min({tb - t, pim::kPacketsPerRow - pk % pim::kPacketsPerRow, partEnd(t) - t});
-          gdmaLoad(in.pim->outputTileAddress(p, tile, pu), win + uint64_t((pu * npu + t * 8 - c0) * 4), 32,
-                   uint32_t(n), uint32_t(in.pim->colBytes()), 32);
-          t += n;
+      const uint64_t dst = addr(d, r * dRow + (c0 - n0));
+      for (int piece = 0; piece < p.splitK; ++piece) {
+        for (int pu = 0; pu < pim::kPUs; ++pu) {
+          int64_t lo = std::max(c0, int64_t(pu) * npu), hi = std::min(c1, int64_t(pu + 1) * npu);
+          if (lo >= hi) continue;
+          int64_t ta = (lo - pu * npu) / 8, tb = (hi - pu * npu) / 8;
+          for (int64_t t = ta; t < tb && t < T;) {
+            int64_t tile = p.tokenOutputTile(m, t, piece);
+            int64_t pk = p.outputBase + tile;
+            int64_t n = std::min({tb - t, pim::kPacketsPerRow - pk % pim::kPacketsPerRow, partEnd(t, piece) - t});
+            gdmaLoad(in.pim->outputTileAddress(p, tile, pu), win + uint64_t((pu * npu + t * 8 - c0) * 4), 32,
+                     uint32_t(n), uint32_t(in.pim->colBytes()), 32);
+            t += n;
+          }
+        }
+        ldma(piece == 0 ? dst : partial, win, uint32_t((c1 - c0) * 4), 1, 0, 0, true);
+        if (piece == 0) continue;
+        for (int64_t e = 0; e < c1 - c0; e += 16) {
+          const uint32_t lanes = uint32_t(std::min<int64_t>(16, c1 - c0 - e));
+          setVL(lanes);
+          vload(0, dst + uint64_t(e * 4), 7);        // I32
+          vload(1, partial + uint64_t(e * 4), 7);
+          rec(typedVector(T_ADD, DT_I32, 2, 0, 1, 0, lanes));
+          vstore(dst + uint64_t(e * 4), 2, 8);
         }
       }
-      ldma(addr(d, r * dRow + (c0 - n0)), win, uint32_t((c1 - c0) * 4), 1, 0, 0, true);
     }
   }
   return success();

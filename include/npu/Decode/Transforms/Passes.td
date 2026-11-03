@@ -265,10 +265,15 @@ def HybPlanLP6 : Pass<"hyb-plan-lp6", "ModuleOp"> {
     weights, cross-phase activations, outputs. A buffer read by a PIM phase is laid out as PIM
     activation packets, a buffer written by a PIM phase as PIM output tiles; the rest are dense.
     NPU data sits below the PIM kernel rows. The PIM plan is stored on the module (hyb.pim_plan).
+    Each PIM phase gets its stream layout here: per projection the accumulators per stream (output
+    rows per stream = 32 x A) and the split-K pieces whose partial sums the NPU adds, the fastest
+    estimate of npu/Decode/Support/PimCost.h over the target's candidates (decision "pim stream
+    layout" in io.json). Fixed weight storage (export/import) keeps 512-row streams over all of K.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">,
-                 Option<"banksetPingPong", "bankset-pingpong", "int", "0",
-                        "research weight row bank-set ping-pong: 0 off, 1 default lead 12, 2..63 lead">];
+                 Option<"banksetPingPong", "bankset-pingpong", "int", "-1",
+                        "weight rows on alternating bank sets: -1 target pim.bankset_pingpong_lead, 0 off, "
+                        "1 lead 12, 2..63 lead">];
 }
 
 def HybNpuPlace : Pass<"hyb-npu-place", "ModuleOp"> {

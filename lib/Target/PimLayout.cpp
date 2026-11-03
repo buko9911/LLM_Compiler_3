@@ -17,28 +17,37 @@ int64_t Program::addActivation(int64_t k) {
 }
 
 int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
-                               const std::vector<int64_t> &inputs, std::map<int, int64_t> &loads) {
+                               const std::vector<int64_t> &inputs, std::map<int, int64_t> &loads, int accs,
+                               int splitK, int64_t streamLoad) {
   Projection p;
   p.name = name;
   p.n = n;
   p.k = k;
-  p.nPad = (n + kRowsPerStream - 1) / kRowsPerStream * kRowsPerStream;
+  p.accs = accs;
+  p.splitK = splitK;
+  const int64_t rows = p.rowsPerStream();
+  p.nPad = (n + rows - 1) / rows * rows;
   p.activations = inputs;
   p.outputBase = nextOutput;
-  // Least-loaded partition per stream, then regrouped so the streams of one
-  // partition are contiguous and its stored output tiles stay contiguous.
-  std::vector<int64_t> count(size_t(partitions), 0);
+  // Least-loaded partition per stream, then regrouped inside each K piece so the
+  // streams of one partition are contiguous and its stored output tiles stay
+  // contiguous. A stream's load is its LdMAC count (sweeps x accumulators).
   if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
+  std::vector<int64_t> count(size_t(partitions), 0);
   auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.streamTiles(); };
-  for (int64_t s = 0; s < p.streams(); ++s) {
-    int best = 0;
-    for (int c = 1; c < partitions; ++c)
-      if (loads[c] < loads[best] || (loads[c] == loads[best] && stored(c) < stored(best))) best = c;
-    count[size_t(best)]++;
-    loads[best] += p.sweeps() * int64_t(inputs.size());
+  for (int64_t piece = 0; piece < splitK; ++piece) {
+    std::vector<int64_t> here(size_t(partitions), 0);
+    for (int64_t b = 0; b < p.blocks(); ++b) {
+      int best = 0;
+      for (int c = 1; c < partitions; ++c)
+        if (loads[c] < loads[best] || (loads[c] == loads[best] && stored(c) < stored(best))) best = c;
+      count[size_t(best)]++;
+      here[size_t(best)]++;
+      loads[best] += streamLoad > 0 ? streamLoad : p.pieceSweeps() * accs * int64_t(inputs.size());
+    }
+    for (int c = 0; c < partitions; ++c)
+      for (int64_t i = 0; i < here[size_t(c)]; ++i) p.streamPart.push_back(c);
   }
-  for (int c = 0; c < partitions; ++c)
-    for (int64_t i = 0; i < count[size_t(c)]; ++i) p.streamPart.push_back(c);
   // Weight tile ids are per partition: a stream's packets live only in its
   // partition's banks, and the runtime addresses a tile inside the partition
   // of the GEMV_STREAM.
@@ -46,7 +55,7 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
     p.streamWeightBase.push_back(nextWeight[size_t(c)]);
     nextWeight[size_t(c)] += p.streamTiles();
   }
-  nextOutput += p.streams() * 8 * int64_t(inputs.size());
+  nextOutput += p.streams() * p.tilesPerStream() * int64_t(inputs.size());
   for (int64_t a : inputs)
     for (int c : p.streamPart)
       if (!std::count(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end(), c))
@@ -68,24 +77,28 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
   // primitive sequence; it does not reconstruct a fixed GEMV macro.
   Projection &p = projections[size_t(index)];
   p.computeFirst = int64_t(commands.size());
-  const int64_t streams = p.streams();
+  const int64_t streams = p.streams(), blocks = p.blocks();
+  const int accs = p.accs;
+  if (accs < 2 || accs > kAccs || accs % 2 || p.splitK < 1 || p.sweeps() % p.splitK)
+    return Result<bool>::failure(p.name + ": PIM stream needs an even accumulator count 2..16 and whole-sweep K pieces");
   for (int m = 0; m < p.tokens(); ++m) {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
     for (int64_t g = 0; g < streams; ++g) {
+      const int64_t block = g % blocks, piece = g / blocks;
       auto make = [&](Opcode opcode) {
         Primitive q;
         q.opcode = opcode;
         q.partition = uint32_t(p.streamPart[size_t(g)]);
         return q;
       };
-      for (int acc = 0; acc < kAccs; ++acc) {
+      for (int acc = 0; acc < accs; ++acc) {
         auto q = make(Opcode::ClearOutput); q.accumulator = acc;
         commands.push_back(q);
       }
-      for (int64_t sweep = 0; sweep < p.sweeps(); ++sweep) {
-        int64_t firstA = a.base + sweep * kInTiles;
-        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * kAccs * kInTiles;
-        if (firstA + kInTiles > INT32_MAX || firstW + kAccs * kInTiles > INT32_MAX)
+      for (int64_t sweep = 0; sweep < p.pieceSweeps(); ++sweep) {
+        int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * kInTiles;
+        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * accs * kInTiles;
+        if (firstA + kInTiles > INT32_MAX || firstW + accs * kInTiles > INT32_MAX)
           return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
         // A load fills a whole 32-byte input register (four logical K=8
         // slices). Emit it once per packet; all slices remain addressable.
@@ -95,15 +108,15 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
         }
         auto q = make(Opcode::GemvStream);
         q.weight = int32_t(firstW); q.activation = int32_t(firstA); q.accumulator = 0;
-        q.inputs = kInTiles; q.outputs = kAccs;
+        q.inputs = kInTiles; q.outputs = accs;
         q.weightInputStride = 1; q.weightOutputStride = kInTiles;
         q.activationInputStride = 1; q.accumulatorOutputStride = 1;
         commands.push_back(q);
       }
-      int64_t firstO = p.outputBase + (int64_t(m) * streams + g) * (kAccs / 2);
-      if (firstO + kAccs / 2 > INT32_MAX)
+      int64_t firstO = p.outputBase + p.tokenOutputTile(m, block * p.tilesPerStream(), int(piece));
+      if (firstO + accs / 2 > INT32_MAX)
         return Result<bool>::failure(p.name + ": PIM output tile ID exceeds INT32_MAX");
-      for (int reg = 0; reg < kAccs / 2; ++reg) {
+      for (int reg = 0; reg < accs / 2; ++reg) {
         auto q = make(Opcode::StoreOutput);
         q.accumulator = 2 * reg; q.output = int32_t(firstO + reg);
         commands.push_back(q);

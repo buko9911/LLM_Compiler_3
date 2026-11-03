@@ -8,9 +8,12 @@
 //  * one LdMAC drives the 8 PUs of the even bank set; a PU packet holds 4 lanes
 //    x 8 INT8 weights; an activation packet holds 32 INT8 values, 4 input
 //    register slices of 8;
-//  * the current compiler tile policy uses 512 output rows (8 PUs x 16 accumulators x 4 lanes)
-//    and 256 inputs (8 input registers x 4 slices x 8); a longer K is several
-//    sweeps;
+//  * a stream covers 32 x A output rows (8 PUs x A accumulators x 4 lanes; A even, 2..16, chosen
+//    per projection, 16 = 512 rows by default) and 256 inputs per sweep (8 input registers x 4
+//    slices x 8); a longer K is several sweeps;
+//  * split-K: a projection may cut K into S equal pieces of whole sweeps. Each piece is a stream
+//    set of its own with its own INT32 output tiles; the NPU adds the S partial sums when it
+//    gathers the result (integer sums, so the result is exact);
 //  * a partition p is subchannel p % C of rank p / C, C = LP6 subchannels (8 for
 //    four LPDDR6 channels, 2 for one);
 //  * tile ids are dense per kind; the runtime places weight rows from the
@@ -54,24 +57,37 @@ struct Activation {
 };
 
 // One GEMV, a weight of N output channels and K inputs, for M tokens.
+// Stream g = piece * blocks() + block: output rows [block * 32A, (block + 1) * 32A), spread over the
+// 8 PUs (4A rows each), and K sweeps [piece * pieceSweeps(), (piece + 1) * pieceSweeps()).
 struct Projection {
   std::string name;
-  int64_t n = 0, k = 0, nPad = 0;           // nPad: N rounded up to whole streams
+  int64_t n = 0, k = 0, nPad = 0;           // nPad: N rounded up to whole streams of 32 x accs rows
+  int accs = kAccs;                         // accumulators per stream (even, 2..16)
+  int splitK = 1;                           // K pieces (sweeps() % splitK == 0)
   int64_t outputBase = 0;
   std::vector<int64_t> streamWeightBase;    // first weight tile of each stream, in its partition
   std::vector<int64_t> activations;         // activation per token
-  std::vector<int> streamPart;              // partition of each stream
+  std::vector<int> streamPart;              // partition of each stream (sorted inside each piece)
   int64_t computeFirst = 0, computeCount = 0;   // executable primitive range
-  int64_t streams() const { return nPad / kRowsPerStream; }
+  int64_t rowsPerStream() const { return int64_t(kPUs) * kLanes * accs; }
+  int64_t blocks() const { return nPad / rowsPerStream(); }
+  int64_t streams() const { return blocks() * splitK; }
   int64_t sweeps() const { return k / kKPerSweep; }
+  int64_t pieceSweeps() const { return sweeps() / splitK; }
   int64_t rowsPerPU() const { return nPad / kPUs; }
-  int64_t tilesPerPU() const { return nPad / (kPUs * 8); }
-  int64_t streamTiles() const { return sweeps() * kAccs * kInTiles; }
+  int64_t tilesPerPU() const { return nPad / (kPUs * 8); }   // output tiles of 8 per PU, per piece and token
+  int64_t tilesPerStream() const { return accs / 2; }        // per PU
+  int64_t streamTiles() const { return pieceSweeps() * accs * kInTiles; }
   int tokens() const { return int(activations.size()); }
-  int tilePart(int64_t t) const { return streamPart[size_t((t % (streams() * 8)) / 8)]; }
-  int64_t tokenOutputTile(int m, int64_t t) const { return int64_t(m) * streams() * 8 + t; }
+  // Output tile id (relative to outputBase) of PU-local tile t of token m and piece j.
+  int64_t tokenOutputTile(int m, int64_t t, int piece = 0) const {
+    return (int64_t(m) * splitK + piece) * blocks() * tilesPerStream() + t;
+  }
+  int tilePart(int64_t tile) const { return streamPart[size_t((tile / tilesPerStream()) % streams())]; }
   // Current compiler schedule: clear, load/stream per K sweep, store.
-  int64_t commands() const { return int64_t(tokens()) * streams() * (kAccs + sweeps() * (kInTiles / kSlices + 1) + kAccs / 2); }
+  int64_t commands() const {
+    return int64_t(tokens()) * streams() * (accs + pieceSweeps() * (kInTiles / kSlices + 1) + accs / 2);
+  }
 };
 
 // All PIM work of one program: one kernel, one tile-id space.
@@ -101,8 +117,10 @@ struct Program {
   // least loaded partition of `loads`, shared by the GEMVs of one PIM phase; a
   // partition that must not compute carries a huge load. Equal loads are broken
   // by resident weight storage, including streams assigned in this projection.
+  // `accs` and `splitK` set the stream shape (default: 512-row streams over all of K).
+  // `streamLoad` is the load one stream adds (0: its LdMAC count / 32, sweeps x accumulators x tokens).
   int64_t addProjection(const std::string &name, int64_t n, int64_t k, const std::vector<int64_t> &activations,
-                        std::map<int, int64_t> &loads);
+                        std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1, int64_t streamLoad = 0);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
   // Lower a projection into final executable PIM IR, before serialization.
@@ -140,21 +158,24 @@ struct Program {
 
 template <typename Fn>
 void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
-  const int64_t streams = p.streams(), sweeps = p.sweeps(), rows = p.rowsPerPU();
-  for (int64_t g = 0; g < streams; ++g)
+  const int64_t streams = p.streams(), sweeps = p.pieceSweeps(), rows = p.rowsPerPU(), blocks = p.blocks();
+  const int accs = p.accs;
+  for (int64_t g = 0; g < streams; ++g) {
+    const int64_t block = g % blocks, piece = g / blocks;
     for (int64_t s = 0; s < sweeps; ++s)
-      for (int o = 0; o < kAccs; ++o)
+      for (int o = 0; o < accs; ++o)
         for (int i = 0; i < kInTiles; ++i) {
-          int64_t tile = p.streamWeightBase[size_t(g)] + (s * kAccs + o) * kInTiles + i;
+          int64_t tile = p.streamWeightBase[size_t(g)] + (s * accs + o) * kInTiles + i;
           for (int pu = 0; pu < kPUs; ++pu) {
             WeightPacketLocation location;
             location.address = weightPacketAddress(tile, pu, p.streamPart[size_t(g)]);
-            location.inputBegin = (s * kInTiles + i) * kGroup;
+            location.inputBegin = ((piece * sweeps + s) * kInTiles + i) * kGroup;
             for (int l = 0; l < kLanes; ++l)
-              location.outputChannels[size_t(l)] = pu * rows + (g * 8 + o / 2) * 8 + 2 * l + (o % 2);
+              location.outputChannels[size_t(l)] = pu * rows + (block * (accs / 2) + o / 2) * 8 + 2 * l + (o % 2);
             fn(location);
           }
         }
+  }
 }
 
 template <typename Fn>

@@ -5,6 +5,7 @@
 // outputs into L1.
 //===----------------------------------------------------------------------===//
 
+#include <optional>
 #include "DriverProgram.h"
 #include "DriverPackage.h"
 #include "npu/Decode/PimMetadata.h"
@@ -28,6 +29,23 @@ DictionaryAttr lp6Of(func::FuncOp step, Value v) {
   if (auto ba = dyn_cast<BlockArgument>(v)) return step.getArgAttrOfType<DictionaryAttr>(ba.getArgNumber(), kLP6);
   if (Operation *d = v.getDefiningOp()) return d->getAttrOfType<DictionaryAttr>(kLP6);
   return {};
+}
+
+/// The cost decisions recorded on a phase (NpuCost.h recordDecision, PimCost.h), with their numbers.
+std::optional<json::Array> decisionsJson(func::FuncOp phase) {
+  auto decisions = phase->getAttrOfType<ArrayAttr>("hyb.decisions");
+  if (!decisions) return std::nullopt;
+  json::Array list;
+  for (Attribute a : decisions) {
+    json::Object entry;
+    for (NamedAttribute f : cast<DictionaryAttr>(a)) {
+      if (auto v = dyn_cast<StringAttr>(f.getValue())) entry[f.getName().str()] = v.getValue().str();
+      else if (auto v = dyn_cast<FloatAttr>(f.getValue())) entry[f.getName().str()] = v.getValueAsDouble();
+      else if (auto v = dyn_cast<IntegerAttr>(f.getValue())) entry[f.getName().str()] = v.getInt();
+    }
+    list.push_back(std::move(entry));
+  }
+  return list;
 }
 
 /// io.json entry of one NPU phase: size of the emitted code, SRAM peaks, weight streams, how often
@@ -85,19 +103,7 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
       {"columns", spec.npu.inputTileColumns}};
 
   // Choices made by comparing costs (NpuCost.h), with the numbers behind each.
-  if (auto decisions = phase->getAttrOfType<ArrayAttr>("hyb.decisions")) {
-    json::Array list;
-    for (Attribute a : decisions) {
-      json::Object entry;
-      for (NamedAttribute f : cast<DictionaryAttr>(a)) {
-        if (auto v = dyn_cast<StringAttr>(f.getValue())) entry[f.getName().str()] = v.getValue().str();
-        else if (auto v = dyn_cast<FloatAttr>(f.getValue())) entry[f.getName().str()] = v.getValueAsDouble();
-        else if (auto v = dyn_cast<IntegerAttr>(f.getValue())) entry[f.getName().str()] = v.getInt();
-      }
-      list.push_back(std::move(entry));
-    }
-    report["decisions"] = std::move(list);
-  }
+  if (auto decisions = decisionsJson(phase)) report["decisions"] = std::move(*decisions);
 
   // Backend scheduling.
   report["async_output_stores"] = json::Object{
@@ -130,7 +136,8 @@ bool driver::emitPimCommands(pim::Program &prog, std::vector<pim::Primitive> &pi
       return false;
     }
     if (prog.projections[pi].computeFirst != expect) {
-      llvm::errs() << "PIM command order differs from the plan\n";
+      llvm::errs() << "PIM command order differs from the plan: " << prog.projections[pi].name << " planned "
+                   << expect << ", emitted at " << prog.projections[pi].computeFirst << "\n";
       return false;
     }
   }
@@ -172,7 +179,9 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       auto [first, count] = prog.phases[size_t(idx)];
       std::vector<pim::Primitive> primitives(pimCommands.begin() + first, pimCommands.begin() + first + count);
       exit = {program.pimRecord(name, exit, primitives)};
-      report.push_back(json::Object{{"phase", name}, {"kind", "pim"}, {"commands", count}});
+      json::Object pimReport{{"phase", name}, {"kind", "pim"}, {"commands", count}};
+      if (auto decisions = decisionsJson(callee)) pimReport["decisions"] = std::move(*decisions);
+      report.push_back(std::move(pimReport));
       carried = {};
       continue;
     }
@@ -373,14 +382,18 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
           }
         } else if (layout == "pim_out") {
           const pim::Projection &p = prog.projections[size_t(a.getAs<IntegerAttr>("proj").getInt())];
+          if (p.splitK != 1) {   // its K pieces are partial sums that only the NPU's gather adds
+            uncollected.push_back(name);
+            continue;
+          }
           json::Array shape{ty.getDimSize(0), p.nPad};
           uint64_t at = item(name, v, ty.getDimSize(0) * p.nPad * 4, std::move(shape), layout);
           if (overflow) break;
-          int64_t T = p.tilesPerPU();
+          const int64_t T = p.tilesPerPU(), per = p.tilesPerStream();
           auto partEnd = [&](int64_t t) {
-            int64_t g = t / 8;
-            while (g < p.streams() && p.streamPart[size_t(g)] == p.streamPart[size_t(t / 8)]) ++g;
-            return g * 8;
+            int64_t b = t / per;
+            while (b < p.blocks() && p.streamPart[size_t(b)] == p.streamPart[size_t(t / per)]) ++b;
+            return b * per;
           };
           for (int m = 0; m < p.tokens(); ++m)
             for (int pu = 0; pu < pim::kPUs; ++pu)

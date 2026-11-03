@@ -13,6 +13,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/PimMetadata.h"
+#include "npu/Decode/Support/PimCost.h"
+#include "npu/Decode/Transforms/NpuCost.h"
 #include "npu/Decode/Transforms/PassSupport.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSet.h"
@@ -50,11 +52,12 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     func::FuncOp step = getStepFunction(module);
     SymbolTable symbols(module);
     pim::Program program;
-    if (banksetPingPong < 0 || banksetPingPong > 63) {
-      module.emitError("bankset-pingpong must be 0..63 (1 selects lead 12)");
+    if (banksetPingPong < -1 || banksetPingPong > 63) {
+      module.emitError("bankset-pingpong must be -1 (target) or 0..63 (1 selects lead 12)");
       return signalPassFailure();
     }
-    program.banksetPingPongLead = banksetPingPong == 1 ? 12 : banksetPingPong;
+    program.banksetPingPongLead = banksetPingPong < 0 ? specOr->pim.banksetPingPongLead
+                                  : banksetPingPong == 1 ? 12 : banksetPingPong;
     program.channels = specOr->pim.channels;
     program.partitions = specOr->pim.partitions;
     if (program.channels < 1 || program.partitions < 1 || program.partitions > program.channels * pim::kRanks) {
@@ -163,10 +166,43 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
           if (program.partRank(c) != rank) loads[c] = std::numeric_limits<int64_t>::max() / 4;
       }
       int64_t first = records;
+      // Stream layout of the phase's projections (they share the input): the fastest estimate over the
+      // target's accumulator counts and split-K pieces. A split-K output is a set of partial sums that
+      // only the NPU gather adds, so an INT32 result the step returns as is stays whole.
+      SmallVector<hyb::QMatmulOp> group;
+      callee.walk([&](hyb::QMatmulOp q) { group.push_back(q); });
+      std::vector<int64_t> rows;
+      bool allowSplit = true;
+      for (hyb::QMatmulOp q : group) {
+        auto out = cast<BlockArgument>(q.getInit());
+        rows.push_back(cast<MemRefType>(out.getType()).getDimSize(1));
+        for (Operation *user : call.getOperand(out.getArgNumber()).getUsers())
+          allowSplit &= !isa<func::ReturnOp>(user);
+      }
+      int open = 0;
+      for (int c = 0; c < program.partitions; ++c) open += loads.count(c) == 0;
+      std::vector<pimcost::Shape> shapes(group.size());
+      if (!fixedStorage && !group.empty()) {
+        pimcost::Estimate best, plain = pimcost::estimate(*specOr, M, K, rows, shapes, open);
+        shapes = pimcost::choose(*specOr, M, K, rows, open, allowSplit, best);
+        std::string label, choice;
+        for (auto [i, q] : llvm::enumerate(group)) {
+          label += (i ? ";" : "") + q.getWeight().str();
+          choice += (i ? ", " : "") + ("A=" + std::to_string(shapes[i].accs) + " S=" + std::to_string(shapes[i].splitK));
+        }
+        cost::recordDecision(callee, "pim stream layout", label, choice,
+                             {{"tokens", double(M)}, {"k", double(K)}, {"partitions", double(open)},
+                              {"pim_us", best.pimUs}, {"gather_us", best.gatherUs}, {"split_sum_us", best.sumUs},
+                              {"pim_us_512_rows", plain.pimUs}, {"gather_us_512_rows", plain.gatherUs}});
+      }
+      size_t qi = 0;
       callee.walk([&](hyb::QMatmulOp q) {
         auto out = cast<BlockArgument>(q.getInit());
         auto outT = cast<MemRefType>(out.getType());
-        int64_t pi = program.addProjection(q.getWeight().str(), outT.getDimSize(1), K, acts, loads);
+        const pimcost::Shape shape = shapes[qi++];
+        const int64_t streamLoad = pimcost::streamCycles(*specOr, M, K / pim::kKPerSweep / shape.splitK, shape.accs);
+        int64_t pi = program.addProjection(q.getWeight().str(), outT.getDimSize(1), K, acts, loads, shape.accs,
+                                           shape.splitK, streamLoad);
         const pim::Projection &p = program.projections[pi];
         program.projections[pi].computeFirst = records;
         int64_t count = p.commands(); // final executable primitive count

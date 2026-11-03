@@ -52,8 +52,31 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(p, "nlld_ck", s.pim.nlldCK); num(p, "efficiency", s.pim.efficiency); num(p, "phase_fixed_us", s.pim.phaseFixedUs);
   num(p, "act_write_us_per_kib", s.pim.actWriteUsPerKiB); num(p, "act_write_fixed_us", s.pim.actWriteFixedUs);
   num(p, "readback_us_per_kib", s.pim.readbackUsPerKiB); num(p, "readback_fixed_us", s.pim.readbackFixedUs);
-  if (p)
+  num(p, "ldmac_ck", s.pim.ldmacCK); num(p, "sweep_ck", s.pim.sweepCK); num(p, "stream_ck", s.pim.streamCK);
+  num(p, "readback_gbps", s.pim.readbackGBps); num(p, "readback_piece_us", s.pim.readbackPieceUs);
+  num(p, "act_write_gbps", s.pim.actWriteGBps); num(p, "act_write_piece_us", s.pim.actWritePieceUs);
+  num(p, "max_split_k", s.pim.maxSplitK); num(p, "bankset_pingpong_lead", s.pim.banksetPingPongLead);
+  if (p) {
     if (auto v = p->getBoolean("concurrent_ranks")) s.pim.concurrentRanks = *v;
+    if (auto *accs = p->getArray("stream_accs")) {
+      s.pim.streamAccs.clear();
+      for (const llvm::json::Value &v : *accs)
+        if (auto a = v.getAsInteger()) s.pim.streamAccs.push_back(int(*a));
+    }
+  }
+  if (s.pim.ldmacCK <= 0) s.pim.ldmacCK = s.pim.nlldCK;
+  if (s.pim.sweepCK < 0 || s.pim.streamCK < 0 || !(s.pim.readbackGBps > 0) || !(s.pim.actWriteGBps > 0) ||
+      s.pim.readbackPieceUs < 0 || s.pim.actWritePieceUs < 0 || s.pim.maxSplitK < 1 || s.pim.streamAccs.empty() ||
+      s.pim.banksetPingPongLead < 0 || s.pim.banksetPingPongLead > 63) {
+    error = "pim stream cost values must be nonnegative (rates positive), max_split_k >= 1, stream_accs nonempty, "
+            "bankset_pingpong_lead 0..63";
+    return failure();
+  }
+  for (int a : s.pim.streamAccs)
+    if (a < 2 || a > 16 || a % 2) {
+      error = "pim.stream_accs entries must be even accumulator counts 2..16";
+      return failure();
+    }
   num(l, "capacity_bytes", s.lp6.capacityBytes); num(l, "row_bytes", s.lp6.rowBytes);
   num(n, "l1_reserved_bytes", s.npu.l1ReservedBytes); num(n, "l2_staging_bytes_per_core", s.npu.l2StagingPerCore);
   num(n, "weight_stream_max_slots", s.npu.weightStreamMaxSlots);

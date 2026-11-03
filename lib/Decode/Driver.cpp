@@ -72,7 +72,8 @@ static cl::opt<int> pimActivationCores("pim-activation-cores",
     cl::desc("1 default; 4 opts into checked isolated quant/PIM activation-feed parallelism with --force=pim"),
     cl::init(1));
 static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
-    cl::desc("research PIM weight-row ping-pong: 0 off, 1 default lead 12, 2..63 lead"), cl::init(0));
+    cl::desc("PIM weight rows on alternating bank sets: -1 the target's pim.bankset_pingpong_lead (default), "
+             "0 off, 1 lead 12, 2..63 lead"), cl::init(-1));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
                                   cl::init(false));
 static cl::opt<bool> noOutputCollect("no-output-collect",

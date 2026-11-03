@@ -73,6 +73,18 @@ struct TargetSpec {
     int parallelPartitions() const { return concurrentRanks ? partitions : std::min(partitions, channels); }
     double efficiency = 0.485, phaseFixedUs = 1.0;
     double actWriteUsPerKiB = 0.9, actWriteFixedUs = 1.5, readbackUsPerKiB = 0.35, readbackFixedUs = 1.5;
+    // ---- stream layout cost (npu/Decode/Support/PimCost.h), measured on the simulator ----------
+    /// PIM cycles per LdMAC in a long stream, row activation and precharge included (nLLD when 0).
+    double ldmacCK = 0;
+    /// Fixed PIM cycles per stream sweep (its activation register loads) and per stream (clear, store).
+    double sweepCK = 0, streamCK = 0;
+    /// NPU gather of INT32 PIM outputs (per K piece) and scatter of INT8 activations (per token).
+    double readbackGBps = 32, readbackPieceUs = 0, actWriteGBps = 96, actWritePieceUs = 0;
+    /// Accumulator counts a stream may use (even, 2..16) and the largest split-K.
+    std::vector<int> streamAccs = {2, 4, 6, 8, 10, 12, 14, 16};
+    int maxSplitK = 8;
+    /// Default weight row layout: 0 even bank set, else alternate bank sets with this LdMAC lead.
+    int banksetPingPongLead = 0;
   } pim;
   struct Lp6 {
     int64_t capacityBytes = int64_t(16) << 30, rowBytes = 65536;

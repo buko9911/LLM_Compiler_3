@@ -27,11 +27,16 @@ llvm::json::Value toJSON(const Program &program) {
   llvm::json::Array a, p, ph;
   for (const Activation &x : program.activations)
     a.push_back(llvm::json::Object{{"k", x.k}, {"base", x.base}, {"parts", llvm::json::Array(x.parts)}});
-  for (const Projection &x : program.projections)
-    p.push_back(llvm::json::Object{{"weight", x.name}, {"n", x.n}, {"k", x.k}, {"n_pad", x.nPad},
-                                   {"stream_weight_base", llvm::json::Array(x.streamWeightBase)}, {"output_base", x.outputBase},
-                                   {"acts", llvm::json::Array(x.activations)}, {"stream_part", llvm::json::Array(x.streamPart)},
-                                   {"compute_first", x.computeFirst}, {"compute_count", x.computeCount}});
+  for (const Projection &x : program.projections) {
+    llvm::json::Object o{{"weight", x.name}, {"n", x.n}, {"k", x.k}, {"n_pad", x.nPad},
+                         {"stream_weight_base", llvm::json::Array(x.streamWeightBase)}, {"output_base", x.outputBase},
+                         {"acts", llvm::json::Array(x.activations)}, {"stream_part", llvm::json::Array(x.streamPart)},
+                         {"compute_first", x.computeFirst}, {"compute_count", x.computeCount}};
+    // Stream shape, written only when it is not the 512-row stream over all of K.
+    if (x.accs != kAccs) o["accs"] = x.accs;
+    if (x.splitK != 1) o["split_k"] = x.splitK;
+    p.push_back(std::move(o));
+  }
   for (auto [f, c] : program.phases) ph.push_back(llvm::json::Array{f, c});
   return llvm::json::Object{{"channels", program.channels}, {"partitions", program.partitions}, {"kernel_row", program.kernelRow},
                             {"weight_layout", program.weightLayout()}, {"bankset_pingpong_lead", program.banksetPingPongLead},
@@ -69,6 +74,8 @@ Program fromJSON(const llvm::json::Value &v) {
     p.n = *xo->getInteger("n");
     p.k = *xo->getInteger("k");
     p.nPad = *xo->getInteger("n_pad");
+    if (auto v = xo->getInteger("accs")) p.accs = int(*v);
+    if (auto v = xo->getInteger("split_k")) p.splitK = int(*v);
     for (const llvm::json::Value &c : *xo->getArray("stream_weight_base")) p.streamWeightBase.push_back(*c.getAsInteger());
     p.outputBase = *xo->getInteger("output_base");
     for (const llvm::json::Value &c : *xo->getArray("acts")) p.activations.push_back(*c.getAsInteger());

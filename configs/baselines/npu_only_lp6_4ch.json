@@ -42,7 +42,11 @@
   "act_write_us_per_kib": 0.9,
   "act_write_fixed_us": 1.5,
   "readback_us_per_kib": 0.35,
-  "readback_fixed_us": 1.5
+  "readback_fixed_us": 1.5,
+  "bankset_pingpong_lead": 12,
+  "ldmac_ck": 10.45,
+  "sweep_ck": 784,
+  "stream_ck": 1017
  },
  "lp6": {
   "capacity_bytes": 17179869184,
