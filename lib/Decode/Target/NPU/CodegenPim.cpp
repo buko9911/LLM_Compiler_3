@@ -10,15 +10,19 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include <algorithm>
+#include <limits>
 #include <set>
 
 namespace mlir::hybrid::codegen {
 
 /// INT32 GEMV results [rows, cols] of a PIM output -> contiguous L1 rows. A stored tile holds
-/// 8 consecutive outputs of one PU; runs split at DRAM rows and partition boundaries are
-/// gathered in the staging window, one LDMA per chunk. A split-K projection stores one partial
-/// sum per K piece: piece 0 lands in the destination, every further piece in the L1 scratch,
-/// and the VPU adds it (INT32, so the sum is exact and independent of the split).
+/// 8 consecutive outputs of one PU. For each token, K piece and PU, every partition keeps its
+/// tiles under the same ids (Projection::outputTile), so one bank group's part of a column (all
+/// subchannels, 32 B each) holds that PU's tile of every partition: those slices are gathered with
+/// GDMAs that read every subchannel at once, then each partition's run of tiles is moved to its
+/// logical place by one strided LDMA. A split-K projection stores one partial sum per K piece:
+/// piece 0 lands in the destination, every further piece in the L1 scratch, and the VPU adds it
+/// (INT32, so the sum is exact and independent of the split).
 LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &err) {
   const pim::Projection &p = in.pim->projections[size_t(s.lp6.getAs<IntegerAttr>("proj").getInt())];
   if (s.shape.size() != 2 || s.strides[1] != 1 || d.space != kL1 || d.strides.back() != 1) {
@@ -32,6 +36,8 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
   }
   int64_t dRow = d.shape.size() == 2 ? d.strides[0] : cols;
   const int64_t T = p.tilesPerPU(), npu = p.rowsPerPU(), per = p.tilesPerStream(), blocks = p.blocks();
+  const int channels = in.pim->channels;
+  const int64_t slice = int64_t(pim::kChBytes) * channels, colBytes = in.pim->colBytes();
   // First PU-local tile after t whose stream lives in another partition (inside one K piece).
   auto partEnd = [&](int64_t t, int piece) {
     int64_t b = t / per;
@@ -39,7 +45,7 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     while (b < blocks && p.streamPart[size_t(piece * blocks + b)] == part) ++b;
     return b * per;
   };
-  uint64_t win = windowBase(curCore);
+  const uint64_t win = windowBase(curCore), winEnd = win + uint64_t(window());
   int64_t chunk = window() / 4 / 8 * 8;
   const uint64_t partial = scratchBase;
   if (p.splitK > 1) {
@@ -50,26 +56,57 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     }
     chunk = std::min(chunk, scratch);
   }
+  struct Run { int64_t t, n, id; int part; };
+  uint64_t stage = win;
   for (int64_t r = 0; r < rows; ++r) {
     int m = int(m0 + r);
     for (int64_t c0 = n0; c0 < n0 + cols; c0 += chunk) {
       int64_t c1 = std::min(n0 + cols, c0 + chunk);
       const uint64_t dst = addr(d, r * dRow + (c0 - n0));
       for (int piece = 0; piece < p.splitK; ++piece) {
+        const uint64_t target = piece == 0 ? dst : partial;
         for (int pu = 0; pu < pim::kPUs; ++pu) {
           int64_t lo = std::max(c0, int64_t(pu) * npu), hi = std::min(c1, int64_t(pu + 1) * npu);
           if (lo >= hi) continue;
-          int64_t ta = (lo - pu * npu) / 8, tb = (hi - pu * npu) / 8;
-          for (int64_t t = ta; t < tb && t < T;) {
-            int64_t tile = p.tokenOutputTile(m, t, piece);
-            int64_t pk = p.outputBase + tile;
-            int64_t n = std::min({tb - t, pim::kPacketsPerRow - pk % pim::kPacketsPerRow, partEnd(t, piece) - t});
-            gdmaLoad(in.pim->outputTileAddress(p, tile, pu), win + uint64_t((pu * npu + t * 8 - c0) * 4), 32,
-                     uint32_t(n), uint32_t(in.pim->colBytes()), 32);
+          int64_t ta = (lo - pu * npu) / 8, tb = std::min(T, (hi - pu * npu) / 8);
+          SmallVector<Run> runs;
+          std::set<int> ranks;
+          for (int64_t t = ta; t < tb;) {
+            const int64_t g = p.streamOfTile(t, piece);
+            const int part = p.streamPart[size_t(g)];
+            const int64_t n = std::min(tb - t, partEnd(t, piece) - t);
+            runs.push_back({t, n, p.outputTile(m, piece, g, int(t % per)), part});
+            ranks.insert(in.pim->partRank(part));
             t += n;
           }
+          for (int rank : ranks) {
+            int64_t idLo = std::numeric_limits<int64_t>::max(), idHi = 0;
+            for (const Run &run : runs)
+              if (in.pim->partRank(run.part) == rank) {
+                idLo = std::min(idLo, run.id);
+                idHi = std::max(idHi, run.id + run.n);
+              }
+            const uint64_t need = uint64_t(idHi - idLo) * uint64_t(slice);
+            if (need > uint64_t(window())) {
+              err = "PIM output gather: one PU's tile slices exceed the L2 staging window";
+              return failure();
+            }
+            if (stage + need > winEnd) stage = win;   // reuse waits for the earlier readers (L2 hazards)
+            const uint64_t base = stage;
+            stage += need;
+            for (int64_t id = idLo; id < idHi;) {
+              const int64_t n = std::min(idHi - id, pim::kPacketsPerRow - id % pim::kPacketsPerRow);
+              gdmaLoad(in.pim->outputTileAddress(id, pu, rank * channels), base + uint64_t((id - idLo) * slice),
+                       uint32_t(slice), uint32_t(n), uint32_t(colBytes), uint32_t(slice));
+              id += n;
+            }
+            for (const Run &run : runs)
+              if (in.pim->partRank(run.part) == rank)
+                ldma(target + uint64_t((pu * npu + run.t * 8 - c0) * 4),
+                     base + uint64_t((run.id - idLo) * slice + in.pim->partChannel(run.part) * pim::kChBytes),
+                     uint32_t(pim::kChBytes), uint32_t(run.n), uint32_t(slice), uint32_t(pim::kChBytes), true);
+          }
         }
-        ldma(piece == 0 ? dst : partial, win, uint32_t((c1 - c0) * 4), 1, 0, 0, true);
         if (piece == 0) continue;
         for (int64_t e = 0; e < c1 - c0; e += 16) {
           const uint32_t lanes = uint32_t(std::min<int64_t>(16, c1 - c0 - e));

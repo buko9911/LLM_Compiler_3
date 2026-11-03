@@ -79,11 +79,18 @@ struct Projection {
   int64_t tilesPerStream() const { return accs / 2; }        // per PU
   int64_t streamTiles() const { return pieceSweeps() * accs * kInTiles; }
   int tokens() const { return int(activations.size()); }
-  // Output tile id (relative to outputBase) of PU-local tile t of token m and piece j.
-  int64_t tokenOutputTile(int m, int64_t t, int piece = 0) const {
-    return (int64_t(m) * splitK + piece) * blocks() * tilesPerStream() + t;
+  // Output tiles. For each token and K piece, every partition numbers the tiles of its streams from
+  // the same id: stream g's register r is tile outputTile(m, piece, g, r). One LP6 column (one tile
+  // id) then holds that id's tile of every subchannel, so the NPU gathers whole bank-group slices
+  // (all subchannels at once) instead of 32-byte tiles from one bank at a time.
+  int64_t outputSlots = 0;            // tile ids per (token, piece): the most tiles one partition stores
+  std::vector<int64_t> streamSlot;    // first tile slot of each stream inside its partition and piece
+  void assignOutputSlots();           // from streamPart; addProjection and plan loading call it
+  int64_t outputTile(int m, int piece, int64_t g, int reg) const {
+    return outputBase + (int64_t(m) * splitK + piece) * outputSlots + streamSlot[size_t(g)] + reg;
   }
-  int tilePart(int64_t tile) const { return streamPart[size_t((tile / tilesPerStream()) % streams())]; }
+  // The stream that stores PU-local output tile t (rows t * 8 .. t * 8 + 7 of each PU) of a piece.
+  int64_t streamOfTile(int64_t t, int piece) const { return piece * blocks() + t / tilesPerStream(); }
   // Current compiler schedule: clear, load/stream per K sweep, store.
   int64_t commands() const {
     return int64_t(tokens()) * streams() * (accs + pieceSweeps() * (kInTiles / kSlices + 1) + accs / 2);
@@ -123,6 +130,8 @@ struct Program {
                         std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1, int64_t streamLoad = 0);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
+  // Output tile ids of every projection again, in order (after the streams were rebound).
+  void assignOutputs();
   // Lower a projection into final executable PIM IR, before serialization.
   Result<bool> emitCompute(int64_t index, std::vector<Primitive> &commands);
 
@@ -136,8 +145,8 @@ struct Program {
   uint64_t activationPacketAddress(const Activation &a, int64_t packet, int pu, int part) const {
     return packetAddress(baseRows().activation, a.packetBase() + packet, pu, part);
   }
-  uint64_t outputTileAddress(const Projection &p, int64_t tile, int pu) const {
-    return packetAddress(baseRows().output, p.outputBase + tile, pu, p.tilePart(tile));
+  uint64_t outputTileAddress(int64_t tile, int pu, int part) const {
+    return packetAddress(baseRows().output, tile, pu, part);
   }
   // Logical output rows of stored tile t of PU pu: 8 rows, in packet word order.
   int64_t firstRow(const Projection &p, int pu, int64_t t) const { return pu * p.rowsPerPU() + t * 8; }

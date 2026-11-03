@@ -411,11 +411,12 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
           for (int m = 0; m < p.tokens(); ++m)
             for (int pu = 0; pu < pim::kPUs; ++pu)
               for (int64_t first = 0; first < T;) {
-                int64_t tile = p.tokenOutputTile(m, first);
-                int64_t pk = p.outputBase + tile;
-                int64_t n = std::min({T - first, pim::kPacketsPerRow - pk % pim::kPacketsPerRow, partEnd(first) - first});
+                const int64_t g = p.streamOfTile(first, 0);
+                const int part = p.streamPart[size_t(g)];
+                const int64_t tile = p.outputTile(m, 0, g, int(first % per));
+                int64_t n = std::min({T - first, pim::kPacketsPerRow - tile % pim::kPacketsPerRow, partEnd(first) - first});
                 uint64_t dst = at + uint64_t((int64_t(m) * p.nPad + pu * p.rowsPerPU() + first * 8) * 4);
-                w.gdmaLoad(prog.outputTileAddress(p, tile, pu), dst, 32, uint32_t(n), uint32_t(prog.colBytes()), 32);
+                w.gdmaLoad(prog.outputTileAddress(tile, pu, part), dst, 32, uint32_t(n), uint32_t(prog.colBytes()), 32);
                 ldma(dst, uint32_t(32 * n));
                 first += n;
               }

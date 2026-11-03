@@ -82,6 +82,7 @@ Program fromJSON(const llvm::json::Value &v) {
     for (const llvm::json::Value &c : *xo->getArray("stream_part")) p.streamPart.push_back(int(*c.getAsInteger()));
     p.computeFirst = *xo->getInteger("compute_first");
     p.computeCount = *xo->getInteger("compute_count");
+    if (!p.streamPart.empty()) p.assignOutputSlots();
     pr.projections.push_back(p);
   }
   for (const llvm::json::Value &x : *o->getArray("phases")) {
@@ -307,6 +308,7 @@ Result<bool> bindPimWeightStorage(pim::Program &p, const PimWeightStorage &s) {
     }
   }
   for (auto &a : p.activations) std::sort(a.parts.begin(), a.parts.end());
+  p.assignOutputs();   // output tile slots follow the rebound streams
   return Result<bool>::success(true);
 }
 } // namespace npu::decode

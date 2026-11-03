@@ -55,7 +55,8 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
     p.streamWeightBase.push_back(nextWeight[size_t(c)]);
     nextWeight[size_t(c)] += p.streamTiles();
   }
-  nextOutput += p.streams() * p.tilesPerStream() * int64_t(inputs.size());
+  p.assignOutputSlots();
+  nextOutput += int64_t(inputs.size()) * splitK * p.outputSlots;
   for (int64_t a : inputs)
     for (int c : p.streamPart)
       if (!std::count(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end(), c))
@@ -63,6 +64,30 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   for (int64_t a : inputs) std::sort(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end());
   projections.push_back(p);
   return int64_t(projections.size()) - 1;
+}
+
+void Projection::assignOutputSlots() {
+  streamSlot.assign(size_t(streams()), 0);
+  outputSlots = 0;
+  for (int64_t piece = 0; piece < splitK; ++piece) {
+    std::map<int, int64_t> used;
+    for (int64_t b = 0; b < blocks(); ++b) {
+      const int64_t g = piece * blocks() + b;
+      int64_t &slot = used[streamPart[size_t(g)]];
+      streamSlot[size_t(g)] = slot;
+      slot += tilesPerStream();
+      outputSlots = std::max(outputSlots, slot);
+    }
+  }
+}
+
+void Program::assignOutputs() {
+  nextOutput = 0;
+  for (Projection &p : projections) {
+    p.outputBase = nextOutput;
+    p.assignOutputSlots();
+    nextOutput += int64_t(p.tokens()) * p.splitK * p.outputSlots;
+  }
 }
 
 int64_t Program::storedTiles(int rank) const {
@@ -113,7 +138,8 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
         q.activationInputStride = 1; q.accumulatorOutputStride = 1;
         commands.push_back(q);
       }
-      int64_t firstO = p.outputBase + p.tokenOutputTile(m, block * p.tilesPerStream(), int(piece));
+      int64_t firstO = p.outputTile(m, int(piece), g, 0);
+      (void)block;
       if (firstO + accs / 2 > INT32_MAX)
         return Result<bool>::failure(p.name + ": PIM output tile ID exceeds INT32_MAX");
       for (int reg = 0; reg < accs / 2; ++reg) {
