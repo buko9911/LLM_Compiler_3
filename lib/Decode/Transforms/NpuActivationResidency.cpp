@@ -22,18 +22,10 @@ using namespace mlir::hybrid;
 
 namespace {
 
-/// Only NPU phases, and none of them the PIM packet kernel.
-bool isNpuOnly(ModuleOp module) {
-  if (module->hasAttr("hyb.pim_packet_npu_requested")) return false;
-  bool hasNpu = false;
-  for (auto fn : module.getOps<func::FuncOp>()) {
-    auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-    if (!phase) continue;
-    if (phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) return false;
-    hasNpu = true;
-  }
-  return hasNpu;
-}
+/// The packet-NPU research kernel (--pim-packet-npu) keeps its own buffer contract. Every other NPU
+/// phase qualifies, also in a program with PIM phases (their LP6 inputs are phase outputs, which
+/// keep their LP6 buffers).
+bool packetKernel(ModuleOp module) { return module->hasAttr("hyb.pim_packet_npu_requested"); }
 
 struct HybNpuActivationResidencyPass
     : mlir::hybrid::impl::HybNpuActivationResidencyBase<HybNpuActivationResidencyPass> {
@@ -42,7 +34,7 @@ struct HybNpuActivationResidencyPass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (!isNpuOnly(getOperation())) return;
+    if (packetKernel(getOperation())) return;
 
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       // hyb-outline-phases emits one straight-line block; leave anything else untouched.

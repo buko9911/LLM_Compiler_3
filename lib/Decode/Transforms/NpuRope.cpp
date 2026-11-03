@@ -225,7 +225,6 @@ struct HybNpuRopePass : mlir::hybrid::impl::HybNpuRopeBase<HybNpuRopePass> {
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    if (hasPimPhase(getOperation())) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       SmallVector<Rope> found;
       for (Operation &op : fn.front())

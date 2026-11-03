@@ -248,7 +248,7 @@ def HybNpuActivationResidency : Pass<"hyb-npu-activation-residency", "ModuleOp">
     CSE may let phase-local activations share the tensor.empty of an escaping output, so that
     bufferization writes them into the phase's LP6 out-parameter. Each escaping output gets a
     private destination; the local values then stay on chip (hyb-npu-place puts shared ones in
-    L2). NPU-only modules only.
+    L2). Runs on every NPU phase, also next to PIM phases; not with --pim-packet-npu.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
   let dependentDialects = ["tensor::TensorDialect", "func::FuncDialect"];

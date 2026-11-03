@@ -320,8 +320,6 @@ struct HybNpuElementwiseDistributePass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    // NPU-only, like hyb-npu-attention-fusion.
-    if (hasPimPhase(getOperation())) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t count = 0, candidates = 0, small = 0, unsupported = 0, capacity = 0, indivisible = 0;
       fn.walk([&](scf::ForallOp loop) { count += loop->hasAttr(marker); });

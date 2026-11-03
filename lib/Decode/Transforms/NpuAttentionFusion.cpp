@@ -145,8 +145,6 @@ struct HybNpuAttentionFusionPass
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    // NPU-only: mixed NPU/PIM programs have their own phase ownership and SRAM use.
-    if (hasPimPhase(getOperation())) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       int64_t matched = 0, fused = 0, direct = 0, unsupported = 0, singleCore = 0;
       int64_t existing = 0;
