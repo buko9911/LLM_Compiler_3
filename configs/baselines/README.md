@@ -24,6 +24,19 @@ partition that does not fit L1 into column chunks. Every choice and its numbers 
 | `gdma_read_gbps` | 92.9 | a Qwen3-4B program's GDMA reads replayed without compute (2026-10-31) |
 | `core_split_us` | 0.5 | fixed cost of running one op on 4 cores instead of 1, Qwen3-4B one-layer fixtures, every op split vs none at M = 1, 4, 8 (2026-10-31) |
 
+The same file is the NPU+PIM target (compile without `--force`; `hyb-partition` picks the device per GEMV
+group). Its PIM stream numbers were fitted on the Ramulator LPDDR6-PIM model (2026-11-03, Qwen3-4B 2-layer
+decode fixtures, every projection at A = 4..14 accumulators per stream plus mixed layouts; 35 PIM phases
+within 1.4% except one at 6%):
+
+| PIM number | Value | Meaning |
+|---|---|---|
+| `bankset_pingpong_lead` | 12 | weight rows alternate bank sets, the other set's row opens 12 LdMACs ahead (leads 12..48 measured within 0.1%; 0 is 14% slower per layer) |
+| `ldmac_ck` | 10.45 | PIM cycles per LdMAC in a long stream (nLLD 10) |
+| `sweep_ck` | 784 | fixed cycles per 256-input sweep of a stream (activation register loads, row changes) |
+| `stream_ck` | 1017 | fixed cycles per stream (clear and store of its accumulators) |
+| `concurrent_ranks` | false | two ranks of one subchannel computing together gave no gain on this model (2026-11-03) |
+
 Measurements, the comparison with the earlier per-step presets and what remains: workspace
 `docs/research/NPU_ONLY_BASELINE.md`. The contribution of each former switch (measured 2026-11-02, before
 they were removed): workspace `docs/architecture/COMPILER.md` appendix A.
