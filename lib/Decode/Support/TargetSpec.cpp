@@ -57,6 +57,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(p, "readback_gbps", s.pim.readbackGBps); num(p, "readback_piece_us", s.pim.readbackPieceUs);
   num(p, "act_write_gbps", s.pim.actWriteGBps); num(p, "act_write_piece_us", s.pim.actWritePieceUs);
   num(p, "readback_ns_per_output", s.pim.readbackNsPerOutput);
+  num(p, "npu_run_split_us", s.pim.npuRunSplitUs); num(p, "npu_run_split_us_per_token", s.pim.npuRunSplitUsPerToken);
   num(p, "max_split_k", s.pim.maxSplitK); num(p, "bankset_pingpong_lead", s.pim.banksetPingPongLead);
   if (p) {
     if (auto v = p->getBoolean("concurrent_ranks")) s.pim.concurrentRanks = *v;
@@ -68,7 +69,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.pim.ldmacCK <= 0) s.pim.ldmacCK = s.pim.nlldCK;
   if (s.pim.sweepCK < 0 || s.pim.streamCK < 0 || !(s.pim.readbackGBps > 0) || !(s.pim.actWriteGBps > 0) ||
-      s.pim.readbackNsPerOutput < 0 ||
+      s.pim.readbackNsPerOutput < 0 || s.pim.npuRunSplitUs < 0 || s.pim.npuRunSplitUsPerToken < 0 ||
       s.pim.readbackPieceUs < 0 || s.pim.actWritePieceUs < 0 || s.pim.maxSplitK < 1 || s.pim.streamAccs.empty() ||
       s.pim.banksetPingPongLead < 0 || s.pim.banksetPingPongLead > 63) {
     error = "pim stream cost values must be nonnegative (rates positive), max_split_k >= 1, stream_accs nonempty, "

@@ -76,8 +76,11 @@ def HybPartition : Pass<"hyb-partition", "ModuleOp"> {
   let description = [{
     Estimates each group on the NPU (weight streaming, INT8 MMA) and on PIM (LdMAC streams over
     the partitions plus the boundary work: activation written in PIM layout, INT32 outputs read
-    back) and picks the cheaper target. `force` and the spec's `mapping` override the choice.
-    Sets `group` and `target` on the qmatmuls and writes the cost table to `report`.
+    back). The groups of one layer are chosen together: the cheapest NPU/PIM combination, where each
+    extra run of NPU groups inside the layer (a PIM group between two NPU groups) costs
+    pim.npu_run_split_us. Groups outside the layers (LM head) take the cheaper target. `force` and
+    the spec's `mapping` override the choice. Sets `group` and `target` on the qmatmuls and writes
+    the cost table to `report`.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">,
                  Option<"force", "force", "std::string", "\"\"", "npu | pim: override the policy for every group">,

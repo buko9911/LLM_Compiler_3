@@ -83,6 +83,9 @@ struct TargetSpec {
     /// NPU time per PIM output per token to bring it back and dequantize it (hyb-partition; the NPU
     /// path dequantizes behind its own GEMV, so this is extra PIM-side work).
     double readbackNsPerOutput = 0;
+    /// hyb-partition: NPU time lost when a PIM group splits a layer's NPU weight stream into two runs
+    /// (the NPU work next to the split is no longer hidden behind weight reads), fixed + per token.
+    double npuRunSplitUs = 0, npuRunSplitUsPerToken = 0;
     /// Accumulator counts a stream may use (even, 2..16) and the largest split-K.
     std::vector<int> streamAccs = {2, 4, 6, 8, 10, 12, 14, 16};
     int maxSplitK = 8;

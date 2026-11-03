@@ -36,6 +36,7 @@ within 1.4% except one at 6%):
 | `sweep_ck` | 784 | fixed cycles per 256-input sweep of a stream (activation register loads, row changes) |
 | `stream_ck` | 1017 | fixed cycles per stream (clear and store of its accumulators) |
 | `readback_ns_per_output` | 0.33 | NPU time per PIM output and token after the PIM phase beyond the gather bytes (dequant, gather setup): Qwen3-4B LM head 151,936 outputs in 69 us (hyb-partition only) |
+| `npu_run_split_us` | 45 | hyb-partition: NPU time lost when a PIM group splits a layer's NPU weight stream (O or gate/up on PIM, the rest NPU): Qwen3-4B 2-layer, 4 and 8 tokens, measured 2026-11-03 (`npu_run_split_us_per_token` 0) |
 | `concurrent_ranks` | false | two ranks of one subchannel computing together gave no gain on this model (2026-11-03) |
 
 Measurements, the comparison with the earlier per-step presets and what remains: workspace
