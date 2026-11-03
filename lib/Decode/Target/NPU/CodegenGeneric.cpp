@@ -819,7 +819,7 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
   unsigned loopFrom = inner;            // outer dims [loopFrom, inner) form the row loop
   int64_t loopRows = 1;
   SmallVector<int64_t> rowBytes(views.size(), 0);
-  if (inner > 0 && n <= 512 && rowOperands.size() <= std::size(kLoopPointers)) {
+  if (inner > 0 && rowOperands.size() <= std::size(kLoopPointers)) {
     bool fits = true;
     for (unsigned i : rowOperands) {
       int64_t stride = dimStride(i, inner - 1);
@@ -836,6 +836,11 @@ LogicalResult Codegen::lowerGeneric(linalg::GenericOp g, std::string &err) {
         loopRows *= ranges[loopFrom];
       }
       if (loopRows < 2) loopFrom = inner;
+      // A row body unrolls its 32-lane chunks. The command processor routes a core block's words at
+      // npu fetch width (4 words/cycle) and issues nothing else meanwhile, so a long row takes
+      // the row loop only when its unrolled body is no larger than the rows' four-chunk loops
+      // that the alternative unrolls per row.
+      if (n > 512 && (n + 31) / 32 > 4 * loopRows) loopFrom = inner;
     }
   }
   DenseMap<unsigned, uint32_t> pointers;
