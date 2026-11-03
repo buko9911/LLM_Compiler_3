@@ -271,6 +271,8 @@ def HybPlanLP6 : Pass<"hyb-plan-lp6", "ModuleOp"> {
     layout" in io.json). Fixed weight storage (export/import) keeps 512-row streams over all of K.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">,
+                 Option<"reusePimBuffers", "reuse-pim-buffers", "bool", "true",
+                        "when the plan exceeds LP6 capacity, give all PIM phases one set of activation/output tiles (off for collected buffers)">,
                  Option<"banksetPingPong", "bankset-pingpong", "int", "-1",
                         "weight rows on alternating bank sets: -1 target pim.bankset_pingpong_lead, 0 off, "
                         "1 lead 12, 2..63 lead">];

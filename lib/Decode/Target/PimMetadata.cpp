@@ -8,8 +8,8 @@ namespace npu::decode {
 using namespace ::npu::pim;
 llvm::json::Object pimRuntimeStorageLayout(const Program &program) {
   const auto base = program.baseRows();
-  const int64_t outputRows = program.nextOutput / kPacketsPerRow +
-                            (program.nextOutput % kPacketsPerRow != 0);
+  const int64_t outputRows = program.outputTiles() / kPacketsPerRow +
+                            (program.outputTiles() % kPacketsPerRow != 0);
   // Preserve Program's existing activation reservation by logical tile count.
   // Runtime packet packing must not shrink this region or shift later regions.
   return llvm::json::Object{
@@ -42,7 +42,9 @@ llvm::json::Value toJSON(const Program &program) {
   return llvm::json::Object{{"channels", program.channels}, {"partitions", program.partitions}, {"kernel_row", program.kernelRow},
                             {"weight_layout", program.weightLayout()}, {"bankset_pingpong_lead", program.banksetPingPongLead},
                             {"next_w", llvm::json::Array(program.nextWeight)},
-                            {"next_a", program.nextActivation}, {"next_o", program.nextOutput}, {"acts", std::move(a)},
+                            {"next_a", program.nextActivation}, {"next_o", program.nextOutput},
+                            {"peak_a", program.activationTiles()}, {"peak_o", program.outputTiles()},
+                            {"reuse_buffers", program.reuseBuffers}, {"acts", std::move(a)},
                             {"projections", std::move(p)}, {"phases", std::move(ph)}};
 }
 
@@ -60,6 +62,9 @@ Program fromJSON(const llvm::json::Value &v) {
   for (const llvm::json::Value &c : *o->getArray("next_w")) pr.nextWeight.push_back(*c.getAsInteger());
   pr.nextActivation = *o->getInteger("next_a");
   pr.nextOutput = *o->getInteger("next_o");
+  if (auto v = o->getInteger("peak_a")) pr.activationPeak = *v;
+  if (auto v = o->getInteger("peak_o")) pr.outputPeak = *v;
+  if (auto v = o->getBoolean("reuse_buffers")) pr.reuseBuffers = *v;
   for (const llvm::json::Value &x : *o->getArray("acts")) {
     const llvm::json::Object *xo = x.getAsObject();
     Activation a;

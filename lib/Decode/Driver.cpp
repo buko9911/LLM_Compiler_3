@@ -191,7 +191,8 @@ std::string decodePipeline(const std::string &overrideOpt) {
       "buffer-results-to-out-params{hoist-static-allocs},canonicalize,cse,";
   // 5. Memory: LP6 addresses, L1/L2 placement, explicit copies, layout rewrites, SRAM offsets.
   const std::string memory =
-      "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) + "},"
+      "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) +
+      " reuse-pim-buffers=" + (debugCollect ? "false" : "true") + "},"
       "loop-invariant-code-motion,"
       "hyb-npu-place,"                                        // L1 (one core) or L2 (shared)
       "hyb-npu-promote,"                                      // compute reads L1 only: insert copies

@@ -25,6 +25,7 @@
 // the strides below the rank grow with C; a rank is 8 GiB in both.
 #include "npu/Target/Result.h"
 #include "npu/Target/PimPrimitive.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -129,6 +130,16 @@ struct Program {
   int64_t kernelRow = 0;
   std::vector<int64_t> nextWeight = std::vector<int64_t>(4, 0);  // weight tile ids per partition
   int64_t nextActivation = 0, nextOutput = 0;
+  // A PIM phase's activation and output tiles are dead once the NPU phase after it has read them (the
+  // phases run one after another). With reuseBuffers every PIM phase numbers them from 0 and the regions
+  // are sized by the largest phase (activationPeak, outputPeak).
+  bool reuseBuffers = false;
+  int64_t activationPeak = 0, outputPeak = 0;
+  int64_t activationTiles() const { return reuseBuffers ? activationPeak : nextActivation; }
+  int64_t outputTiles() const { return reuseBuffers ? outputPeak : nextOutput; }
+  // Renumber the activation and output tiles of every PIM phase from 0 and set reuseBuffers. False (and no
+  // change) when an activation is read by two phases.
+  bool reuseBuffersAcrossPhases();
   std::vector<Activation> activations;
   std::vector<Projection> projections;
   std::vector<std::pair<int64_t, int64_t>> phases; // first command, command count
@@ -155,6 +166,7 @@ struct Program {
   int64_t storedTiles(int rank) const;
   // Output tile ids of every projection again, in order (after the streams were rebound).
   void assignOutputs();
+  int64_t phaseOf(const Projection &p) const;   // PIM phase holding p's commands, -1 for none
   // Lower a projection into final executable PIM IR, before serialization.
   Result<bool> emitCompute(int64_t index, std::vector<Primitive> &commands);
 

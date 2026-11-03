@@ -1,6 +1,7 @@
 #include "npu/Target/PimLayout.h"
 #include "npu/Target/ISAv2.h"
 #include <algorithm>
+#include <map>
 
 namespace npu::pim {
 namespace {
@@ -95,13 +96,61 @@ void Projection::assignOutputSlots() {
   }
 }
 
+int64_t Program::phaseOf(const Projection &p) const {
+  if (p.computeCount <= 0) return -1;
+  for (size_t i = 0; i < phases.size(); ++i)
+    if (p.computeFirst >= phases[i].first && p.computeFirst < phases[i].first + phases[i].second) return int64_t(i);
+  return -1;
+}
+
 void Program::assignOutputs() {
-  nextOutput = 0;
+  nextOutput = outputPeak = 0;
+  int64_t phase = -1;
   for (Projection &p : projections) {
+    if (reuseBuffers && p.computeCount > 0 && phaseOf(p) != phase) {
+      phase = phaseOf(p);
+      nextOutput = 0;
+    }
     p.outputBase = nextOutput;
     p.assignOutputSlots();
     nextOutput += int64_t(p.tokens()) * p.splitK * p.outputSlots;
+    outputPeak = std::max(outputPeak, nextOutput);
   }
+}
+
+bool Program::reuseBuffersAcrossPhases() {
+  std::map<int64_t, int64_t> owner;   // activation -> phase
+  for (const Projection &p : projections) {
+    const int64_t ph = phaseOf(p);
+    if (ph < 0) continue;
+    for (int64_t a : p.activations) {
+      auto [it, fresh] = owner.emplace(a, ph);
+      if (!fresh && it->second != ph) return false;
+    }
+  }
+  std::map<int64_t, int64_t> actLo, outLo;
+  for (auto [a, ph] : owner) {
+    auto [it, fresh] = actLo.emplace(ph, activations[size_t(a)].base);
+    if (!fresh) it->second = std::min(it->second, activations[size_t(a)].base);
+  }
+  for (const Projection &p : projections)
+    if (int64_t ph = phaseOf(p); ph >= 0) {
+      auto [it, fresh] = outLo.emplace(ph, p.outputBase);
+      if (!fresh) it->second = std::min(it->second, p.outputBase);
+    }
+  activationPeak = outputPeak = 0;
+  for (auto [a, ph] : owner) {
+    Activation &x = activations[size_t(a)];
+    x.base -= actLo[ph];
+    activationPeak = std::max(activationPeak, x.base + x.k / kGroup);
+  }
+  for (Projection &p : projections) {
+    const int64_t ph = phaseOf(p);
+    p.outputBase = ph < 0 ? 0 : p.outputBase - outLo[ph];
+    outputPeak = std::max(outputPeak, p.outputBase + int64_t(p.tokens()) * p.splitK * p.outputSlots);
+  }
+  reuseBuffers = true;
+  return true;
 }
 
 int64_t Program::storedTiles(int rank) const {
@@ -173,7 +222,7 @@ Program::BaseRows Program::baseRows() const {
   for (int64_t n : nextWeight) most = std::max(most, n);
   int64_t activation = weight + rowsFor(most);
   // The runtime reserves activation rows by activation tile count.
-  int64_t output = activation + rowsFor(nextActivation);
+  int64_t output = activation + rowsFor(activationTiles());
   return {weight, activation, output};
 }
 
@@ -188,7 +237,7 @@ uint64_t Program::packetAddress(int64_t baseRow, int64_t packet, int pu, int par
 }
 
 uint64_t Program::rankEndAddress() const {
-  return uint64_t(baseRows().output + rowsFor(nextOutput)) * uint64_t(rowBytes());
+  return uint64_t(baseRows().output + rowsFor(outputTiles())) * uint64_t(rowBytes());
 }
 
 uint64_t Program::endAddress() const {

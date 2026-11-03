@@ -100,6 +100,19 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       return signalPassFailure();
     }
 
+    // When the plan does not fit, every PIM phase reuses the same activation and output tiles (below),
+    // unless a PIM output is a step result (it must survive to the end) or the driver collects
+    // intermediate buffers. Plans that fit keep distinct tiles: reused rows made a decode layer's QKV
+    // phase 42.2 -> 47.1 us on Ramulator (2-layer fixture, layer 1).
+    bool mayReuse = reusePimBuffers;
+    step.walk([&](func::CallOp call) {
+      auto callee = symbols.lookup<func::FuncOp>(call.getCallee());
+      if (!callee || !callee->hasAttr(kPhase) || cast<StringAttr>(callee->getAttr(kPhase)).getValue() != "pim") return;
+      callee.walk([&](hyb::QMatmulOp q) {
+        for (Operation *user : call.getOperand(cast<BlockArgument>(q.getInit()).getArgNumber()).getUsers())
+          if (isa<func::ReturnOp>(user)) mayReuse = false;
+      });
+    });
     DenseMap<Value, DictionaryAttr> pimBuffers;   // PIM-laid-out buffers
     int64_t records = 0;
     int64_t packetPhases = 0;
@@ -435,6 +448,23 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       v.getDefiningOp()->setAttr(kLP6, b.getDictionaryAttr(attrs));
     }
     uint64_t end = std::max<uint64_t>(program.endAddress(), npuWeightEnd);
+    if (int64_t(end) > specOr->lp6.capacityBytes && mayReuse && program.reuseBuffersAcrossPhases()) {
+      const uint64_t without = end;
+      end = std::max<uint64_t>(program.endAddress(), npuWeightEnd);
+      // Listed with the first PIM phase (io.json phases[].decisions).
+      func::FuncOp first;
+      step.walk([&](func::CallOp call) {
+        auto callee = symbols.lookup<func::FuncOp>(call.getCallee());
+        if (!first && callee && callee->hasAttr(kPhase) &&
+            cast<StringAttr>(callee->getAttr(kPhase)).getValue() == "pim")
+          first = callee;
+      });
+      if (first)
+        cost::recordDecision(first, "pim buffer reuse", "PIM activation/output tiles of every PIM phase",
+                             "one set (plan exceeds LP6 capacity)",
+                             {{"bytes_without", double(without)}, {"bytes_with", double(end)},
+                              {"capacity", double(specOr->lp6.capacityBytes)}});
+    }
     if (int64_t(end) > specOr->lp6.capacityBytes) {
       module.emitError() << "LP6 plan needs " << end << " bytes, capacity " << specOr->lp6.capacityBytes;
       return signalPassFailure();
