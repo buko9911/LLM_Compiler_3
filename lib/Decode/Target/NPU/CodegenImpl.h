@@ -135,6 +135,7 @@ private:
   // earlier phases; core blocks drop them (they follow the phase entry).
   int phaseFirstCommand = 0;
   void reachableDependencies(std::vector<int> &deps) const;
+  void pimOverlapDependencies(ArrayRef<std::pair<uint64_t, uint64_t>> lp6Ranges, std::vector<int> &deps) const;
 
   // ---- instruction helpers -------------------------------------------------------------
   void emit(uint32_t word);

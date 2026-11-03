@@ -197,6 +197,25 @@ void Codegen::reachableDependencies(std::vector<int> &deps) const {
   }
 }
 
+/// NPU+PIM: a GDMA that touches an LP6 rank the preceding PIM phase computes on (its weights,
+/// activations and output tiles) waits for that PIM record. One that touches none of them waits for
+/// the records the PIM phase waited for (the NPU phase before it) instead, so it runs during the PIM
+/// work, not earlier: started inside the NPU phase before, it would take DRAM bandwidth from that
+/// phase's activation stores, which the PIM phase waits for. The PIM phase touches no L2 and no
+/// other rank. The phase's core blocks still follow the entry.
+void Codegen::pimOverlapDependencies(ArrayRef<std::pair<uint64_t, uint64_t>> lp6Ranges,
+                                     std::vector<int> &deps) const {
+  if (in.pimRecord < 0) return;
+  const bool pimRank = llvm::any_of(lp6Ranges, [&](auto r) {
+    return llvm::any_of(in.pimRanks, [&](int rank) {
+      const uint64_t lo = uint64_t(rank) * uint64_t(pim::kRankBytes);
+      return overlaps(r.first, r.second, lo, lo + uint64_t(pim::kRankBytes));
+    });
+  });
+  if (pimRank) deps.push_back(in.pimRecord);
+  else deps.insert(deps.end(), in.beforePim.begin(), in.beforePim.end());
+}
+
 /// LP6 -> L2 (2-D). Waits for earlier stores to the LP6 range and every earlier access to
 /// the L2 range. The accesses include the previous NPU phases', so a load needs no phase barrier.
 /// `stream` marks a weight-stream ring load, the only GDMAs counted against npu.gdma_lookahead.
@@ -216,6 +235,7 @@ int Codegen::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t row
     if (touches(a.s,a.e,l2Ranges) && a.id >= 0) deps.push_back(a.id);
   for (const LAcc &a : lp6acc)
     if (a.store && touches(a.s,a.e,lp6Ranges)) deps.push_back(a.id);
+  pimOverlapDependencies(lp6Ranges, deps);
   reachableDependencies(deps);
   std::sort(deps.begin(), deps.end());
   deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
@@ -245,6 +265,7 @@ int Codegen::gdmaStore(uint64_t l2, uint64_t lp6, uint32_t rowBytes, uint32_t ro
     if (touches(a.s,a.e,l2Ranges) && a.id >= 0 && (a.k == GW || a.k == CW)) deps.push_back(a.id);
   for (const LAcc &a : lp6acc)
     if (touches(a.s,a.e,lp6Ranges)) deps.push_back(a.id);
+  pimOverlapDependencies(lp6Ranges, deps);
   reachableDependencies(deps);
   std::sort(deps.begin(), deps.end());
   deps.erase(std::unique(deps.begin(), deps.end()), deps.end());

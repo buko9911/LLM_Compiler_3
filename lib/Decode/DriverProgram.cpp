@@ -168,6 +168,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
   program.commandSchedule = true;
   int parallelActivationPhases = 0;
   CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)
+  struct { int record = -1; std::vector<int> ranks, before; } pimBefore;   // the PIM phase just before
   for (Operation &op : step.getBody().front()) {
     auto call = dyn_cast<func::CallOp>(op);
     if (!call) continue;
@@ -178,11 +179,19 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       int64_t idx = call->getAttrOfType<IntegerAttr>("hyb.pim_phase").getInt();
       auto [first, count] = prog.phases[size_t(idx)];
       std::vector<pim::Primitive> primitives(pimCommands.begin() + first, pimCommands.begin() + first + count);
+      pimBefore.before = exit;
       exit = {program.pimRecord(name, exit, primitives)};
+      pimBefore.record = exit.front();
+      pimBefore.ranks.clear();
+      for (const auto &p : prog.projections)
+        if (p.computeCount > 0 && p.computeFirst >= first && p.computeFirst < first + count)
+          for (int part : p.streamPart)
+            if (!llvm::is_contained(pimBefore.ranks, prog.partRank(part))) pimBefore.ranks.push_back(prog.partRank(part));
       json::Object pimReport{{"phase", name}, {"kind", "pim"}, {"commands", count}};
       if (auto decisions = decisionsJson(callee)) pimReport["decisions"] = std::move(*decisions);
       report.push_back(std::move(pimReport));
-      carried = {};
+      // The NPU phase before keeps its carried accesses: the PIM phase touches no L2, and the next
+      // NPU phase orders its GDMAs against the PIM ranks itself (NpuPhaseInput::pimRecord).
       continue;
     }
     NpuPhaseInput in;
@@ -202,6 +211,10 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     const bool packet = callee->hasAttr("hyb.npu_kernel");
     if (packet) carried = {};
     else in.carried = &carried;
+    in.pimRecord = pimBefore.record;
+    in.pimRanks = pimBefore.ranks;
+    in.beforePim = pimBefore.before;
+    pimBefore = {};
     program.beginPhase(name, exit);
     NpuPhaseStats stats;
     LogicalResult emitted = packet ? emitPimPacketNpuPhase(in, stats, err) : emitNpuPhase(in, extra, stats, err);

@@ -50,6 +50,11 @@ struct NpuPhaseInput {
   plena::ProgramBuilder *program = nullptr;   // the step's single program (phase already begun)
   int pimActivationCores = 1;            // explicit bounded isolated quant/activation-feed experiment
   CarriedAccesses *carried = nullptr;    // in: the previous NPU phase's accesses; out: this phase's
+  // NPU+PIM: the PIM phase just before this one, the LP6 ranks it computes on and the records it waited
+  // for. A GDMA that touches none of those ranks and has no other hazard follows `beforePim` instead of
+  // the phase entry, so its DRAM traffic overlaps the PIM work on the other rank.
+  int pimRecord = -1;
+  std::vector<int> pimRanks, beforePim;
 };
 
 struct NpuPhaseStats {

@@ -162,6 +162,24 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         int rank = 0;
         for (int rk = 1; rk <= program.partRank(program.partitions - 1); ++rk)
           if (stored(rk) < stored(rank)) rank = rk;
+        // The dense LP6 region (step inputs such as the KV cache, NPU activations) is in rank 0. When the
+        // next NPU phase reads more than 64 KiB of step inputs, this phase runs on the last rank, so those
+        // reads can overlap its PIM work (codegen orders only the GDMAs that touch the PIM rank after it).
+        int64_t nextDense = 0;
+        for (Operation *op = call->getNextNode(); op; op = op->getNextNode()) {
+          auto next = dyn_cast<func::CallOp>(op);
+          auto nextFn = next ? symbols.lookup<func::FuncOp>(next.getCallee()) : func::FuncOp();
+          if (!nextFn || !nextFn->hasAttr(kPhase)) continue;
+          if (cast<StringAttr>(nextFn->getAttr(kPhase)).getValue() != "npu") break;
+          for (Value v : next.getOperands())
+            if (auto arg = dyn_cast<BlockArgument>(v); arg && arg.getOwner() == &step.getBody().front())
+              nextDense += bytesOf(v.getType());
+          break;
+        }
+        const int last = program.partRank(program.partitions - 1);
+        if (nextDense > (64 << 10) && last > 0) rank = last;
+        cost::recordDecision(callee, "pim rank", "next NPU phase reads " + std::to_string(nextDense) + " B of step inputs",
+                             "rank " + std::to_string(rank), {{"next_dense_bytes", double(nextDense)}});
         for (int c = 0; c < program.partitions; ++c)
           if (program.partRank(c) != rank) loads[c] = std::numeric_limits<int64_t>::max() / 4;
       }
