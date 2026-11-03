@@ -47,7 +47,7 @@
   "ldmac_ck": 10.45,
   "sweep_ck": 784,
   "stream_ck": 1017,
-  "readback_ns_per_output": 1.0
+  "readback_ns_per_output": 0.33
  },
  "lp6": {
   "capacity_bytes": 17179869184,
