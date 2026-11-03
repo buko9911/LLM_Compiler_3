@@ -35,6 +35,7 @@ llvm::json::Value toJSON(const Program &program) {
     // Stream shape, written only when it is not the 512-row stream over all of K.
     if (x.accs != kAccs) o["accs"] = x.accs;
     if (x.splitK != 1) o["split_k"] = x.splitK;
+    if (x.tailBlocks) { o["tail_accs"] = x.tailAccs; o["tail_blocks"] = x.tailBlocks; }
     p.push_back(std::move(o));
   }
   for (auto [f, c] : program.phases) ph.push_back(llvm::json::Array{f, c});
@@ -76,6 +77,8 @@ Program fromJSON(const llvm::json::Value &v) {
     p.nPad = *xo->getInteger("n_pad");
     if (auto v = xo->getInteger("accs")) p.accs = int(*v);
     if (auto v = xo->getInteger("split_k")) p.splitK = int(*v);
+    if (auto v = xo->getInteger("tail_accs")) p.tailAccs = int(*v);
+    if (auto v = xo->getInteger("tail_blocks")) p.tailBlocks = *v;
     for (const llvm::json::Value &c : *xo->getArray("stream_weight_base")) p.streamWeightBase.push_back(*c.getAsInteger());
     p.outputBase = *xo->getInteger("output_base");
     for (const llvm::json::Value &c : *xo->getArray("acts")) p.activations.push_back(*c.getAsInteger());
@@ -299,7 +302,7 @@ Result<bool> bindPimWeightStorage(pim::Program &p, const PimWeightStorage &s) {
     q.streamPart = w.streamPart; q.streamWeightBase = w.streamWeightBase;
     for (size_t i = 0; i < q.streamPart.size(); ++i) {
       const int part = q.streamPart[i];
-      p.nextWeight[size_t(part)] = std::max(p.nextWeight[size_t(part)], q.streamWeightBase[i] + q.streamTiles());
+      p.nextWeight[size_t(part)] = std::max(p.nextWeight[size_t(part)], q.streamWeightBase[i] + q.streamTiles(int64_t(i)));
       for (int64_t ai : q.activations) {
         if (ai < 0 || ai >= int64_t(p.activations.size())) return fail("invalid new invocation activation");
         auto &parts = p.activations[size_t(ai)].parts;

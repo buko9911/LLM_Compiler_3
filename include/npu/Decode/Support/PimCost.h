@@ -12,6 +12,7 @@
 //   stream CK  = tokens x (pieceSweeps x (32 A ldmac_ck + sweep_ck) + stream_ck)
 //   phase us   = (max over partitions of its streams' CK) / clock_mhz
 //   gather us  = tokens x S x (Npad x 4 B / readback_gbps + readback_piece_us)      (per projection)
+//   (a projection may end in a tail of smaller streams: blocks of tailAccs accumulators)
 //   sum us     = tokens x (S - 1) x Npad / 16 x 4 NPU cycles / cores                  (split-K adds)
 //
 // Every layout gives the same INT32 sums, so the choice only moves time.
@@ -28,7 +29,11 @@ namespace mlir::hybrid::pimcost {
 
 struct Shape {
   int accs = 16, splitK = 1;
-  bool operator==(const Shape &o) const { return accs == o.accs && splitK == o.splitK; }
+  int tailAccs = 0;          // the last tailBlocks blocks use tailAccs accumulators (0: none)
+  int64_t tailBlocks = 0;
+  bool operator==(const Shape &o) const {
+    return accs == o.accs && splitK == o.splitK && tailAccs == o.tailAccs && tailBlocks == o.tailBlocks;
+  }
 };
 
 struct Estimate {
@@ -39,6 +44,10 @@ struct Estimate {
 /// Output rows of one projection padded to whole streams of `accs` accumulators.
 int64_t paddedRows(const TargetSpec &spec, int64_t n, int accs);
 
+/// Blocks (streams per K piece) of a projection of n rows with `shape`, main ones first; each entry is
+/// the block's accumulator count. Matches pim::Program::addProjection.
+std::vector<int> shapeBlocks(const TargetSpec &spec, int64_t n, const Shape &shape);
+
 /// PIM clock cycles of one stream (all tokens).
 int64_t streamCycles(const TargetSpec &spec, int64_t tokens, int64_t pieceSweeps, int accs);
 
@@ -48,8 +57,9 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
                   llvm::ArrayRef<Shape> shapes, int partitions);
 
 /// The fastest shapes for the phase over the target's candidates (pim.stream_accs, split-K up to
-/// pim.max_split_k with whole sweeps per piece; no split when `allowSplit` is false). Ties keep the
-/// fewer PIM commands (more accumulators, fewer pieces).
+/// pim.max_split_k with whole sweeps per piece; no split when `allowSplit` is false). The last
+/// projection may also replace its last 1..partitions blocks by a tail of smaller streams. Ties keep
+/// the fewer PIM commands (more accumulators, fewer pieces, no tail).
 std::vector<Shape> choose(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::ArrayRef<int64_t> n,
                           int partitions, bool allowSplit, Estimate &best);
 

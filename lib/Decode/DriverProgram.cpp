@@ -402,18 +402,19 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
           json::Array shape{ty.getDimSize(0), p.nPad};
           uint64_t at = item(name, v, ty.getDimSize(0) * p.nPad * 4, std::move(shape), layout);
           if (overflow) break;
-          const int64_t T = p.tilesPerPU(), per = p.tilesPerStream();
+          const int64_t T = p.tilesPerPU();
           auto partEnd = [&](int64_t t) {
-            int64_t b = t / per;
-            while (b < p.blocks() && p.streamPart[size_t(b)] == p.streamPart[size_t(t / per)]) ++b;
-            return b * per;
+            int64_t b = p.blockOfTile(t);
+            const int part = p.streamPart[size_t(b)];
+            while (b < p.blocks() && p.streamPart[size_t(b)] == part) ++b;
+            return p.blockTile(b);
           };
           for (int m = 0; m < p.tokens(); ++m)
             for (int pu = 0; pu < pim::kPUs; ++pu)
               for (int64_t first = 0; first < T;) {
                 const int64_t g = p.streamOfTile(first, 0);
                 const int part = p.streamPart[size_t(g)];
-                const int64_t tile = p.outputTile(m, 0, g, int(first % per));
+                const int64_t tile = p.outputTile(m, 0, g, int(first - p.blockTile(p.blockOfTile(first))));
                 int64_t n = std::min({T - first, pim::kPacketsPerRow - tile % pim::kPacketsPerRow, partEnd(first) - first});
                 uint64_t dst = at + uint64_t((int64_t(m) * p.nPad + pu * p.rowsPerPU() + first * 8) * 4);
                 w.gdmaLoad(prog.outputTileAddress(tile, pu, part), dst, 32, uint32_t(n), uint32_t(prog.colBytes()), 32);

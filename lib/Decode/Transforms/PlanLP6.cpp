@@ -207,6 +207,8 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         for (auto [i, q] : llvm::enumerate(group)) {
           label += (i ? ";" : "") + q.getWeight().str();
           choice += (i ? ", " : "") + ("A=" + std::to_string(shapes[i].accs) + " S=" + std::to_string(shapes[i].splitK));
+          if (shapes[i].tailBlocks)
+            choice += " tail " + std::to_string(shapes[i].tailBlocks) + "xA=" + std::to_string(shapes[i].tailAccs);
         }
         cost::recordDecision(callee, "pim stream layout", label, choice,
                              {{"tokens", double(M)}, {"k", double(K)}, {"partitions", double(open)},
@@ -218,9 +220,10 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         auto out = cast<BlockArgument>(q.getInit());
         auto outT = cast<MemRefType>(out.getType());
         const pimcost::Shape shape = shapes[qi++];
-        const int64_t streamLoad = pimcost::streamCycles(*specOr, M, K / pim::kKPerSweep / shape.splitK, shape.accs);
+        const int64_t pieceSweeps = K / pim::kKPerSweep / shape.splitK;
+        auto streamLoad = [&](int accs) { return pimcost::streamCycles(*specOr, M, pieceSweeps, accs); };
         int64_t pi = program.addProjection(q.getWeight().str(), outT.getDimSize(1), K, acts, loads, shape.accs,
-                                           shape.splitK, streamLoad);
+                                           shape.splitK, streamLoad, shape.tailAccs, shape.tailBlocks);
         const pim::Projection &p = program.projections[pi];
         program.projections[pi].computeFirst = records;
         int64_t count = p.commands(); // final executable primitive count

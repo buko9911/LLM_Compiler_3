@@ -46,7 +46,7 @@ bool driver::collectPimWeightStorage(const ::npu::pim::Program &prog,
   storage.capacityBytes = capacityBytes;
   for (const auto &p : prog.projections) {
     if (!scaleSlots.count(p.name)) { llvm::errs() << "PIM weight storage missing row_scale: " << p.name << '\n'; return false; }
-    if (p.accs != ::npu::pim::kAccs || p.splitK != 1) {   // the storage manifest has the 512-row stream format
+    if (p.accs != ::npu::pim::kAccs || p.splitK != 1 || p.tailBlocks) {   // the storage manifest has the 512-row stream format
       llvm::errs() << "PIM weight storage supports only 512-row streams over all of K: " << p.name << '\n';
       return false;
     }

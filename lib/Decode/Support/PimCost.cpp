@@ -2,6 +2,8 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <map>
+#include <tuple>
 
 namespace mlir::hybrid::pimcost {
 
@@ -18,17 +20,33 @@ int64_t streamCycles(const TargetSpec &spec, int64_t tokens, int64_t pieceSweeps
   return int64_t(double(tokens) * (double(pieceSweeps) * sweep + p.streamCK) + 0.5);
 }
 
+std::vector<int> shapeBlocks(const TargetSpec &spec, int64_t n, const Shape &shape) {
+  const int64_t unit = int64_t(spec.pim.pus) * spec.pim.lanes;
+  std::vector<int> blocks;
+  if (shape.tailBlocks > 0) {
+    const int64_t tailRows = shape.tailBlocks * unit * shape.tailAccs, rows = unit * shape.accs;
+    const int64_t main = std::max<int64_t>(0, (n - tailRows + rows - 1) / rows);
+    blocks.assign(size_t(main), shape.accs);
+    blocks.insert(blocks.end(), size_t(shape.tailBlocks), shape.tailAccs);
+  } else {
+    blocks.assign(size_t(paddedRows(spec, n, shape.accs) / (unit * shape.accs)), shape.accs);
+  }
+  return blocks;
+}
+
 Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::ArrayRef<int64_t> n,
                   llvm::ArrayRef<Shape> shapes, int partitions) {
   Estimate e;
   std::vector<int64_t> load(size_t(std::max(1, partitions)), 0);
-  const int64_t sweeps = k / 256;
+  const int64_t sweeps = k / 256, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
   for (size_t i = 0; i < n.size(); ++i) {
     const Shape s = shapes[i];
-    const int64_t nPad = paddedRows(spec, n[i], s.accs);
-    const int64_t blocks = nPad / (int64_t(spec.pim.pus) * spec.pim.lanes * s.accs);
-    const int64_t cycles = streamCycles(spec, tokens, sweeps / s.splitK, s.accs);
-    for (int64_t g = 0; g < blocks * s.splitK; ++g) *std::min_element(load.begin(), load.end()) += cycles;
+    const std::vector<int> blocks = shapeBlocks(spec, n[i], s);
+    int64_t nPad = 0;
+    for (int a : blocks) nPad += unit * a;
+    for (int64_t piece = 0; piece < s.splitK; ++piece)
+      for (int a : blocks)
+        *std::min_element(load.begin(), load.end()) += streamCycles(spec, tokens, sweeps / s.splitK, a);
     e.gatherUs += double(tokens) * s.splitK *
                   (double(nPad) * 4 / (spec.pim.readbackGBps * 1e3) + spec.pim.readbackPieceUs);
     e.sumUs += double(tokens) * (s.splitK - 1) * double(nPad) / 16 * 4 /
@@ -40,25 +58,45 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
 
 std::vector<Shape> choose(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::ArrayRef<int64_t> n,
                           int partitions, bool allowSplit, Estimate &best) {
-  const int64_t sweeps = k / 256;
+  // Equal groups (every layer of a model) get equal answers; the search is exhaustive.
+  using Key = std::tuple<int64_t, int64_t, std::vector<int64_t>, int, bool, const TargetSpec *>;
+  static std::map<Key, std::pair<std::vector<Shape>, Estimate>> cache;
+  Key key{tokens, k, std::vector<int64_t>(n.begin(), n.end()), partitions, allowSplit, &spec};
+  if (auto it = cache.find(key); it != cache.end()) {
+    best = it->second.second;
+    return it->second.first;
+  }
+  const int64_t sweeps = k / 256, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
   std::vector<Shape> options;
   for (int accs : spec.pim.streamAccs)
     for (int split = 1; split <= (allowSplit ? spec.pim.maxSplitK : 1); ++split)
       if (sweeps % split == 0) options.push_back({accs, split});
+  // The last projection may end in a tail of smaller streams instead of its last 1..partitions blocks.
+  std::vector<Shape> lastOptions = options;
+  if (!n.empty())
+    for (const Shape &base : options) {
+      const int64_t rows = unit * base.accs, blocks = (n.back() + rows - 1) / rows;
+      for (int64_t drop = 1; drop <= std::min<int64_t>(blocks, partitions); ++drop)
+        for (int tail : spec.pim.streamAccs) {
+          if (tail >= base.accs) continue;
+          const int64_t rest = n.back() - (blocks - drop) * rows;
+          if (rest <= 0) continue;
+          Shape s = base;
+          s.tailAccs = tail;
+          s.tailBlocks = (rest + unit * tail - 1) / (unit * tail);
+          lastOptions.push_back(s);
+        }
+    }
   std::vector<Shape> current(n.size()), chosen(n.size(), Shape{});
   double bestUs = std::numeric_limits<double>::infinity();
   int64_t bestCommands = std::numeric_limits<int64_t>::max();
-  // Exhaustive over the group (at most a few projections share one input).
   std::function<void(size_t)> visit = [&](size_t i) {
     if (i == n.size()) {
       Estimate e = estimate(spec, tokens, k, n, current, partitions);
       int64_t commands = 0;
-      for (size_t j = 0; j < n.size(); ++j) {
-        const int64_t blocks = paddedRows(spec, n[j], current[j].accs) /
-                               (int64_t(spec.pim.pus) * spec.pim.lanes * current[j].accs);
-        const int64_t pieceSweeps = sweeps / current[j].splitK;
-        commands += blocks * current[j].splitK * (current[j].accs * 3 / 2 + pieceSweeps * 9);
-      }
+      for (size_t j = 0; j < n.size(); ++j)
+        for (int a : shapeBlocks(spec, n[j], current[j]))
+          commands += current[j].splitK * (a * 3 / 2 + sweeps / current[j].splitK * 9);
       // A relative margin keeps the simpler layout on estimates within rounding of each other.
       const double us = e.total();
       if (us < bestUs * (1 - 1e-9) || (us <= bestUs * (1 + 1e-9) && commands < bestCommands)) {
@@ -69,16 +107,14 @@ std::vector<Shape> choose(const TargetSpec &spec, int64_t tokens, int64_t k, llv
       }
       return;
     }
-    for (const Shape &s : options) {
+    for (const Shape &s : (i + 1 == n.size() ? lastOptions : options)) {
       current[i] = s;
       visit(i + 1);
     }
   };
-  if (options.empty()) {
-    best = estimate(spec, tokens, k, n, chosen, partitions);
-    return chosen;
-  }
-  visit(0);
+  if (options.empty()) best = estimate(spec, tokens, k, n, chosen, partitions);
+  else visit(0);
+  cache[key] = {chosen, best};
   return chosen;
 }
 

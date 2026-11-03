@@ -18,42 +18,56 @@ int64_t Program::addActivation(int64_t k) {
 
 int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
                                const std::vector<int64_t> &inputs, std::map<int, int64_t> &loads, int accs,
-                               int splitK, int64_t streamLoad) {
+                               int splitK, std::function<int64_t(int)> streamLoad, int tailAccs,
+                               int64_t tailBlocks) {
   Projection p;
   p.name = name;
   p.n = n;
   p.k = k;
   p.accs = accs;
   p.splitK = splitK;
-  const int64_t rows = p.rowsPerStream();
-  p.nPad = (n + rows - 1) / rows * rows;
+  p.tailAccs = tailBlocks > 0 ? tailAccs : 0;
+  p.tailBlocks = tailBlocks > 0 ? tailBlocks : 0;
+  const int64_t rows = int64_t(kPUs) * kLanes * accs, tailRows = int64_t(kPUs) * kLanes * p.tailAccs;
+  if (p.tailBlocks) {
+    // Main blocks cover what the tail does not; the tail rounds the rest up.
+    const int64_t mainBlocks = std::max<int64_t>(0, (n - p.tailBlocks * tailRows + rows - 1) / rows);
+    p.nPad = mainBlocks * rows + p.tailBlocks * tailRows;
+  } else {
+    p.nPad = (n + rows - 1) / rows * rows;
+  }
   p.activations = inputs;
   p.outputBase = nextOutput;
-  // Least-loaded partition per stream, then regrouped inside each K piece so the
-  // streams of one partition are contiguous and its stored output tiles stay
-  // contiguous. A stream's load is its LdMAC count (sweeps x accumulators).
+  // Least-loaded partition per stream. The streams of one partition are then made contiguous inside
+  // each K piece, main blocks and tail blocks separately (so every partition keeps the blocks, and the
+  // load, the greedy pass gave it). A stream's default load is its LdMAC count (sweeps x accumulators).
   if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
   std::vector<int64_t> count(size_t(partitions), 0);
-  auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.streamTiles(); };
+  auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.pieceSweeps() * accs * kInTiles; };
+  auto load = [&](int a) {
+    return streamLoad ? streamLoad(a) : p.pieceSweeps() * a * int64_t(inputs.size());
+  };
   for (int64_t piece = 0; piece < splitK; ++piece) {
-    std::vector<int64_t> here(size_t(partitions), 0);
+    std::vector<int64_t> main(size_t(partitions), 0), tail(size_t(partitions), 0);
     for (int64_t b = 0; b < p.blocks(); ++b) {
       int best = 0;
       for (int c = 1; c < partitions; ++c)
         if (loads[c] < loads[best] || (loads[c] == loads[best] && stored(c) < stored(best))) best = c;
       count[size_t(best)]++;
-      here[size_t(best)]++;
-      loads[best] += streamLoad > 0 ? streamLoad : p.pieceSweeps() * accs * int64_t(inputs.size());
+      (b < p.mainBlocks() ? main : tail)[size_t(best)]++;
+      loads[best] += load(p.blockAccs(b));
     }
-    for (int c = 0; c < partitions; ++c)
-      for (int64_t i = 0; i < here[size_t(c)]; ++i) p.streamPart.push_back(c);
+    for (const auto *here : {&main, &tail})
+      for (int c = 0; c < partitions; ++c)
+        for (int64_t i = 0; i < (*here)[size_t(c)]; ++i) p.streamPart.push_back(c);
   }
   // Weight tile ids are per partition: a stream's packets live only in its
   // partition's banks, and the runtime addresses a tile inside the partition
   // of the GEMV_STREAM.
-  for (int c : p.streamPart) {
+  for (size_t g = 0; g < p.streamPart.size(); ++g) {
+    const int c = p.streamPart[g];
     p.streamWeightBase.push_back(nextWeight[size_t(c)]);
-    nextWeight[size_t(c)] += p.streamTiles();
+    nextWeight[size_t(c)] += p.streamTiles(int64_t(g));
   }
   p.assignOutputSlots();
   nextOutput += int64_t(inputs.size()) * splitK * p.outputSlots;
@@ -75,7 +89,7 @@ void Projection::assignOutputSlots() {
       const int64_t g = piece * blocks() + b;
       int64_t &slot = used[streamPart[size_t(g)]];
       streamSlot[size_t(g)] = slot;
-      slot += tilesPerStream();
+      slot += tilesPerStream(g);
       outputSlots = std::max(outputSlots, slot);
     }
   }
@@ -103,13 +117,14 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
   Projection &p = projections[size_t(index)];
   p.computeFirst = int64_t(commands.size());
   const int64_t streams = p.streams(), blocks = p.blocks();
-  const int accs = p.accs;
-  if (accs < 2 || accs > kAccs || accs % 2 || p.splitK < 1 || p.sweeps() % p.splitK)
+  auto validAccs = [](int a) { return a >= 2 && a <= kAccs && a % 2 == 0; };
+  if (!validAccs(p.accs) || (p.tailBlocks && !validAccs(p.tailAccs)) || p.splitK < 1 || p.sweeps() % p.splitK)
     return Result<bool>::failure(p.name + ": PIM stream needs an even accumulator count 2..16 and whole-sweep K pieces");
   for (int m = 0; m < p.tokens(); ++m) {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
     for (int64_t g = 0; g < streams; ++g) {
       const int64_t block = g % blocks, piece = g / blocks;
+      const int accs = p.blockAccs(block);
       auto make = [&](Opcode opcode) {
         Primitive q;
         q.opcode = opcode;
@@ -139,7 +154,7 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
         commands.push_back(q);
       }
       int64_t firstO = p.outputTile(m, int(piece), g, 0);
-      (void)block;
+
       if (firstO + accs / 2 > INT32_MAX)
         return Result<bool>::failure(p.name + ": PIM output tile ID exceeds INT32_MAX");
       for (int reg = 0; reg < accs / 2; ++reg) {

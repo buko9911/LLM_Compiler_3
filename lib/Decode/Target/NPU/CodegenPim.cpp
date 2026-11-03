@@ -35,15 +35,15 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     return failure();
   }
   int64_t dRow = d.shape.size() == 2 ? d.strides[0] : cols;
-  const int64_t T = p.tilesPerPU(), npu = p.rowsPerPU(), per = p.tilesPerStream(), blocks = p.blocks();
+  const int64_t T = p.tilesPerPU(), npu = p.rowsPerPU(), blocks = p.blocks();
   const int channels = in.pim->channels;
   const int64_t slice = int64_t(pim::kChBytes) * channels, colBytes = in.pim->colBytes();
   // First PU-local tile after t whose stream lives in another partition (inside one K piece).
   auto partEnd = [&](int64_t t, int piece) {
-    int64_t b = t / per;
+    int64_t b = p.blockOfTile(t);
     const int part = p.streamPart[size_t(piece * blocks + b)];
     while (b < blocks && p.streamPart[size_t(piece * blocks + b)] == part) ++b;
-    return b * per;
+    return p.blockTile(b);
   };
   const uint64_t win = windowBase(curCore), winEnd = win + uint64_t(window());
   int64_t chunk = window() / 4 / 8 * 8;
@@ -75,7 +75,7 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
             const int64_t g = p.streamOfTile(t, piece);
             const int part = p.streamPart[size_t(g)];
             const int64_t n = std::min(tb - t, partEnd(t, piece) - t);
-            runs.push_back({t, n, p.outputTile(m, piece, g, int(t % per)), part});
+            runs.push_back({t, n, p.outputTile(m, piece, g, int(t - p.blockTile(p.blockOfTile(t)))), part});
             ranks.insert(in.pim->partRank(part));
             t += n;
           }

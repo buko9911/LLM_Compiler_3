@@ -27,6 +27,7 @@
 #include "npu/Target/PimPrimitive.h"
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -57,27 +58,43 @@ struct Activation {
 };
 
 // One GEMV, a weight of N output channels and K inputs, for M tokens.
-// Stream g = piece * blocks() + block: output rows [block * 32A, (block + 1) * 32A), spread over the
-// 8 PUs (4A rows each), and K sweeps [piece * pieceSweeps(), (piece + 1) * pieceSweeps()).
+// Stream g = piece * blocks() + block: one block of output rows, spread over the 8 PUs, and K sweeps
+// [piece * pieceSweeps(), (piece + 1) * pieceSweeps()). Block b has blockAccs(b) accumulators, i.e.
+// 32 x blockAccs(b) rows (4 x blockAccs(b) per PU): the first mainBlocks() blocks `accs`, the last
+// `tailBlocks` blocks `tailAccs` (a smaller stream that evens out the partitions' loads).
 struct Projection {
   std::string name;
-  int64_t n = 0, k = 0, nPad = 0;           // nPad: N rounded up to whole streams of 32 x accs rows
-  int accs = kAccs;                         // accumulators per stream (even, 2..16)
+  int64_t n = 0, k = 0, nPad = 0;           // nPad: N rounded up to whole blocks
+  int accs = kAccs;                         // accumulators per stream of the main blocks (even, 2..16)
   int splitK = 1;                           // K pieces (sweeps() % splitK == 0)
+  int tailAccs = 0;                         // accumulators of the tail blocks (0: no tail)
+  int64_t tailBlocks = 0;
   int64_t outputBase = 0;
   std::vector<int64_t> streamWeightBase;    // first weight tile of each stream, in its partition
   std::vector<int64_t> activations;         // activation per token
   std::vector<int> streamPart;              // partition of each stream (sorted inside each piece)
   int64_t computeFirst = 0, computeCount = 0;   // executable primitive range
-  int64_t rowsPerStream() const { return int64_t(kPUs) * kLanes * accs; }
-  int64_t blocks() const { return nPad / rowsPerStream(); }
+  int64_t mainBlocks() const {
+    return (nPad - tailBlocks * int64_t(kPUs) * kLanes * tailAccs) / (int64_t(kPUs) * kLanes * accs);
+  }
+  int64_t blocks() const { return mainBlocks() + tailBlocks; }
+  int blockAccs(int64_t b) const { return b < mainBlocks() ? accs : tailAccs; }
+  int64_t blockTile(int64_t b) const {     // first PU-local output tile of block b
+    const int64_t main = mainBlocks();
+    return b <= main ? b * (accs / 2) : main * (accs / 2) + (b - main) * (tailAccs / 2);
+  }
+  int64_t blockOfTile(int64_t t) const {
+    const int64_t mainTiles = mainBlocks() * (accs / 2);
+    return t < mainTiles ? t / (accs / 2) : mainBlocks() + (t - mainTiles) / (tailAccs / 2);
+  }
   int64_t streams() const { return blocks() * splitK; }
   int64_t sweeps() const { return k / kKPerSweep; }
   int64_t pieceSweeps() const { return sweeps() / splitK; }
   int64_t rowsPerPU() const { return nPad / kPUs; }
   int64_t tilesPerPU() const { return nPad / (kPUs * 8); }   // output tiles of 8 per PU, per piece and token
-  int64_t tilesPerStream() const { return accs / 2; }        // per PU
-  int64_t streamTiles() const { return pieceSweeps() * accs * kInTiles; }
+  int streamAccs(int64_t g) const { return blockAccs(g % blocks()); }
+  int64_t tilesPerStream(int64_t g) const { return streamAccs(g) / 2; }   // per PU
+  int64_t streamTiles(int64_t g) const { return pieceSweeps() * streamAccs(g) * kInTiles; }
   int tokens() const { return int(activations.size()); }
   // Output tiles. For each token and K piece, every partition numbers the tiles of its streams from
   // the same id: stream g's register r is tile outputTile(m, piece, g, r). One LP6 column (one tile
@@ -90,10 +107,13 @@ struct Projection {
     return outputBase + (int64_t(m) * splitK + piece) * outputSlots + streamSlot[size_t(g)] + reg;
   }
   // The stream that stores PU-local output tile t (rows t * 8 .. t * 8 + 7 of each PU) of a piece.
-  int64_t streamOfTile(int64_t t, int piece) const { return piece * blocks() + t / tilesPerStream(); }
+  int64_t streamOfTile(int64_t t, int piece) const { return piece * blocks() + blockOfTile(t); }
   // Current compiler schedule: clear, load/stream per K sweep, store.
   int64_t commands() const {
-    return int64_t(tokens()) * streams() * (accs + pieceSweeps() * (kInTiles / kSlices + 1) + accs / 2);
+    int64_t perToken = 0;
+    for (int64_t b = 0; b < blocks(); ++b)
+      perToken += splitK * (blockAccs(b) + pieceSweeps() * (kInTiles / kSlices + 1) + blockAccs(b) / 2);
+    return int64_t(tokens()) * perToken;
   }
 };
 
@@ -126,8 +146,11 @@ struct Program {
   // by resident weight storage, including streams assigned in this projection.
   // `accs` and `splitK` set the stream shape (default: 512-row streams over all of K).
   // `streamLoad` is the load one stream adds (0: its LdMAC count / 32, sweeps x accumulators x tokens).
+  // `tailAccs` / `tailBlocks`: the last blocks use fewer accumulators. `streamLoad(accs)` is the load
+  // one stream adds (empty: its LdMAC count / 32, sweeps x accumulators x tokens).
   int64_t addProjection(const std::string &name, int64_t n, int64_t k, const std::vector<int64_t> &activations,
-                        std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1, int64_t streamLoad = 0);
+                        std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1,
+                        std::function<int64_t(int)> streamLoad = {}, int tailAccs = 0, int64_t tailBlocks = 0);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
   // Output tile ids of every projection again, in order (after the streams were rebound).
@@ -168,9 +191,9 @@ struct Program {
 template <typename Fn>
 void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
   const int64_t streams = p.streams(), sweeps = p.pieceSweeps(), rows = p.rowsPerPU(), blocks = p.blocks();
-  const int accs = p.accs;
   for (int64_t g = 0; g < streams; ++g) {
-    const int64_t block = g % blocks, piece = g / blocks;
+    const int64_t block = g % blocks, piece = g / blocks, tile0 = p.blockTile(block);
+    const int accs = p.blockAccs(block);
     for (int64_t s = 0; s < sweeps; ++s)
       for (int o = 0; o < accs; ++o)
         for (int i = 0; i < kInTiles; ++i) {
@@ -180,7 +203,7 @@ void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
             location.address = weightPacketAddress(tile, pu, p.streamPart[size_t(g)]);
             location.inputBegin = ((piece * sweeps + s) * kInTiles + i) * kGroup;
             for (int l = 0; l < kLanes; ++l)
-              location.outputChannels[size_t(l)] = pu * rows + (block * (accs / 2) + o / 2) * 8 + 2 * l + (o % 2);
+              location.outputChannels[size_t(l)] = pu * rows + (tile0 + o / 2) * 8 + 2 * l + (o % 2);
             fn(location);
           }
         }
