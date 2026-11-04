@@ -5,6 +5,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CodegenImpl.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include <algorithm>
@@ -29,6 +30,8 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
   if (d0->layout == "pim_act") {
     if (parallelActivationFeed && parallelActivationFeed->copy == op)
       return scatterPimActParallel(*s0, *d0, err);
+    if (auto c = op->getAttrOfType<IntegerAttr>("hyb.feed_cores"))
+      return scatterPimActCores(*s0, *d0, int(c.getInt()), err);
     return scatterPimAct(*s0, *d0, err);
   }
   if (s0->layout != "dense" || d0->layout != "dense") {
@@ -36,6 +39,8 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
           " LP6 buffer: PIM layouts are only gathered from (pim_out) or scattered to (pim_act)";
     return failure();
   }
+  readAfterGather = op->hasAttr("hyb.read_after_gather");
+  llvm::scope_exit resetReadOrder([&] { readAfterGather = false; });
   View s = *s0, d = *d0;
   if (!perm.empty()) {    // linalg.transpose: dst dim i = src dim perm[i]
     View p = s;

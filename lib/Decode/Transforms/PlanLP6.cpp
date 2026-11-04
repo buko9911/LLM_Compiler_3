@@ -16,6 +16,7 @@
 #include "npu/Decode/Support/PimCost.h"
 #include "npu/Decode/Transforms/NpuCost.h"
 #include "npu/Decode/Transforms/PassSupport.h"
+#include <cmath>
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
@@ -243,8 +244,10 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         const pimcost::Shape shape = shapes[qi++];
         const int64_t pieceSweeps = K / pim::kKPerSweep / shape.splitK;
         auto streamLoad = [&](int accs) { return pimcost::streamCycles(*specOr, M, pieceSweeps, accs); };
+        // Both ranks open and an even K split: each rank computes its own K pieces and needs only their input.
+        const int pieceRanks = open == program.channels * pim::kRanks && shape.splitK % pim::kRanks == 0 ? pim::kRanks : 1;
         int64_t pi = program.addProjection(q.getWeight().str(), outT.getDimSize(1), K, acts, loads, shape.accs,
-                                           shape.splitK, streamLoad, shape.tailAccs, shape.tailBlocks);
+                                           shape.splitK, streamLoad, shape.tailAccs, shape.tailBlocks, pieceRanks);
         const pim::Projection &p = program.projections[pi];
         program.projections[pi].computeFirst = records;
         int64_t count = p.commands(); // final executable primitive count
@@ -255,6 +258,24 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       });
       program.phases.push_back({first, records - first});
       call->setAttr("hyb.pim_phase", b.getI64IntegerAttr(int64_t(program.phases.size()) - 1));
+      // PIM records of the phase. The command processor reads one record before it starts, so a long record delays
+      // the phase; the later records of several are read while the earlier ones compute. As many as keep the first
+      // read below the target's bound, cut at K sweeps (the partition with the fewest sets the limit).
+      if (!group.empty()) {
+        std::map<int, int64_t> sweepsOf;
+        for (int64_t pi = int64_t(program.projections.size()) - int64_t(group.size()); pi < int64_t(program.projections.size()); ++pi) {
+          const pim::Projection &p = program.projections[size_t(pi)];
+          for (int part : p.streamPart) sweepsOf[part] += int64_t(p.tokens()) * p.pieceSweeps();
+        }
+        int64_t rounds = std::numeric_limits<int64_t>::max();
+        for (auto [part, sweeps] : sweepsOf) rounds = std::min(rounds, sweeps);
+        const double fetchUs = double(records - first) * pim::kRecordWordsPerPrimitive / specOr->npu.commandFetchWordsPerCycle / specOr->npu.clockMHz;
+        const int64_t wanted = int64_t(std::ceil(fetchUs / specOr->pim.recordFetchUs));
+        const int64_t count = std::clamp<int64_t>(wanted, 1, std::min<int64_t>(specOr->pim.maxRecords, rounds));
+        call->setAttr("hyb.pim_records", b.getI64IntegerAttr(count));
+        cost::recordDecision(callee, "pim records", "PIM phase of " + std::to_string(records - first) + " primitives",
+                             std::to_string(count), {{"fetch_us", fetchUs}, {"sweep_rounds", double(rounds)}});
+      }
       pimBuffers[qx] = b.getDictionaryAttr({b.getNamedAttr("layout", b.getStringAttr("pim_act")),
                                             b.getNamedAttr("acts", b.getI64ArrayAttr(acts))});
     });

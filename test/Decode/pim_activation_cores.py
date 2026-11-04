@@ -106,8 +106,9 @@ def check_plan(build, baseline_build=None):
     assert commands[publish]["kind"] == "core_block" and commands[publish]["target_logical_core"] == 0
     assert all(publish in ancestors(commands, c["id"]) for c in stores)
     pims = [c for c in commands if c["kind"] == "pim"]
-    assert len(pims) == 1
-    assert set(plan["activation_store_events"]) <= ancestors(commands, pims[0]["id"])
+    assert pims
+    for pim in pims:
+        assert set(plan["activation_store_events"]) <= ancestors(commands, pim["id"])
     math_ops = {"V_LD", "V_OP", "V_ST", "V_CVT", "S_OP", "S_LD", "S_ST"}
     counts = Counter()
     active = set()
@@ -134,8 +135,16 @@ def check_plan(build, baseline_build=None):
         old_pim = [c["pim_commands"] for c in old["commands"] if c["kind"] == "pim"]
         assert old_pim == [c["pim_commands"] for c in pims], "PIM primitive payload changed"
         def write_rows(rs):
-            return sorted((c["lp6_address"]+r*c["lp6_stride"], c["row_bytes"])
+            # The LP6 bytes written, merged: how they are cut into stores may differ.
+            rows = sorted((c["lp6_address"]+r*c["lp6_stride"], c["row_bytes"])
                           for c in rs if c["kind"] == "gdma_store" for r in range(c["rows"]))
+            merged = []
+            for begin, size in rows:
+                if merged and merged[-1][0]+merged[-1][1] == begin:
+                    merged[-1][1] += size
+                else:
+                    merged.append([begin, size])
+            return merged
         assert write_rows(old_records) == write_rows(records), "activation/scale store PA or logical bytes changed"
     return dict(plan=plan, actual_quant_math_counts=dict(counts), quant_only_on_core0=True,
                 actual_active_cores=sorted(active), all_activation_stores_depend_on_Q_publication=True,

@@ -5,6 +5,7 @@ add_mlir_library(NPUDecodeTransforms
   Partition.cpp
   OutlinePhases.cpp
   PlanLP6.cpp
+  PimBoundary.cpp
   NpuTensorPasses.cpp
   NpuMemoryPasses.cpp
   NpuMatmulLayout.cpp

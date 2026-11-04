@@ -180,6 +180,9 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   fn.walk([&](scf::ForallOp f) {
     if (auto c = f->getAttrOfType<IntegerAttr>("hyb.cores")) cores = std::max<int>(cores, int(c.getInt()));
   });
+  fn.walk([&](memref::CopyOp copy) {
+    if (auto c = copy->getAttrOfType<IntegerAttr>("hyb.feed_cores")) cores = std::max<int>(cores, int(c.getInt()));
+  });
   if (cores > in.spec->npu.cores) {
     err = "phase uses more cores than the target has";
     return failure();

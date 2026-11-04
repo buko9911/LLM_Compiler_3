@@ -163,19 +163,23 @@ std::vector<int> ProgramBuilder::endPhase() {
   return sinks;
 }
 
-int ProgramBuilder::pimRecord(const std::string &name, std::vector<int> deps, const std::vector<::npu::pim::Primitive> &commands) {
+int ProgramBuilder::pimRecord(const std::string &name, std::vector<int> deps, const std::vector<::npu::pim::Primitive> &commands,
+                              bool samePhase) {
   assert(!commands.empty());
   flushBlock();
-  phaseNames.push_back(name);
-  phase = int(phaseNames.size()) - 1;
-  phaseStart = cmds.size();
-  phaseGdmas.clear();
+  if (!samePhase) {
+    phaseNames.push_back(name);
+    phase = int(phaseNames.size()) - 1;
+    phaseStart = cmds.size();
+    phaseGdmas.clear();
+  }
   base = deps;
   Command c;
   c.kind = Kind::Pim;
   c.deps = std::move(deps);
   c.pimFirst = int64_t(pimPrimitives.size());
   c.pimCount = int64_t(commands.size());
+  c.pimContinuation = samePhase;
   pimPrimitives.insert(pimPrimitives.end(), commands.begin(), commands.end());
   int id = push(std::move(c));
   frontier = {id};
@@ -326,10 +330,12 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
   bool hasPim = false;
   for (size_t id = 0; id < cmds.size(); ++id) {
     const Command &c = cmds[id];
-    // Symbol = <phase>.<kind>_<id>; a PIM record is named after its phase.
+    // Symbol = <phase>.<kind>_<id>; a phase's first PIM record is named after the phase.
     std::string name = phaseNames[size_t(c.phase)];
-    if (c.kind == Kind::Pim) hasPim = true;
-    else
+    if (c.kind == Kind::Pim) {
+      hasPim = true;
+      if (c.pimContinuation) name += ".pim_" + std::to_string(id);
+    } else
       name += std::string(c.kind == Kind::CoreBlock ? ".core_block_" : (c.kind == Kind::Barrier ? ".barrier_" : ".gdma_")) +
               std::to_string(id);
     symbols.push_back(llvm::json::Object{{"id", int64_t(id)}, {"name", name}});

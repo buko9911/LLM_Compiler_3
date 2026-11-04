@@ -20,7 +20,7 @@ int64_t Program::addActivation(int64_t k) {
 int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
                                const std::vector<int64_t> &inputs, std::map<int, int64_t> &loads, int accs,
                                int splitK, std::function<int64_t(int)> streamLoad, int tailAccs,
-                               int64_t tailBlocks) {
+                               int64_t tailBlocks, int pieceRanks) {
   Projection p;
   p.name = name;
   p.n = n;
@@ -51,8 +51,10 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   for (int64_t piece = 0; piece < splitK; ++piece) {
     std::vector<int64_t> main(size_t(partitions), 0), tail(size_t(partitions), 0);
     for (int64_t b = 0; b < p.blocks(); ++b) {
-      int best = 0;
-      for (int c = 1; c < partitions; ++c)
+      const int rank = int(piece) % pieceRanks;
+      const bool oneRank = pieceRanks > 1;
+      int best = oneRank ? rank * channels : 0;
+      for (int c = best + 1; c < (oneRank ? (rank + 1) * channels : partitions); ++c)
         if (loads[c] < loads[best] || (loads[c] == loads[best] && stored(c) < stored(best))) best = c;
       count[size_t(best)]++;
       (b < p.mainBlocks() ? main : tail)[size_t(best)]++;
@@ -79,6 +81,26 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   for (int64_t a : inputs) std::sort(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end());
   projections.push_back(p);
   return int64_t(projections.size()) - 1;
+}
+
+std::vector<std::pair<int64_t, int64_t>> Program::activationPackets(int64_t index, int rank) const {
+  std::vector<std::pair<int64_t, int64_t>> ranges;
+  for (const Projection &p : projections) {
+    if (!std::count(p.activations.begin(), p.activations.end(), index)) continue;
+    const int64_t packetsPerSweep = kInTiles / kSlices;
+    for (int64_t g = 0; g < p.streams(); ++g) {
+      if (partRank(p.streamPart[size_t(g)]) != rank) continue;
+      const int64_t piece = g / p.blocks();
+      ranges.push_back({piece * p.pieceSweeps() * packetsPerSweep, (piece + 1) * p.pieceSweeps() * packetsPerSweep});
+    }
+  }
+  std::sort(ranges.begin(), ranges.end());
+  std::vector<std::pair<int64_t, int64_t>> merged;
+  for (auto r : ranges) {
+    if (!merged.empty() && r.first <= merged.back().second) merged.back().second = std::max(merged.back().second, r.second);
+    else merged.push_back(r);
+  }
+  return merged;
 }
 
 void Projection::assignOutputSlots() {

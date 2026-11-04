@@ -38,6 +38,8 @@ inline constexpr int kPUs = 8, kLanes = 4, kAccs = 16, kGroup = 8, kSlices = 4, 
 inline constexpr int64_t kKPerSweep = 256, kRowsPerStream = 512, kPacketsPerRow = 64;
 inline constexpr int kRanks = 2;
 inline constexpr int64_t kChBytes = 32, kRankBytes = int64_t(1) << 33;
+// ISA 2.0 words of one primitive in a PIM record, on average (LOAD 3, GEMV_STREAM 5 and so on, measured on Qwen3-4B).
+inline constexpr double kRecordWordsPerPrimitive = 3.2;
 
 // One physical 32-byte weight packet, described without reading weight data.
 // Lane l stores W[inputBegin + e, outputChannels[l]], e=0..7, in the
@@ -158,9 +160,14 @@ struct Program {
   // `streamLoad` is the load one stream adds (0: its LdMAC count / 32, sweeps x accumulators x tokens).
   // `tailAccs` / `tailBlocks`: the last blocks use fewer accumulators. `streamLoad(accs)` is the load
   // one stream adds (empty: its LdMAC count / 32, sweeps x accumulators x tokens).
+  // `pieceRanks` > 1: K piece p stays on rank p % pieceRanks, so that rank needs only those input packets.
   int64_t addProjection(const std::string &name, int64_t n, int64_t k, const std::vector<int64_t> &activations,
                         std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1,
-                        std::function<int64_t(int)> streamLoad = {}, int tailAccs = 0, int64_t tailBlocks = 0);
+                        std::function<int64_t(int)> streamLoad = {}, int tailAccs = 0, int64_t tailBlocks = 0,
+                        int pieceRanks = 1);
+  // Packet ranges of activation `index` that the streams on rank `rank` read (sorted, merged). A rank that computes
+  // only some K pieces needs only their packets.
+  std::vector<std::pair<int64_t, int64_t>> activationPackets(int64_t index, int rank) const;
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
   // Output tile ids of every projection again, in order (after the streams were rebound).

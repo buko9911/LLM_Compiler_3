@@ -57,7 +57,7 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     chunk = std::min(chunk, scratch);
   }
   struct Run { int64_t t, n, id; int part; };
-  uint64_t stage = win;
+  uint64_t &stage = gatherStage.try_emplace(curCore, win).first->second;
   for (int64_t r = 0; r < rows; ++r) {
     int m = int(m0 + r);
     for (int64_t c0 = n0; c0 < n0 + cols; c0 += chunk) {
@@ -96,8 +96,9 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
             stage += need;
             for (int64_t id = idLo; id < idHi;) {
               const int64_t n = std::min(idHi - id, pim::kPacketsPerRow - id % pim::kPacketsPerRow);
-              gdmaLoad(in.pim->outputTileAddress(id, pu, rank * channels), base + uint64_t((id - idLo) * slice),
-                       uint32_t(slice), uint32_t(n), uint32_t(colBytes), uint32_t(slice));
+              lastGatherRead[curCore] =
+                  gdmaLoad(in.pim->outputTileAddress(id, pu, rank * channels), base + uint64_t((id - idLo) * slice),
+                           uint32_t(slice), uint32_t(n), uint32_t(colBytes), uint32_t(slice));
               id += n;
             }
             for (const Run &run : runs)
@@ -364,12 +365,105 @@ void Codegen::replicateColumns(uint64_t dup, uint64_t src, int64_t packets) {
            uint32_t(colBytes), uint32_t(colBytes));
 }
 
+/// Stores activation packets [first, first + count), replicated at L2 `l2`: for every rank the packets that rank's
+/// streams read, one linear store per bank set. A rank that computes only some K pieces takes only their packets.
+void Codegen::storeActivationPackets(int64_t actIndex, uint64_t l2, int64_t first, int64_t count) {
+  const pim::Activation &a = in.pim->activations[size_t(actIndex)];
+  const int64_t colBytes = in.pim->colBytes();
+  const int channels = in.pim->channels;
+  std::set<int> ranks;
+  for (int part : a.parts) ranks.insert(in.pim->partRank(part));
+  for (int rk : ranks)
+    for (auto [lo, hi] : in.pim->activationPackets(actIndex, rk)) {
+      const int64_t from = std::max(lo, first), to = std::min(hi, first + count);
+      for (int64_t p = from; p < to;) {
+        const int64_t pk = a.packetBase() + p;
+        const int64_t n = std::min(to - p, pim::kPacketsPerRow - pk % pim::kPacketsPerRow);
+        for (int parity = 0; parity < 2; ++parity)   // bank 0 (PUs 0,2,4,6) then bank 2 (PUs 1,3,5,7)
+          gdmaStore(l2 + uint64_t((p - first) * colBytes), in.pim->activationPacketAddress(a, p, parity, rk * channels),
+                    uint32_t(colBytes * n), 1, uint32_t(colBytes * n), uint32_t(colBytes * n));
+        p += n;
+      }
+    }
+}
+
+/// The feed of scatterPimAct shared among `feedCores` cores (hyb-pim-boundary chose it): the core that quantized the
+/// vector publishes it to its small-transfer staging, every other core copies its share of the packets to the L1
+/// scratch, and each core replicates and stores its own packets. Other cores touch only their L1 scratch and their L2
+/// staging window, which the phase reserves for them.
+LogicalResult Codegen::scatterPimActCores(const View &s, const View &d, int feedCores, std::string &err) {
+  constexpr int64_t kFeedBatchesPerCore = 4;
+  auto acts = d.lp6.getAs<ArrayAttr>("acts");
+  const int64_t K = d.shape[1], sRow = s.shape.size() == 2 ? s.strides[0] : K;
+  if (s.space != kL1 || s.strides.back() != 1 || d.strides.size() != 2 || d.offset || d.shape[0] != int64_t(acts.size())) {
+    err = "shared PIM activation feed needs whole contiguous L1 rows of the activation buffer";
+    return failure();
+  }
+  const int source = curCore;
+  const int64_t colBytes = in.pim->colBytes();
+  const int64_t scratch = in.spec->npu.l1ReservedBytes - kPoolMax;
+  std::map<int, uint64_t> stages;   // per core: next free bytes of the staging window, across the tokens
+  for (int64_t m = 0; m < d.shape[0]; ++m) {
+    const int64_t actIndex = cast<IntegerAttr>(acts[size_t(m)]).getInt();
+    const pim::Activation &a = in.pim->activations[size_t(actIndex)];
+    const uint64_t row = addr(s, m * sRow);
+    // Publish the vector to L2. The block that ends here is what the other cores wait for.
+    const uint64_t published = stagingFor(uint64_t(K));
+    ldma(row, published, uint32_t(K), 1, 0, 0, false);
+    const int publish = flush();
+    if (publish < 0) {
+      err = "PIM activation publication emitted no core block";
+      return failure();
+    }
+    const int64_t packets = a.packets();
+    for (int core = 0; core < feedCores; ++core) {
+      const int64_t begin = packets * core / feedCores, end = packets * (core + 1) / feedCores;
+      if (begin == end) continue;
+      const int c = (source + core) % feedCores;
+      startCore(c, c == source ? std::vector<int>{} : std::vector<int>{publish});
+      uint64_t src = row + uint64_t(begin * 32);
+      const uint64_t dup = scratchBase, win = windowBase(c);
+      const int64_t partBytes = (end - begin) * 32;
+      int64_t budget = scratch;
+      if (c != source) {
+        // The packets sit at the end of the L1 scratch, the replicas grow from its start.
+        src = dup + uint64_t((scratch - partBytes) / 64 * 64);
+        budget = (scratch - partBytes) / 64 * 64;
+        ldma(src, published + uint64_t(begin * 32), uint32_t(partBytes), 1, 0, 0, true);
+      }
+      // A few batches per core, so the stores of one run while the next is copied to L2.
+      const int64_t pipelined = std::max<int64_t>(1, (end - begin + kFeedBatchesPerCore - 1) / kFeedBatchesPerCore);
+      const int64_t batch = std::min({pipelined, budget / colBytes, (int64_t(ringWindow()) - 32 * pim::kPacketsPerRow) / colBytes});
+      if (batch < 1) {
+        err = "shared PIM activation feed needs one column of L1 scratch and L2 staging";
+        return failure();
+      }
+      uint64_t &stage = stages.try_emplace(c, win).first->second;
+      const uint64_t windowEnd = win + uint64_t(ringWindow());
+      for (int64_t first = begin; first < end; first += batch) {
+        const int64_t count = std::min(batch, end - first);
+        if (stage + uint64_t(colBytes * count) > windowEnd) stage = win;
+        replicateColumns(dup, src + uint64_t((first - begin) * 32), count);
+        ldma(dup, stage, uint32_t(colBytes * count), 1, 0, 0, false);
+        storeActivationPackets(actIndex, stage, first, count);
+        stage += uint64_t(colBytes * count);
+      }
+      endCore();
+    }
+    curCore = source;
+    w.logicalCore = source;
+    w.frontier = last[size_t(source)];
+  }
+  return success();
+}
+
 /// INT8 activation rows (L1) -> every consuming PU's bank.
 /// Subchannel and bank group sit below the column in the address, so one column of the
 /// 4 bank groups x C subchannels of a bank is colBytes() = 128 C contiguous bytes: each packet is
 /// copied 4 C times in L1 scratch and, for every rank that reads the vector, the even-bank PUs
 /// (0,2,4,6) and odd-bank PUs (1,3,5,7) take one linear store each.
 LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &err) {
+  constexpr int64_t kFeedBatches = 4;
   if (s.space != kL1 || s.strides.back() != 1) {
     err = "PIM activation copy needs contiguous L1 rows";
     return failure();
@@ -384,9 +478,8 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     err = "PIM activation copy must cover whole token rows of the activation buffer";
     return failure();
   }
-  uint64_t dup = scratchBase, win = windowBase(curCore);
+  uint64_t dup = scratchBase, win = windowBase(curCore), stage = win;
   const int64_t colBytes = in.pim->colBytes();
-  const int channels = in.pim->channels;
   // Replication is scratch, not a planned L1 allocation. Bound it by both the
   // L1 reserve and L2 window; a wide FFN vector otherwise overwrites live L1
   // activation/scale buffers before they are stored (e.g. Llama's K=14336).
@@ -405,24 +498,18 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
     // (the same rows, PimLayout::baseRows), so the extra copies land in unused slots. Per-PU stores
     // move 32 B at a time and were 17x slower per byte (Qwen3-4B O and down inputs, 5 of 8
     // subchannels: 389 KB in 71 us, against 164 KB in 1.7 us for a full rank; measured 2026-11-03).
-    std::set<int> pairRanks;
-    for (int p : a.parts) pairRanks.insert(in.pim->partRank(p));
-    if (!pairRanks.empty()) {
-      for (int64_t begin = 0; begin < a.packets(); begin += batchPackets) {
-        const int64_t count = std::min(batchPackets, a.packets() - begin);
+    const int64_t actIndex = cast<IntegerAttr>(acts[size_t(row0 + m)]).getInt();
+    if (!a.parts.empty()) {
+      // A few batches, in different staging bytes, so the stores of one run while the next is copied to L2.
+      const int64_t batch = std::min(batchPackets, std::max<int64_t>(1, (a.packets() + kFeedBatches - 1) / kFeedBatches));
+      const uint64_t windowEnd = win + uint64_t(ringWindow());
+      for (int64_t begin = 0; begin < a.packets(); begin += batch) {
+        const int64_t count = std::min(batch, a.packets() - begin);
+        if (stage + uint64_t(colBytes * count) > windowEnd) stage = win;
         replicateColumns(dup, row + uint64_t(begin * 32), count);
-        ldma(dup, win, uint32_t(colBytes * count), 1, 0, 0, false);
-        for (int rk : pairRanks) {
-          int part0 = rk * channels;
-          for (int64_t first = begin; first < begin + count;) {
-            int64_t pk = a.packetBase() + first;
-            int64_t n = std::min(begin + count - first, pim::kPacketsPerRow - pk % pim::kPacketsPerRow);
-            for (int parity = 0; parity < 2; ++parity)   // bank 0 (PUs 0,2,4,6) then bank 2 (PUs 1,3,5,7)
-              gdmaStore(win + uint64_t((first - begin) * colBytes), in.pim->activationPacketAddress(a, first, parity, part0),
-                        uint32_t(colBytes * n), 1, uint32_t(colBytes * n), uint32_t(colBytes * n));
-            first += n;
-          }
-        }
+        ldma(dup, stage, uint32_t(colBytes * count), 1, 0, 0, false);
+        storeActivationPackets(actIndex, stage, begin, count);
+        stage += uint64_t(colBytes * count);
       }
     }
   }

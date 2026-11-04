@@ -39,13 +39,13 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   static constexpr llvm::StringLiteral kNpuKeys[] = {
       "clock_mhz", "cores", "sa_rows", "sa_cols", "l1_bytes", "l2_bytes", "gemv_fixed_us",
       "l1_read_bytes_per_cycle", "l1_write_bytes_per_cycle", "mma_k_per_cycle", "mma_pipeline_cycles",
-      "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps",
+      "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps", "ldma_gbps_per_core", "command_fetch_words_per_cycle",
       "core_split_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
       "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
   static constexpr llvm::StringLiteral kPimKeys[] = {
       "clock_mhz", "pus", "lanes", "accumulators", "k_per_sweep", "channels", "ranks", "partitions",
       "concurrent_ranks", "nlld_ck", "bankset_pingpong_lead", "ldmac_ck", "sweep_ck", "stream_ck", "two_rank_factor",
-      "readback_gbps", "act_write_gbps", "readback_ns_per_output", "npu_run_split_us", "pim_layer_exposed_us", "stream_accs",
+      "readback_gbps", "act_write_gbps", "readback_ns_per_output", "npu_run_split_us", "pim_layer_exposed_us", "record_fetch_us", "max_records", "stream_accs",
       "max_split_k"};
   static constexpr llvm::StringLiteral kLp6Keys[] = {"capacity_bytes"};
   auto unknownKey = [&](llvm::json::Object *o, llvm::StringRef name, llvm::ArrayRef<llvm::StringLiteral> keys) {
@@ -79,9 +79,11 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(n, "vector_lanes", s.npu.vectorLanes); num(n, "vector_exp_per_cycle", s.npu.vectorExpPerCycle);
   num(n, "vector_rcp_per_cycle", s.npu.vectorRcpPerCycle); num(n, "vector_sqrt_per_cycle", s.npu.vectorSqrtPerCycle);
   num(n, "gdma_read_gbps", s.npu.gdmaReadGBps); num(n, "core_split_us", s.npu.coreSplitUs);
+  num(n, "ldma_gbps_per_core", s.npu.ldmaGBpsPerCore);
+  num(n, "command_fetch_words_per_cycle", s.npu.commandFetchWordsPerCycle);
   if (s.npu.l1ReadBytesPerCycle <= 0 || s.npu.l1WriteBytesPerCycle <= 0 || s.npu.mmaKPerCycle <= 0 ||
       s.npu.mmaPipelineCycles < 0 || s.npu.vectorLanes <= 0 || s.npu.vectorExpPerCycle <= 0 ||
-      s.npu.vectorRcpPerCycle <= 0 || s.npu.vectorSqrtPerCycle <= 0 || !(s.npu.gdmaReadGBps > 0) ||
+      s.npu.vectorRcpPerCycle <= 0 || s.npu.vectorSqrtPerCycle <= 0 || !(s.npu.gdmaReadGBps > 0) || !(s.npu.ldmaGBpsPerCore > 0) || s.npu.commandFetchWordsPerCycle < 1 ||
       !(s.npu.coreSplitUs >= 0)) {
     error = "npu timing values must be positive (core_split_us non-negative)";
     return failure();
@@ -96,6 +98,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(p, "npu_run_split_us", s.pim.npuRunSplitUs);
   num(p, "pim_layer_exposed_us", s.pim.layerExposedUs);
   num(p, "two_rank_factor", s.pim.twoRankFactor);
+  num(p, "record_fetch_us", s.pim.recordFetchUs); num(p, "max_records", s.pim.maxRecords);
   num(p, "max_split_k", s.pim.maxSplitK); num(p, "bankset_pingpong_lead", s.pim.banksetPingPongLead);
   if (p) {
     if (auto v = p->getBoolean("concurrent_ranks")) s.pim.concurrentRanks = *v;
@@ -107,7 +110,8 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.pim.ldmacCK < s.pim.nlldCK || s.pim.sweepCK < 0 || s.pim.streamCK < 0 || !(s.pim.readbackGBps > 0) ||
       !(s.pim.actWriteGBps > 0) || s.pim.readbackNsPerOutput < 0 || s.pim.npuRunSplitUs < 0 ||
-      s.pim.layerExposedUs < 0 || !(s.pim.twoRankFactor >= 1) ||
+      s.pim.layerExposedUs < 0 || !(s.pim.twoRankFactor >= 1) || !(s.pim.recordFetchUs > 0) ||
+      s.pim.maxRecords < 1 || s.pim.maxRecords > 64 ||
       s.pim.maxSplitK < 1 || s.pim.streamAccs.empty() || s.pim.banksetPingPongLead < 0 ||
       s.pim.banksetPingPongLead > 63) {
     error = "pim stream costs: ldmac_ck >= nlld_ck, the others nonnegative (rates positive), max_split_k >= 1, "
@@ -181,17 +185,16 @@ GemvCost mlir::hybrid::estimateGemvGroup(const TargetSpec &spec, int64_t tokens,
   // PIM (W8A8): the fastest stream layout of the group (PimCost.h: accumulators per stream and
   // split-K per projection, streams balanced over one phase's partitions, every token repeating
   // every stream). Boundary work done by the NPU: the INT8 activation written as whole columns to
-  // every PU of the phase's ranks (K x PUs x subchannels x ranks bytes per token), the INT32 outputs gathered and the
+  // every PU of the ranks that read it (K x PUs x subchannels x ranks bytes per token), the INT32 outputs gathered and the
   // split-K partial sums added.
   std::vector<int64_t> rows;
   for (const GemvShape &g : group) rows.push_back(g.n);
   pimcost::Estimate e;
   pimcost::choose(spec, tokens, group.front().k, rows, pimcost::phasePartitions(spec), true, e);
   c.pimUs = e.pimUs;
-  const double actBytes = double(group.front().k) * spec.pim.pus * spec.pim.channels * spec.pim.phaseRanks() * double(tokens);
   double outputs = 0;
   for (const GemvShape &g : group) outputs += double(g.n);
-  c.pimBoundaryUs = actBytes / (spec.pim.actWriteGBps * 1e3) + e.gatherUs + e.sumUs + double(tokens) * outputs * spec.pim.readbackNsPerOutput / 1e3;
+  c.pimBoundaryUs = e.scatterUs + e.gatherUs + e.sumUs + double(tokens) * outputs * spec.pim.readbackNsPerOutput / 1e3;
   // NPU: weights and row scales streamed from LP6 once for all tokens at the sustained GDMA read rate,
   // or the systolic array time when that is longer.
   double bytes = 0, macs = 0;

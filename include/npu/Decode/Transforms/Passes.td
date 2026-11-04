@@ -360,4 +360,15 @@ def HybNpuMemPlan : Pass<"hyb-npu-memplan", "ModuleOp"> {
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
 }
 
+def HybPimBoundary : Pass<"hyb-pim-boundary", "ModuleOp"> {
+  let summary = "Order LP6 reads after small PIM results; share the activation feed among the cores";
+  let description = [{
+    Decides from sizes and hardware numbers. An LP6 read larger than the PIM results read before it in the phase gets
+    `hyb.read_after_gather`: it queues behind them in the in-order DMA read engine. An activation copy of a phase whose
+    quant ran on one core gets `hyb.feed_cores` when sharing the copy among the cores saves time (publishing the input
+    costs less than the local DMA it divides). Every choice is recorded on the phase.
+  }];
+  let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+}
+
 #endif

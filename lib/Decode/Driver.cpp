@@ -200,7 +200,8 @@ std::string decodePipeline(const std::string &overrideOpt) {
       "hyb-npu-matmul-layout" + spec + ","                    // fill SA tiles for transpose-B matmuls
       "hyb-npu-input-pipeline" + spec + ","                   // overlap the next input copy with compute
       "hyb-npu-epilogue-pipeline" + spec + ","                // dequantize GEMV tiles behind the next MMA
-      "hyb-npu-memplan" + spec;                               // liveness-based L1/L2 offsets
+      "hyb-npu-memplan" + spec + ","                          // liveness-based L1/L2 offsets
+      "hyb-pim-boundary" + spec;                              // read order and input feed around PIM phases
   return tensor + placement + fusion + ownership + memory;
 }
 

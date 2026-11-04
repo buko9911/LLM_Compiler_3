@@ -205,14 +205,14 @@ void Codegen::reachableDependencies(std::vector<int> &deps) const {
 /// other rank. The phase's core blocks still follow the entry.
 void Codegen::pimOverlapDependencies(ArrayRef<std::pair<uint64_t, uint64_t>> lp6Ranges,
                                      std::vector<int> &deps) const {
-  if (in.pimRecord < 0) return;
+  if (in.pimRecords.empty()) return;
   const bool pimRank = llvm::any_of(lp6Ranges, [&](auto r) {
     return llvm::any_of(in.pimRanks, [&](int rank) {
       const uint64_t lo = uint64_t(rank) * uint64_t(pim::kRankBytes);
       return overlaps(r.first, r.second, lo, lo + uint64_t(pim::kRankBytes));
     });
   });
-  if (pimRank) deps.push_back(in.pimRecord);
+  if (pimRank) deps.insert(deps.end(), in.pimRecords.begin(), in.pimRecords.end());
   else deps.insert(deps.end(), in.beforePim.begin(), in.beforePim.end());
 }
 
@@ -236,6 +236,8 @@ int Codegen::gdmaLoad(uint64_t lp6, uint64_t l2, uint32_t rowBytes, uint32_t row
   for (const LAcc &a : lp6acc)
     if (a.store && touches(a.s,a.e,lp6Ranges)) deps.push_back(a.id);
   pimOverlapDependencies(lp6Ranges, deps);
+  if (readAfterGather)
+    for (auto [core, id] : lastGatherRead) deps.push_back(id);
   reachableDependencies(deps);
   std::sort(deps.begin(), deps.end());
   deps.erase(std::unique(deps.begin(), deps.end()), deps.end());

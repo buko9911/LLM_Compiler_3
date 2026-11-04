@@ -39,20 +39,32 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
   Estimate e;
   std::vector<int64_t> load(size_t(std::max(1, partitions)), 0);
   const int64_t sweeps = k / spec.pim.kPerSweep, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
+  // Both ranks in use: a projection with an even K split keeps each piece on one rank (pim::Program::addProjection),
+  // and a rank needs only the input packets of its pieces, when every projection of the group splits so.
+  const bool twoRanks = partitions > spec.pim.channels, allOpen = partitions == spec.pim.channels * spec.pim.ranks;
+  bool pieceRanks = allOpen;
+  for (size_t i = 0; i < n.size(); ++i) pieceRanks &= shapes[i].splitK % spec.pim.ranks == 0;
   for (size_t i = 0; i < n.size(); ++i) {
     const Shape s = shapes[i];
     const std::vector<int> blocks = shapeBlocks(spec, n[i], s);
+    const bool onePerRank = allOpen && s.splitK % spec.pim.ranks == 0;
     int64_t nPad = 0;
     for (int a : blocks) nPad += unit * a;
     for (int64_t piece = 0; piece < s.splitK; ++piece)
-      for (int a : blocks)
-        *std::min_element(load.begin(), load.end()) += streamCycles(spec, tokens, sweeps / s.splitK, a);
+      for (int a : blocks) {
+        const int64_t lo = onePerRank ? (piece % spec.pim.ranks) * spec.pim.channels : 0;
+        const int64_t hi = onePerRank ? lo + spec.pim.channels : int64_t(load.size());
+        *std::min_element(load.begin() + lo, load.begin() + hi) += streamCycles(spec, tokens, sweeps / s.splitK, a);
+      }
     e.gatherUs += double(tokens) * s.splitK * double(nPad) * 4 / (spec.pim.readbackGBps * 1e3);
     e.sumUs += double(tokens) * (s.splitK - 1) * double(nPad) / 16 * 4 /
                (spec.npu.clockMHz * std::max(1, spec.npu.cores));
   }
   e.pimUs = double(*std::max_element(load.begin(), load.end())) / spec.pim.clockMHz;
-  if (partitions > spec.pim.channels) e.pimUs *= spec.pim.twoRankFactor;
+  if (twoRanks) e.pimUs *= spec.pim.twoRankFactor;
+  // Input written as whole columns to every PU of the ranks that read it.
+  const double ranks = twoRanks ? (pieceRanks ? 1.0 : double(spec.pim.ranks)) : 1.0;
+  e.scatterUs = double(tokens) * double(k) * spec.pim.pus * spec.pim.channels * ranks / (spec.pim.actWriteGBps * 1e3);
   return e;
 }
 

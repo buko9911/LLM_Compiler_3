@@ -127,6 +127,29 @@ json::Object npuPhaseReport(const std::string &name, func::FuncOp phase, const N
 
 } // namespace
 
+/// Cuts a PIM phase's primitives into `records` records. Each partition keeps its own order and its share of every
+/// record is about the same number of K sweeps, so all partitions advance together. The command processor reads a
+/// record only when the one before is issued: the later records are read while the earlier ones compute, and only the
+/// first record's read stays in front of the phase.
+static std::vector<std::vector<pim::Primitive>> splitPimRecords(const std::vector<pim::Primitive> &all, int records) {
+  std::map<uint32_t, std::vector<pim::Primitive>> byPartition;
+  for (const pim::Primitive &p : all) byPartition[p.partition].push_back(p);
+  std::vector<std::vector<pim::Primitive>> out(size_t(std::max(1, records)));
+  for (auto &[partition, list] : byPartition) {
+    int64_t sweeps = 0, done = 0;
+    for (const pim::Primitive &p : list) sweeps += p.opcode == pim::Opcode::GemvStream;
+    size_t record = 0;
+    for (size_t i = 0; i < list.size(); ++i) {
+      out[record].push_back(list[i]);
+      if (list[i].opcode == pim::Opcode::GemvStream) ++done;
+      const bool storeNext = i + 1 < list.size() && list[i + 1].opcode == pim::Opcode::StoreOutput;
+      if (!storeNext && record + 1 < out.size() && done * int64_t(out.size()) >= sweeps * int64_t(record + 1)) ++record;
+    }
+  }
+  llvm::erase_if(out, [](const auto &r) { return r.empty(); });
+  return out;
+}
+
 bool driver::emitPimCommands(pim::Program &prog, std::vector<pim::Primitive> &pimCommands) {
   for (size_t pi = 0; pi < prog.projections.size(); ++pi) {
     int64_t expect = prog.projections[pi].computeFirst;
@@ -168,7 +191,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
   program.commandSchedule = true;
   int parallelActivationPhases = 0;
   CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)
-  struct { int record = -1; std::vector<int> ranks, before; } pimBefore;   // the PIM phase just before
+  struct { std::vector<int> records, ranks, before; } pimBefore;   // the PIM phase just before
   for (Operation &op : step.getBody().front()) {
     auto call = dyn_cast<func::CallOp>(op);
     if (!call) continue;
@@ -180,8 +203,15 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       auto [first, count] = prog.phases[size_t(idx)];
       std::vector<pim::Primitive> primitives(pimCommands.begin() + first, pimCommands.begin() + first + count);
       pimBefore.before = exit;
-      exit = {program.pimRecord(name, exit, primitives)};
-      pimBefore.record = exit.front();
+      pimBefore.records.clear();
+      auto recordsAttr = call->getAttrOfType<IntegerAttr>("hyb.pim_records");
+      const int records = recordsAttr ? int(recordsAttr.getInt()) : 1;
+      bool samePhase = false;
+      for (const auto &part : splitPimRecords(primitives, records)) {
+        pimBefore.records.push_back(program.pimRecord(name, pimBefore.before, part, samePhase));
+        samePhase = true;
+      }
+      exit = pimBefore.records;
       pimBefore.ranks.clear();
       for (const auto &p : prog.projections)
         if (p.computeCount > 0 && p.computeFirst >= first && p.computeFirst < first + count)
@@ -211,7 +241,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     const bool packet = callee->hasAttr("hyb.npu_kernel");
     if (packet) carried = {};
     else in.carried = &carried;
-    in.pimRecord = pimBefore.record;
+    in.pimRecords = pimBefore.records;
     in.pimRanks = pimBefore.ranks;
     in.beforePim = pimBefore.before;
     pimBefore = {};

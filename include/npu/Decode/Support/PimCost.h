@@ -37,8 +37,8 @@ struct Shape {
 };
 
 struct Estimate {
-  double pimUs = 0, gatherUs = 0, sumUs = 0;
-  double total() const { return pimUs + gatherUs + sumUs; }
+  double pimUs = 0, gatherUs = 0, sumUs = 0, scatterUs = 0;
+  double total() const { return pimUs + gatherUs + sumUs + scatterUs; }
 };
 
 /// Output rows of one projection padded to whole streams of `accs` accumulators.

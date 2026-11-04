@@ -35,6 +35,10 @@ struct TargetSpec {
     int64_t vectorRcpPerCycle = 2, vectorSqrtPerCycle = 2;
     // Sustained LP6 -> L2 read of all cores together: a program's GDMA reads replayed without compute.
     double gdmaReadGBps = 92.9;
+    /// Sustained L1 <-> L2 local DMA of one core, GB/s (measured).
+    double ldmaGBpsPerCore = 0;
+    /// Words of system commands the command processor reads per cycle.
+    int64_t commandFetchWordsPerCycle = 0;
     // Fixed cost of running one op on several cores instead of one (dispatch, the cross-core events
     // and the per-core copies of its operands): measured, see npu.core_split_us in the target files.
     double coreSplitUs = 0.5;
@@ -85,6 +89,9 @@ struct TargetSpec {
     /// A phase on both ranks takes this much longer than the one-rank cost: the ranks of a subchannel
     /// share its command bus and DQ (measured ratio).
     double twoRankFactor = 1;
+    /// The first PIM record of a phase is read before the phase computes: at most this long, in at most maxRecords records.
+    double recordFetchUs = 0;
+    int64_t maxRecords = 1;
     /// NPU gather of INT32 PIM outputs and scatter of INT8 activations.
     double readbackGBps = 32, actWriteGBps = 96;
     /// NPU time per PIM output per token to bring it back and dequantize it (hyb-partition; the NPU

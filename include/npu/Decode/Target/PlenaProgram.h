@@ -37,6 +37,7 @@ public:
     uint64_t lp6 = 0, l2 = 0;
     uint32_t rowBytes = 0, rows = 1, lp6Stride = 0, l2Stride = 0;
     int64_t pimFirst = 0, pimCount = 0;   // Kind::Pim: indices into pimPrimitives
+    bool pimContinuation = false;
     int phase = 0;                        // index into phaseNames (symbol prefix)
     int source = -1;                      // optional diagnostic origin, never encoded
   };
@@ -65,8 +66,10 @@ public:
   /// Ends the phase: a BARRIER (chained when it joins more than 255 records) after every record
   /// of the phase; returns its ordinal, or the phase entry when the phase is empty.
   std::vector<int> endPhase();
-  /// A PIM phase: compiler-lowered primitives, ordered after `deps`.
-  int pimRecord(const std::string &name, std::vector<int> deps, const std::vector<::npu::pim::Primitive> &commands);
+  /// A PIM phase: compiler-lowered primitives, ordered after `deps`. `samePhase`: a further record of the phase just
+  /// begun (the command processor reads it while the earlier records compute).
+  int pimRecord(const std::string &name, std::vector<int> deps, const std::vector<::npu::pim::Primitive> &commands,
+                bool samePhase = false);
   /// PIM kernel configuration written to system.json when the program has PIM records.
   std::string pimKernelJson;
 

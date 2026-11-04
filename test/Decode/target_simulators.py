@@ -21,6 +21,7 @@ checks = {
     "npu.cores": (npu["cores"], toml["SYSTEM"]["num_cores"]),
     "npu.l1_bytes": (npu["l1_bytes"], arch["l1_sram_size_bytes"]),
     "npu.l2_bytes": (npu["l2_bytes"], toml["L2"]["size_bytes"]),
+    "npu.command_fetch_words_per_cycle": (npu["command_fetch_words_per_cycle"], toml["COMMAND_PROCESSOR"]["fetch_words_per_cycle"]),
     "lp6.capacity_bytes": (lp6["capacity_bytes"], arch["lp6_capacity_bytes"]),
     "pim.channels": (pim["channels"], ini.getint("system", "channels")),
     "pim.ranks": (pim["ranks"], ini.getint("system", "ranks")),

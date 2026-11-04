@@ -116,6 +116,13 @@ private:
     std::vector<int64_t> activationIds;
   };
   std::optional<ParallelActivationFeed> parallelActivationFeed;
+  // hyb.read_after_gather: the GDMA reads of the PIM results so far, the last one per core, and whether the copy being
+  // lowered waits for them (its GDMA reads then queue behind them in the DMA read engine).
+  std::map<int, int> lastGatherRead;
+  // Next free byte of each core's staging window for PIM results: results of later projections do not wait for the
+  // readers of earlier ones, so all result reads queue at the phase start.
+  std::map<int, uint64_t> gatherStage;
+  bool readAfterGather = false;
 
   int64_t window() const {
     if (auto a = in.phase->getAttrOfType<IntegerAttr>("hyb.l2_staging_per_core")) return a.getInt();
@@ -339,6 +346,8 @@ private:
   LogicalResult scatterPimActParallel(const View &s, const View &, std::string &err);
   std::string parallelActivationPlanJSON() const;
   LogicalResult scatterPimAct(const View &s, const View &d, std::string &err);
+  LogicalResult scatterPimActCores(const View &s, const View &d, int feedCores, std::string &err);
+  void storeActivationPackets(int64_t actIndex, uint64_t l2, int64_t first, int64_t count);
 
   // ---- compute ops (CodegenOps.cpp) ----------------------------------------------------------
   static bool isMatmulInit(Operation *user, Value out);

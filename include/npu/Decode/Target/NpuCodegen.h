@@ -53,8 +53,7 @@ struct NpuPhaseInput {
   // NPU+PIM: the PIM phase just before this one, the LP6 ranks it computes on and the records it waited
   // for. A GDMA that touches none of those ranks and has no other hazard follows `beforePim` instead of
   // the phase entry, so its DRAM traffic overlaps the PIM work on the other rank.
-  int pimRecord = -1;
-  std::vector<int> pimRanks, beforePim;
+  std::vector<int> pimRecords, pimRanks, beforePim;
 };
 
 struct NpuPhaseStats {
