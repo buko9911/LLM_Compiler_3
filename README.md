@@ -64,6 +64,7 @@ MLIR 기본 pass 13단계). 모든 pass가 항상 돌고, 각 pass가 텐서 크
 | | `hyb-npu-input-pipeline` | L2→L1 입력 복사와 matmul을 타일로 나눠 겹침 | |
 | | `hyb-npu-epilogue-pipeline` | GEMV 루프 뒤 dequant를 한 타일 늦게 다음 타일의 MMA 사이에 냄(VPU와 SA 겹침) | SiLU×up은 루프가 weight를 기다릴 때만 타일마다 |
 | | `hyb-npu-memplan` | 수명 기반 L1/L2 주소 배정, 루프 buffer 2칸, L2 staging 크기 | 넘치면 컴파일 오류 |
+| | `hyb-pim-boundary` | 큰 LP6 읽기를 PIM 결과 읽기 뒤로, PIM 입력 복제·저장을 코어 여럿에 | 읽기 바이트, K, local DMA 속도로 비교 |
 
 ## Backend (MLIR pass 아님)
 
@@ -155,7 +156,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 
 ## 테스트
 
-`ctest --test-dir build`는 34개를 돌린다. `decode-frontend`는 `-DNPU_TEST_EMULATOR`와 `-DNPU_TEST_SETTINGS`가, `decode-target-simulators`와
+`ctest --test-dir build`는 35개를 돌린다. `decode-frontend`는 `-DNPU_TEST_EMULATOR`와 `-DNPU_TEST_SETTINGS`가, `decode-target-simulators`와
 `e2e-*`는 `-DNPU_TEST_EMULATOR`와 `-DNPU_TEST_LIBRARY`가 있어야 등록된다.
 
 | 이름 | 내용 |

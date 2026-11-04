@@ -42,8 +42,8 @@ two disagree.
 | `concurrent_ranks` | true | setting | true: one PIM phase computes on both ranks. false: on one rank; the other serves normal reads meanwhile |
 | `nlld_ck` | 10 | draft | Minimum LdMAC spacing, draft Table 51 at 9600-10667 Mbps |
 | `bankset_pingpong_lead` | 12 | assumption | Weight rows alternate bank sets, the other set's row opens 12 LdMACs ahead (leads 12..48 measured within 0.1%; 0 is 14% slower per layer). The draft does not spell this operation out |
-| `ldmac_ck`, `sweep_ck`, `stream_ck` | 11.6111, 871.111, 1130 | fitted | DRAM CK per LdMAC in a long stream, per 256-input sweep, per stream. Fit on Qwen3-4B 2-layer decode fixtures (`research/npu_pim_baseline/fit_pim.py`) |
-| `readback_gbps`, `act_write_gbps` | 32, 96 | estimate | NPU gather of INT32 outputs and scatter of INT8 activations |
+| `ldmac_ck`, `sweep_ck`, `stream_ck` | 11.496, 784.7, 87 | fitted | DRAM CK per LdMAC in a long stream, per 256-input sweep, per stream. Fit on Qwen3-4B 2-layer decode, one rank, A fixed to 4..14 and the mixed layout, 35 phases within 1.6% but two tails (`research/npu_pim_baseline/fit_pim.py`, 2026-11-04, PIM phases cut into records) |
+| `readback_gbps`, `act_write_gbps` | 32, 96 | estimate | NPU gather of INT32 outputs and scatter of INT8 activations. The scatter counts only the packets each rank reads (two ranks, even K split: half) |
 | `readback_ns_per_output` | 0.33 | measured | NPU time per PIM output and token beyond the gather bytes: LM head 151,936 outputs in 69 us |
 | `npu_run_split_us` | 45 | measured | NPU time lost when a PIM group splits a layer's NPU weight stream, 2-layer fixture, 4 and 8 tokens |
 | `pim_layer_exposed_us` | 35 | measured | A layer with any group on PIM runs its attention, norms and SiLU in the open; an all-NPU layer hides them under weight reads. (Measured layer minus computed GEMV and boundary, PIM layer minus NPU layer: 25, 26, 53 µs at 1, 3, 4 tokens, 2-layer fixture, layer 1, `fit_layer.py`) |
