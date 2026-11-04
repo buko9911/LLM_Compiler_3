@@ -48,7 +48,7 @@ def main():
     a = ap.parse_args()
     out = a.output.resolve(); out.mkdir(parents=True,exist_ok=False)
     compiler = root/'build/bin/npu-compile'
-    settings = workspace/'research/checkpoint_race/hardware/kernel_probe/settings_4core.toml'
+    settings = workspace/'core/simulator/npu/plena_settings.toml'
     library = workspace/'core/ramulator2/liblp6_ramulator.so'
     ini = workspace/'core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini'
     (out/'provenance.json').write_text(json.dumps({str(p):digest(p) for p in

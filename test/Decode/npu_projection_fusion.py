@@ -58,7 +58,8 @@ def main():
     ]
     for name,text,options,groups,contractions in cases:
         sp=out/f'{name}.json'; src=out/f'{name}.mlir'
-        sp.write_text(json.dumps({'npu':options}));src.write_text(text)
+        target=json.loads((Path(__file__).resolve().parents[2]/'configs/target.json').read_text());target['npu'].update(options)
+        sp.write_text(json.dumps(target));src.write_text(text)
         cmd=[str(a.optimizer.resolve()),str(src),f'--hyb-npu-projection-fusion=spec={sp.resolve()}',
              '--canonicalize','--verify-each']
         p=subprocess.run(cmd,text=True,capture_output=True)

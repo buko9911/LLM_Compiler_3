@@ -246,7 +246,7 @@ def main():
     injected.write_text(sources[4][0].read_text().replace('module {','module attributes {hyb.pim_weight_storage_requested = unit} {',1))
     compile_case('negative_ir_attribute',4,['--no-image'],expect='reserved compiler IR attributes are driver-owned',source_override=injected)
     compile_case('negative_npu',4,['--pim-weight-storage-import',exported,'--force=npu'],expect='requires at least one PIM projection')
-    compile_case('negative_explicit_bankset',4,['--pim-weight-storage-import',exported,'--pim-bankset-pingpong=12'],expect='bankset layout differs')
+    compile_case('negative_explicit_bankset',4,['--pim-weight-storage-import',exported,'--pim-bankset-pingpong=24'],expect='bankset layout differs')
     result['all_checks_passed']=True
     save(out/'summary.json',result)
     print(json.dumps(dict(native_cases=len(result['native']),negative_cases=len(result['negatives']),all_checks_passed=True)),flush=True)

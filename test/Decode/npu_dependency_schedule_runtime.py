@@ -182,7 +182,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=root / "build/bin/npu-compile")
     parser.add_argument("--emulator", type=Path, default=workspace / "core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
-    parser.add_argument("--settings", type=Path, default=workspace / "research/checkpoint_race/hardware/kernel_probe/settings_4core.toml")
+    parser.add_argument("--settings", type=Path, default=workspace / "core/simulator/npu/plena_settings.toml")
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+", help="Optional exact fixture names")

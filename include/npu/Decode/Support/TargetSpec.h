@@ -12,7 +12,7 @@
 namespace mlir::hybrid {
 
 /// Target description (configs/target.json): NPU (PLENA) and PIM (LPDDR6-PIM) parameters,
-/// plus the calibration constants of the cost model.
+/// plus the calibration constants of the cost model. Every key must be in the file (TargetSpec::load).
 struct TargetSpec {
   struct Npu {
     // ---- hardware -------------------------------------------------------------------------------
@@ -20,8 +20,8 @@ struct TargetSpec {
     int cores = 4, saRows = 32, saCols = 32;
     int64_t l1Bytes = 4 << 20, l2Bytes = 8 << 20;
     int64_t completionEventSlots = 65536;  // commands per program (simulator completion events)
-    // Cost model of hyb-partition: sustained LP6 read bandwidth and a fixed cost per GEMV.
-    double lp6ReadGBps = 19.0, gemvFixedUs = 2.0;
+    // Cost model of hyb-partition: a fixed cost per NPU GEMV.
+    double gemvFixedUs = 2.0;
 
     // ---- timing of the NPU itself (NpuCost.h; the simulator's model, docs/architecture/NPU_SIMULATOR.md) --
     // The passes compare these costs to choose between equivalent programs; every choice is a function
@@ -63,33 +63,33 @@ struct TargetSpec {
     int64_t stagingMiscBytes = 0;
   } npu;
   struct Pim {
-    /// DRAM CK of the LPDDR6-PIM model (tCK 0.375 ns in core/ramulator2/configs/lp6/*.ini). The *CK
-    /// numbers below are in these cycles. Before 2026-11-04 this was 2400, a unit that the stream costs
-    /// had been fitted against, not the DRAM clock; the costs were rescaled by 2666.667 / 2400.
+    /// DRAM CK of the LPDDR6-PIM model (core/ramulator2/src/ramulator/pim/runtime_profile.h, tCK 0.375 ns).
+    /// The *CK numbers below are in these cycles.
     double clockMHz = 2666.667;
-    int pus = 8, lanes = 4, channels = 2, ranks = 2, partitions = 4, nlldCK = 10;
-    /// Whether PIM partitions on different ranks compute at the same time. The LPDDR6-PIM draft
-    /// defines no rank-to-rank rule for PIM compute commands; when false, each PIM phase runs on
-    /// the subchannels of one rank and the other rank only holds data.
+    /// The geometry fixed by the LPDDR6-PIM draft. npu/Target/PimLayout.h is written for it, so
+    /// TargetSpec::load refuses other values instead of laying out a program the hardware cannot run.
+    int pus = 8, lanes = 4, accumulators = 16, kPerSweep = 256, channels = 8, ranks = 2, partitions = 16;
+    /// Minimum LdMAC spacing (draft Table 51; 10 CK at 9600-10667 Mbps). A fitted ldmac_ck cannot be below it.
+    int nlldCK = 10;
+    /// Whether the partitions of different ranks compute at the same time. False runs each PIM phase on
+    /// the subchannels of one rank; the other rank only holds data and serves normal reads meanwhile.
     bool concurrentRanks = true;
-    /// Partitions that compute at the same time.
+    /// Partitions that compute at the same time, and the ranks one PIM phase uses.
     int parallelPartitions() const { return concurrentRanks ? partitions : std::min(partitions, channels); }
-    /// The PIM model before the stream layout cost; read by runtime/calibrate.py, not by the compiler.
-    double efficiency = 0.485, phaseFixedUs = 1.0;
-    double actWriteUsPerKiB = 0.9, actWriteFixedUs = 1.5, readbackUsPerKiB = 0.35, readbackFixedUs = 1.5;
+    int phaseRanks() const { return concurrentRanks ? ranks : 1; }
     // ---- stream layout cost (npu/Decode/Support/PimCost.h), measured on the simulator ----------
-    /// DRAM CK per LdMAC in a long stream, row activation and precharge included (nLLD when 0).
+    /// DRAM CK per LdMAC in a long stream, row activation and precharge included.
     double ldmacCK = 0;
     /// Fixed DRAM CK per stream sweep (its activation register loads) and per stream (clear, store).
     double sweepCK = 0, streamCK = 0;
-    /// NPU gather of INT32 PIM outputs (per K piece) and scatter of INT8 activations (per token).
-    double readbackGBps = 32, readbackPieceUs = 0, actWriteGBps = 96, actWritePieceUs = 0;
+    /// NPU gather of INT32 PIM outputs and scatter of INT8 activations.
+    double readbackGBps = 32, actWriteGBps = 96;
     /// NPU time per PIM output per token to bring it back and dequantize it (hyb-partition; the NPU
     /// path dequantizes behind its own GEMV, so this is extra PIM-side work).
     double readbackNsPerOutput = 0;
     /// hyb-partition: NPU time lost when a PIM group splits a layer's NPU weight stream into two runs
-    /// (the NPU work next to the split is no longer hidden behind weight reads), fixed + per token.
-    double npuRunSplitUs = 0, npuRunSplitUsPerToken = 0;
+    /// (the NPU work next to the split is no longer hidden behind weight reads).
+    double npuRunSplitUs = 0;
     /// Accumulator counts a stream may use (even, 2..16) and the largest split-K.
     std::vector<int> streamAccs = {2, 4, 6, 8, 10, 12, 14, 16};
     int maxSplitK = 8;
@@ -97,7 +97,7 @@ struct TargetSpec {
     int banksetPingPongLead = 0;
   } pim;
   struct Lp6 {
-    int64_t capacityBytes = int64_t(16) << 30, rowBytes = 65536;
+    int64_t capacityBytes = int64_t(16) << 30;
   } lp6;
   /// GEMV mapping: "cost" (cost model per group), "npu" or "pim" (every group); overrides map a
   /// substring of a weight name to a target and win over the policy (first match).

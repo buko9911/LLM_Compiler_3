@@ -28,7 +28,7 @@ ap.add_argument("--max-length", type=int, required=True, help="L: positions ever
 ap.add_argument("--chunk", type=int, required=True, help="C: tokens per prompt chunk")
 ap.add_argument("--verify", type=int, required=True, help="V: tokens per verify block")
 ap.add_argument("--out", type=Path, required=True)
-ap.add_argument("--target", type=Path, default=ROOT / "configs/baselines/npu_only_lp6_4ch.json")
+ap.add_argument("--target", type=Path, default=ROOT / "configs/target.json")
 ap.add_argument("--force", choices=["npu", "pim"], help="place every GEMV group on one device")
 ap.add_argument("--layers", type=int, default=0, help="truncate to N layers (0 = all; for fixtures)")
 ap.add_argument("--programs", nargs="+", choices=["decode", "verify", "chunk"], default=["decode", "verify", "chunk"])

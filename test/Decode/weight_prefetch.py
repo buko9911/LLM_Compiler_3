@@ -148,7 +148,7 @@ def main():
                 f.seek(arg["addr"])
                 f.write(x.tobytes())
             image_hash = sha256(image)
-            run([emu, "--settings", settings, "--lp6-config", a.pim_root / "configs/LPDDR6_PIM_Mobile_4CH.ini",
+            run([emu, "--settings", settings, "--lp6-config", root.parent / "ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini",
                  "--system-program", "system.json", "--command-report", "commands.json",
                  "--lp6-image", "lp6.bin", "--lp6-size", "16GiB", "--log-level", "off",
                  "--timeline-out", "timeline.json", "--timeline-merge-gap", "0"], out, out / "run.log", env)

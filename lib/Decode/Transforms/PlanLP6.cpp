@@ -161,6 +161,14 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       Value qx = call.getOperand(0);
       auto qxT = cast<MemRefType>(qx.getType());
       int64_t M = qxT.getDimSize(0), K = qxT.getDimSize(1);
+      // A sweep loads 256 inputs. The primitives count whole sweeps, so another K would drop inputs and
+      // produce wrong sums without any other sign.
+      if (K % pim::kKPerSweep) {
+        call.emitError() << "PIM GEMV needs K to be a multiple of " << pim::kKPerSweep << ", got " << K
+                         << " (compile this group for the NPU with --map or --force=npu)";
+        placementOK = false;
+        return;
+      }
       std::vector<int64_t> acts;
       for (int64_t m = 0; m < M; ++m) acts.push_back(program.addActivation(K));
       std::map<int, int64_t> loads;

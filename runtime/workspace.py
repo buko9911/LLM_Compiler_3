@@ -29,7 +29,6 @@ NPU_TOOLS = NPU / "transactional_emulator/tools"
 RAMULATOR = CORE / "ramulator2"
 RAMULATOR_LIBRARY = RAMULATOR / "liblp6_ramulator.so"
 LP6_CONFIGS = RAMULATOR / "configs/lp6"
-LP6_CONFIG = LP6_CONFIGS / "LPDDR6_PIM_Mobile_4CH.ini"      # four channels, the default
-LP6_CONFIG_1CH = LP6_CONFIGS / "LPDDR6_PIM_Mobile_2CH.ini"  # one channel
+LP6_CONFIG = LP6_CONFIGS / "LPDDR6_PIM_Mobile_4CH.ini"      # four channels
 
 EVIDENCE = WORKSPACE / "archive/evidence"

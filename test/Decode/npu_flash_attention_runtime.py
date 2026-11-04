@@ -314,7 +314,7 @@ def main():
     parser.add_argument("--reference-only", action="store_true")
     parser.add_argument("--compile-only", action="store_true")
     parser.add_argument("--emulator", type=Path, default=workspace / "core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
-    parser.add_argument("--settings", type=Path, default=workspace / "research/checkpoint_race/hardware/kernel_probe/settings_4core.toml")
+    parser.add_argument("--settings", type=Path, default=workspace / "core/simulator/npu/plena_settings.toml")
     parser.add_argument("--lp6-library", type=Path, default=workspace / "core/ramulator2/liblp6_ramulator.so")
     args = parser.parse_args()
     modes = args.modes.split(",")

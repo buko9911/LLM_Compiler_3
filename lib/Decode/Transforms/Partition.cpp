@@ -47,8 +47,8 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
     });
     // One decision per group, made per layer: the groups of a layer whose target comes from the cost
     // model are chosen together, because a PIM group between two NPU groups of the same layer splits that
-    // layer's NPU weight stream into two phases. Each extra NPU run of a layer costs npu_run_split_us
-    // (+ per token), measured: NPU work at the split that its own weight stream no longer hides.
+    // layer's NPU weight stream into two phases. Each extra NPU run of a layer costs npu_run_split_us,
+    // measured: NPU work at the split that its own weight stream no longer hides.
     auto layerOf = [](StringRef weight) -> int64_t {
       size_t at = weight.find("layers.");
       if (at == StringRef::npos) return -1;
@@ -114,8 +114,7 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       for (size_t i : members)
         if (list[i].why == "cost") free.push_back(i);
       if (free.empty() || free.size() > 12) continue;
-      const int64_t tokens = list[members.front()].rows;
-      splitUs = specOr->pim.npuRunSplitUs + specOr->pim.npuRunSplitUsPerToken * double(tokens);
+      splitUs = specOr->pim.npuRunSplitUs;
       auto layerUs = [&](uint32_t mask) {
         double us = 0;
         int runs = 0;

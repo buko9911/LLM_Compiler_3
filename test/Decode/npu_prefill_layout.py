@@ -116,7 +116,9 @@ def run(optimizer, out, name, text, flags):
 
 def spec(out, name, **options):
     path = out / f"{name}.json"
-    path.write_text(json.dumps({"npu": {"cores": 4, **options}}))
+    target = json.loads((Path(__file__).resolve().parents[2] / "configs/target.json").read_text())
+    target["npu"].update(cores=4, **options)
+    path.write_text(json.dumps(target))
     return path.resolve()
 
 

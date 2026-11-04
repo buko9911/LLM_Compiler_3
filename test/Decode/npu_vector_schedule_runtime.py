@@ -89,7 +89,8 @@ def fixtures():
         cases.append(dict(name=f"nonlinear_r{rows}_n{columns}",
             source=source(rows, columns, body, [("x", "vector"), ("u", "vector")]),
             inputs=dict(x=x, u=u), reference=reference, fp32_reference=fp32,
-            pipeline=columns > 32, scalar_reuse=False))
+            # Chunks interleave only when there are two whole 32-element chunks to alternate.
+            pipeline=columns >= 64, scalar_reuse=False))
     for columns in [33, 97]:
         rows = 3
         x = (rng.integers(-32, 33, size=(rows, columns)) / 8).astype(np.float16)
@@ -103,14 +104,14 @@ def fixtures():
         stored_d = np.zeros_like(x);stored_d[:, 0] = d
         cases.append(dict(name=f"row_divisor_n{columns}",
             source=source(rows, columns, body, [("x", "vector"), ("d", "scalar")]),
-            inputs=dict(x=x, d=stored_d), reference=reference, pipeline=True, scalar_reuse=True))
-    for name, rows, columns in [("reduction_excluded", 3, 65), ("reduction_long", 2, 1100)]:
+            inputs=dict(x=x, d=stored_d), reference=reference, pipeline=columns >= 64, scalar_reuse=True))
+    for name, rows, columns in [("reduction_short", 3, 65), ("reduction_long", 2, 1100)]:
         x = rng.integers(-8, 9, size=(rows, columns)).astype(np.float16)
         body = '''%wide = arith.extf %x_arg : f16 to f32
           %sum = arith.addf %wide,%out : f32
           linalg.yield %sum : f32'''
         cases.append(dict(name=name, source=source(rows, columns, body, [("x", "vector")], True),
-            inputs=dict(x=x), reference=x.astype(np.float32).sum(axis=1), pipeline=False, scalar_reuse=False))
+            inputs=dict(x=x), reference=x.astype(np.float32).sum(axis=1), pipeline=True, scalar_reuse=False))
     inputs = {f"x{i}": (rng.integers(-4, 5, size=(2, 97))/4).astype(np.float16) for i in range(9)}
     lines = ["%v1 = arith.addf %x0_arg,%x1_arg : f16"]
     value = rounded(inputs["x0"] + inputs["x1"])
@@ -129,7 +130,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--compiler", type=Path, default=root/"build/bin/npu-compile")
     parser.add_argument("--emulator", type=Path, default=workspace/"core/simulator/npu/transactional_emulator/target/release/transactional_emulator")
-    parser.add_argument("--settings", type=Path, default=workspace/"research/checkpoint_race/hardware/kernel_probe/settings_4core.toml")
+    parser.add_argument("--settings", type=Path, default=workspace/"core/simulator/npu/plena_settings.toml")
     parser.add_argument("--lp6-library", type=Path, default=workspace/"core/ramulator2/liblp6_ramulator.so")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+")

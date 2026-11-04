@@ -38,7 +38,7 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
                   llvm::ArrayRef<Shape> shapes, int partitions) {
   Estimate e;
   std::vector<int64_t> load(size_t(std::max(1, partitions)), 0);
-  const int64_t sweeps = k / 256, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
+  const int64_t sweeps = k / spec.pim.kPerSweep, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
   for (size_t i = 0; i < n.size(); ++i) {
     const Shape s = shapes[i];
     const std::vector<int> blocks = shapeBlocks(spec, n[i], s);
@@ -47,8 +47,7 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
     for (int64_t piece = 0; piece < s.splitK; ++piece)
       for (int a : blocks)
         *std::min_element(load.begin(), load.end()) += streamCycles(spec, tokens, sweeps / s.splitK, a);
-    e.gatherUs += double(tokens) * s.splitK *
-                  (double(nPad) * 4 / (spec.pim.readbackGBps * 1e3) + spec.pim.readbackPieceUs);
+    e.gatherUs += double(tokens) * s.splitK * double(nPad) * 4 / (spec.pim.readbackGBps * 1e3);
     e.sumUs += double(tokens) * (s.splitK - 1) * double(nPad) / 16 * 4 /
                (spec.npu.clockMHz * std::max(1, spec.npu.cores));
   }
@@ -66,7 +65,7 @@ std::vector<Shape> choose(const TargetSpec &spec, int64_t tokens, int64_t k, llv
     best = it->second.second;
     return it->second.first;
   }
-  const int64_t sweeps = k / 256, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
+  const int64_t sweeps = k / spec.pim.kPerSweep, unit = int64_t(spec.pim.pus) * spec.pim.lanes;
   std::vector<Shape> options;
   for (int accs : spec.pim.streamAccs)
     for (int split = 1; split <= (allowSplit ? spec.pim.maxSplitK : 1); ++split)

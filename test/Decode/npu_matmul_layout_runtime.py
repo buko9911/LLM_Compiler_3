@@ -33,7 +33,7 @@ def main():
     ap.add_argument('--compiler',type=Path,default=root/'build/bin/npu-compile')
     ap.add_argument('--output',type=Path,required=True)
     args=ap.parse_args();out=args.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    settings=workspace/'research/checkpoint_race/hardware/kernel_probe/settings_4core.toml'
+    settings=workspace/'core/simulator/npu/plena_settings.toml'
     ini=workspace/'core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini'
     bridge=workspace/'core/ramulator2/liblp6_ramulator.so'
     model=out/'model';model.mkdir();save_file({'unused':np.zeros(1,dtype=np.float16)},model/'model.safetensors')

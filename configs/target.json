@@ -1,5 +1,5 @@
 {
-  "_comment": "Target description read by hyb-partition, hyb-npu-tile, hyb-npu-memplan and the NPU backend. LP6: four LPDDR6 channels (8 subchannels x 2 ranks, core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini), run with IESLAB_NPU_Simulator/plena_settings.toml (runtime/decode.py default). configs/target_1ch.json is one channel (the LP6 of the Part 3 results). npu.lp6_read_gbps is the 36-layer NPU-only W8A8 step on four channels (4.02 GB in 71.6 ms, 2026-09-30); pim.efficiency is still the one-channel fit (runtime/calibrate.py, 2026-09-26); the boundary costs (act_write_*, readback_*) and gemv_fixed_us are estimates from the former hybrid_bench (workspace docs/PERFORMANCE.md, 2026-09-21 hybrid bench results §19.1), not fitted. None of these values is from the LPDDR6-PIM PDF. pim.concurrent_ranks remains false to preserve the existing calibration and baseline; it is not required by an absence of cross-rank PIM timing. Draft 13.6 maps PIMX to base Meta commands, whose cross-rank 2 CK in the supported WCK-always-on/ODT-off profile is enforced by the shared CA scheduler. true permits both ranks to compute while sharing external DQ. See the workspace docs/research/PIM_RANK_REFRESH_FEED.md (rank-overlap spec and two-rank baseline sections) for validation and remaining protocol/input-feed limits.",
+  "_comment": "Everything the compiler knows about the hardware: NPU 4 cores at 800 MHz (run with core/simulator/npu/plena_settings.toml), LPDDR6-PIM 4 channels = 8 subchannels x 2 ranks at 10667 Mbps (run with core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini). The file names every key; a missing or unknown key is an error. pim.concurrent_ranks true computes on both ranks in one PIM phase, false on one rank per phase. Meaning and source of each number: configs/README.md.",
   "npu": {
     "clock_mhz": 800,
     "cores": 4,
@@ -7,7 +7,6 @@
     "sa_cols": 32,
     "l1_bytes": 4194304,
     "l2_bytes": 8388608,
-    "lp6_read_gbps": 56.2,
     "gemv_fixed_us": 2.0,
     "l1_read_bytes_per_cycle": 128,
     "l1_write_bytes_per_cycle": 128,
@@ -32,28 +31,35 @@
     "clock_mhz": 2666.667,
     "pus": 8,
     "lanes": 4,
+    "accumulators": 16,
+    "k_per_sweep": 256,
     "channels": 8,
     "ranks": 2,
     "partitions": 16,
-    "concurrent_ranks": false,
+    "concurrent_ranks": true,
     "nlld_ck": 10,
-    "efficiency": 0.5153,
-    "phase_fixed_us": 1.0,
-    "act_write_us_per_kib": 0.9,
-    "act_write_fixed_us": 1.5,
-    "readback_us_per_kib": 0.35,
-    "readback_fixed_us": 1.5,
     "bankset_pingpong_lead": 12,
     "ldmac_ck": 11.6111,
     "sweep_ck": 871.111,
     "stream_ck": 1130,
+    "readback_gbps": 32,
+    "act_write_gbps": 96,
     "readback_ns_per_output": 0.33,
     "npu_run_split_us": 45,
-    "npu_run_split_us_per_token": 0
+    "stream_accs": [
+      2,
+      4,
+      6,
+      8,
+      10,
+      12,
+      14,
+      16
+    ],
+    "max_split_k": 8
   },
   "lp6": {
-    "capacity_bytes": 17179869184,
-    "row_bytes": 262144
+    "capacity_bytes": 17179869184
   },
   "mapping": {
     "policy": "cost",

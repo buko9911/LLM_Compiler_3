@@ -216,7 +216,8 @@ def main():
                   argv=sys.argv, provenance_before=before, compile_cases=[], negatives=[], native=[])
     save(out / "summary.json", result)
     spec = json.loads((ROOT / "configs/target.json").read_text())
-    spec["pim"]["partitions"] = 8
+    # Packet NPU reads rank 0 storage in the even bank set layout.
+    spec["pim"].update(partitions=8, bankset_pingpong_lead=0)
     spec_path = out / "target.json"; save(spec_path, spec)
     rng = np.random.default_rng(195121)
     wq = rng.integers(-127, 128, (args.n, args.k), dtype=np.int8); wq[:, 0] = 127

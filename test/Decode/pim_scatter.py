@@ -84,9 +84,11 @@ def main():
         with (build / "lp6.bin").open("r+b") as f:
             f.seek(arg["addr"])
             f.write(x.tobytes())
-        run([emu, "--settings", settings, "--lp6-config", pim / "configs/LPDDR6_PIM_Mobile_4CH.ini",
+        kernel = json.loads((build / "system.json").read_text())["pim_kernel"]
+        run([emu, "--settings", settings, "--lp6-config", root.parent / "ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini",
              "--system-program", "system.json", "--command-report", "commands.json", "--lp6-image", "lp6.bin",
-             "--lp6-size", "16GiB", "--log-level", "off"], build, build / "run.log", env)
+             "--lp6-size", "16GiB", "--log-level", "off"], build, build / "run.log",
+            {**env, "LP6PIM_BANKSET_PINGPONG": str(kernel.get("bankset_pingpong_lead", 0))})
         o = next(v for v in io["outputs"] if v["name"] == "y")
         actual = np.frombuffer((build / "sram_dump.core0.bin").read_bytes(), np.float16, m * n, o["l1"]).reshape(m, n)
         assert np.isfinite(actual).all(), (name, "nonfinite output")

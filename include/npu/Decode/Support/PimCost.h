@@ -7,11 +7,11 @@
 // A PIM GEMV runs as streams (npu/Target/PimLayout.h). A stream with A accumulators covers 32 A
 // output rows and one K piece; split-K cuts K into S pieces whose INT32 partial sums the NPU adds
 // while gathering. Per partition, the streams run one after another, each sweep of 256 inputs as
-// 32 A LdMACs. The partitions of one rank (one per subchannel) run at the same time.
+// 32 A LdMACs. All partitions of a phase run at the same time (pim.concurrent_ranks: both ranks or one).
 //
 //   stream CK  = tokens x (pieceSweeps x (32 A ldmac_ck + sweep_ck) + stream_ck)
 //   phase us   = (max over partitions of its streams' CK) / clock_mhz      (CK = DRAM CK, 2666.667 MHz)
-//   gather us  = tokens x S x (Npad x 4 B / readback_gbps + readback_piece_us)      (per projection)
+//   gather us  = tokens x S x Npad x 4 B / readback_gbps                              (per projection)
 //   (a projection may end in a tail of smaller streams: blocks of tailAccs accumulators)
 //   sum us     = tokens x (S - 1) x Npad / 16 x 4 NPU cycles / cores                  (split-K adds)
 //
