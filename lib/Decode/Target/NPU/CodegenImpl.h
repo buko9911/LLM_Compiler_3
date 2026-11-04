@@ -122,6 +122,8 @@ private:
   // Next free byte of each core's staging window for PIM results: results of later projections do not wait for the
   // readers of earlier ones, so all result reads queue at the phase start.
   std::map<int, uint64_t> gatherStage;
+  /// Bytes above the staging window base the last weight stream of each core filled up to.
+  std::map<int, uint64_t> ringCursor;
   bool readAfterGather = false;
 
   int64_t window() const {

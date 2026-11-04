@@ -194,16 +194,22 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
   // GDMA can run while a tile computes.
   bool pipeline = stream && n > 1 && nslots >= 3 && weightPipeline(f, stream, gemv, output, err);
   if (!err.empty()) return failure();
-  // The ring starts at an L2 slot that no earlier access still protects.
+  // The ring continues after the bytes the last stream of this core filled: the oldest staged
+  // tile is there, so a full window makes the first read wait the least. From that slot on, the
+  // first slot no earlier access still protects is better still.
   uint64_t win = windowBase(curCore), initialSlot = 0;
   if (stream) {
-    for (uint64_t candidate = 0; candidate < nslots; ++candidate) {
-      uint64_t begin = win + candidate * slotBytes;
+    auto cursor = ringCursor.find(curCore);
+    const uint64_t first = cursor == ringCursor.end() ? 0 : (cursor->second + slotBytes - 1) / slotBytes % nslots;
+    initialSlot = first;
+    for (uint64_t step = 0; step < nslots; ++step) {
+      const uint64_t candidate = (first + step) % nslots, begin = win + candidate * slotBytes;
       if (llvm::none_of(l2acc, [&](const Acc &a) { return overlaps(a.s, a.e, begin, begin + slotBytes); })) {
         initialSlot = candidate;
         break;
       }
     }
+    ringCursor[curCore] = ((uint64_t(std::max<int64_t>(n, 1) - 1) + initialSlot) % nslots + 1) * slotBytes;
   }
   auto slotAddress = [&](int64_t tile) {
     return win + ((uint64_t(tile) + initialSlot) % nslots) * slotBytes;
