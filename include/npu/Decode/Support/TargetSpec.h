@@ -63,7 +63,10 @@ struct TargetSpec {
     int64_t stagingMiscBytes = 0;
   } npu;
   struct Pim {
-    double clockMHz = 2400;
+    /// DRAM CK of the LPDDR6-PIM model (tCK 0.375 ns in core/ramulator2/configs/lp6/*.ini). The *CK
+    /// numbers below are in these cycles. Before 2026-11-04 this was 2400, a unit that the stream costs
+    /// had been fitted against, not the DRAM clock; the costs were rescaled by 2666.667 / 2400.
+    double clockMHz = 2666.667;
     int pus = 8, lanes = 4, channels = 2, ranks = 2, partitions = 4, nlldCK = 10;
     /// Whether PIM partitions on different ranks compute at the same time. The LPDDR6-PIM draft
     /// defines no rank-to-rank rule for PIM compute commands; when false, each PIM phase runs on
@@ -71,12 +74,13 @@ struct TargetSpec {
     bool concurrentRanks = true;
     /// Partitions that compute at the same time.
     int parallelPartitions() const { return concurrentRanks ? partitions : std::min(partitions, channels); }
+    /// The PIM model before the stream layout cost; read by runtime/calibrate.py, not by the compiler.
     double efficiency = 0.485, phaseFixedUs = 1.0;
     double actWriteUsPerKiB = 0.9, actWriteFixedUs = 1.5, readbackUsPerKiB = 0.35, readbackFixedUs = 1.5;
     // ---- stream layout cost (npu/Decode/Support/PimCost.h), measured on the simulator ----------
-    /// PIM cycles per LdMAC in a long stream, row activation and precharge included (nLLD when 0).
+    /// DRAM CK per LdMAC in a long stream, row activation and precharge included (nLLD when 0).
     double ldmacCK = 0;
-    /// Fixed PIM cycles per stream sweep (its activation register loads) and per stream (clear, store).
+    /// Fixed DRAM CK per stream sweep (its activation register loads) and per stream (clear, store).
     double sweepCK = 0, streamCK = 0;
     /// NPU gather of INT32 PIM outputs (per K piece) and scatter of INT8 activations (per token).
     double readbackGBps = 32, readbackPieceUs = 0, actWriteGBps = 96, actWritePieceUs = 0;

@@ -29,12 +29,19 @@ group). Its PIM stream numbers were fitted on the Ramulator LPDDR6-PIM model (20
 decode fixtures, every projection at A = 4..14 accumulators per stream plus mixed layouts; 35 PIM phases
 within 1.4% except one at 6%):
 
+`clock_mhz` 2666.667 is the DRAM CK of the model (tCK 0.375 ns). Until 2026-11-04 it was 2400 and the three
+stream costs were in 1/2400 us; they were rescaled by 2666.667 / 2400. Every estimate of this file is unchanged: 23 builds (Qwen3-4B 2-layer
+M = 1, 2, 3, 4, 8, 64 with this file, target.json and target_1ch.json; 36-layer M = 1, 3, 4, 8 and prefill 64 with this
+file) gave byte-identical program.bin and the same NPU/PIM placement, PIM estimates within 0.0004%. target_1ch.json has
+no fitted stream costs (LdMAC = nLLD 10 CK), so its PIM estimates are 10% lower than before; its placement and
+program.bin did not change on those six fixtures.
+
 | PIM number | Value | Meaning |
 |---|---|---|
 | `bankset_pingpong_lead` | 12 | weight rows alternate bank sets, the other set's row opens 12 LdMACs ahead (leads 12..48 measured within 0.1%; 0 is 14% slower per layer) |
-| `ldmac_ck` | 10.45 | PIM cycles per LdMAC in a long stream (nLLD 10) |
-| `sweep_ck` | 784 | fixed cycles per 256-input sweep of a stream (activation register loads, row changes) |
-| `stream_ck` | 1017 | fixed cycles per stream (clear and store of its accumulators) |
+| `ldmac_ck` | 11.6111 | DRAM CK per LdMAC in a long stream, 4.35 ns (nLLD 10 CK = 3.75 ns, so 86% of the nLLD rate) |
+| `sweep_ck` | 871.111 | fixed DRAM CK per 256-input sweep of a stream (activation register loads, row changes) |
+| `stream_ck` | 1130 | fixed DRAM CK per stream (clear and store of its accumulators) |
 | `readback_ns_per_output` | 0.33 | NPU time per PIM output and token after the PIM phase beyond the gather bytes (dequant, gather setup): Qwen3-4B LM head 151,936 outputs in 69 us (hyb-partition only) |
 | `npu_run_split_us` | 45 | hyb-partition: NPU time lost when a PIM group splits a layer's NPU weight stream (O or gate/up on PIM, the rest NPU): Qwen3-4B 2-layer, 4 and 8 tokens, measured 2026-11-03 (`npu_run_split_us_per_token` 0) |
 | `concurrent_ranks` | false | two ranks of one subchannel computing together gave no gain on this model (2026-11-03) |

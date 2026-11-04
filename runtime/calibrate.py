@@ -6,7 +6,12 @@
     efficiency = sum(ideal) / sum(measured - phase_fixed).
   NPU LP6 read bandwidth: an NPU-only run of the same step: weight bytes of the NPU GEMVs over
     (NPU-only time - the hybrid run's NPU phase time), i.e. the GEMV weight streaming alone.
-Prints the fitted values; --write updates the spec file."""
+Prints the fitted values; --write updates the spec file.
+
+pim.efficiency belongs to the PIM model before the stream layout cost (2026-11-03) and is no longer read by
+the compiler; the stream costs (pim.ldmac_ck, sweep_ck, stream_ck) are fitted by
+research/npu_pim_baseline/fit_pim.py in the workspace. The ideal below uses pim.clock_mhz as the DRAM CK
+(2666.667 MHz since 2026-11-04; with the earlier 2400 the ideal was 11% too long)."""
 import argparse, json, sys
 from pathlib import Path
 

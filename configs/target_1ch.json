@@ -29,7 +29,7 @@
     "staging_misc_bytes": 65536
   },
   "pim": {
-    "clock_mhz": 2400,
+    "clock_mhz": 2666.667,
     "pus": 8,
     "lanes": 4,
     "channels": 2,
@@ -37,7 +37,7 @@
     "partitions": 4,
     "concurrent_ranks": false,
     "nlld_ck": 10,
-    "efficiency": 0.5725,
+    "efficiency": 0.5153,
     "phase_fixed_us": 1.0,
     "act_write_us_per_kib": 0.9,
     "act_write_fixed_us": 1.5,
