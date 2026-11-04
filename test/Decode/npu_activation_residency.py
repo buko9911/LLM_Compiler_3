@@ -104,8 +104,9 @@ def main():
     results['already_private'] = {'private_results': 0}
 
     mixed = SOURCE.replace('  func.func @decode_step', '  func.func private @pim_phase() attributes {hyb.phase = "pim"} { return }\n  func.func @decode_step')
-    assert run('mixed_npu_pim', mixed) == run('mixed_original', mixed, bare=True)
-    results['mixed_npu_pim'] = {'byte_identical_ir': True}
+    # NPU phases of an NPU+PIM program get the same rewrite as in an NPU-only one.
+    assert 'hyb.activation_residency_private_results = 1' in run('mixed_npu_pim', mixed)
+    results['mixed_npu_pim'] = {'private_results': 1}
     packet = SOURCE.replace('hyb.phase = "npu"', 'hyb.phase = "npu", hyb.npu_kernel = "packet"')
     assert run('packet', packet) == run('packet_original', packet, bare=True)
     results['packet_kernel'] = {'byte_identical_ir': True}

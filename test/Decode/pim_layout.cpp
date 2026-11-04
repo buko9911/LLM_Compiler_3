@@ -102,7 +102,8 @@ int main() {
   tails.nextWeight[3] += 100000;
   auto ai = tails.addActivation(512);
   auto pi = tails.addProjection("priority", 512, 512, {ai, ai}, loads);
-  require(tails.projections[pi].streamPart[0] == 3 && loads[3] == 4, "storage displaced phase compute priority");
+  // default stream load = K sweeps x accumulators x tokens = 2 x 16 x 2
+  require(tails.projections[pi].streamPart[0] == 3 && loads[3] == 2 * 16 * 2, "storage displaced phase compute priority");
 
   // Include streams assigned by the current projection when breaking storage ties.
   Program uneven;
@@ -112,7 +113,7 @@ int main() {
   loads.clear();
   pi = uneven.addProjection("odd", 1536, 256, {ai}, loads);
   require(uneven.nextWeight[0] == uneven.nextWeight[1], "pending streams were omitted from storage tie-break");
-  require(loads[0] == 2 && loads[1] == 1, "phase load exceeded its optimal maximum");
+  require(loads[0] == 2 * 16 && loads[1] == 1 * 16, "phase load exceeded its optimal maximum");   // sweeps x 16 accumulators
 
   // Full Llama 3.1 8B W8A8 pressure: 32 layers plus the untied LM head.
   // The old lowest-index tie-break exceeded both the 16 GiB image and rank bounds.
@@ -142,7 +143,7 @@ int main() {
     int64_t maxLoad = 0;
     for (int c = 0; c < llama.partitions; ++c)
       if (llama.partRank(c) == rank) maxLoad = std::max(maxLoad, ls[c]);
-    require(maxLoad == (streams + 7) / 8 * (k / 256), "storage balance increased phase critical work");
+    require(maxLoad == (streams + 7) / 8 * (k / 256) * 16, "storage balance increased phase critical work");   // sweeps x 16 accumulators
     ++phaseCount;
   };
   for (int layer = 0; layer < 32; ++layer) {
@@ -161,7 +162,7 @@ int main() {
     for (int64_t s = 0; s < p.streams(); ++s) {
       int c = p.streamPart[s];
       require(p.streamWeightBase[s] == cursor[c], "partition weight tiles overlap or have gaps");
-      cursor[c] += p.streamTiles();
+      cursor[c] += p.streamTiles(s);
     }
   require(cursor == llama.nextWeight, "resident storage differs from stream allocation");
   auto copy = ::npu::decode::fromJSON(::npu::decode::toJSON(llama));
@@ -189,8 +190,8 @@ int main() {
   require(ping.endAddress() == even.endAddress(), "ping-pong changed reserved image bounds");
   require(ping.activationPacketAddress(ping.activations[0], 0, 7, 15) ==
               even.activationPacketAddress(even.activations[0], 0, 7, 15), "ping-pong moved activations");
-  require(ping.outputTileAddress(ping.projections[0], 0, 7) ==
-              even.outputTileAddress(even.projections[0], 0, 7), "ping-pong moved outputs");
+  require(ping.outputTileAddress(ping.projections[0].outputTile(0, 0, 0, 0), 0, 7) ==
+              even.outputTileAddress(even.projections[0].outputTile(0, 0, 0, 0), 0, 7), "ping-pong moved outputs");
   auto pingCopy = ::npu::decode::fromJSON(::npu::decode::toJSON(ping));
   require(pingCopy.banksetPingPongLead == 12 &&
               pingCopy.weightPacketAddress(64, 7, 15) == ping.weightPacketAddress(64, 7, 15),

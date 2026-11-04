@@ -106,7 +106,7 @@ def main():
         "dynamic": ({"dynamic": True}, {}, 0, None),
         "index_dependent": ({"indexed": True}, {}, 0, None),
         "reduction": ({"reduction": True}, {}, 0, None),
-        "mixed_phases": ({}, {}, 0, None),
+        "mixed_phases": ({}, {}, 1, (0, 4)),   # NPU phases of an NPU+PIM program are rewritten too
     }
     results = {}
     for name, (kwargs, options, expected, partition) in cases.items():

@@ -132,7 +132,7 @@ def main():
         "one_core": (dict(), True, 1, 0),
         "head_divisor": (dict(heads=6), True, 4, 1),
         "pim_phase": (dict(phase="pim"), True, 4, 0),
-        "mixed_module": (dict(), True, 4, 0),
+        "mixed_module": (dict(), True, 4, 1),   # NPU phases of an NPU+PIM module are fused too
         "per_token_mask": (dict(with_mask=True), True, 4, 1),
     }
     results = {}
@@ -176,7 +176,7 @@ def main():
             assert repeated.stdout == result.stdout, (name,"pass must be idempotent")
         if name == "already_direct":
             assert "already_direct = 1" in result.stdout, result.stdout
-        if name in ("pim_phase", "mixed_module"):
+        if name == "pim_phase":
             assert "hyb.attention_fusion" not in result.stdout, result.stdout
         results[name] = dict(fused_chains=expected)
     (output/"summary.json").write_text(json.dumps(results,indent=2)+"\n")
