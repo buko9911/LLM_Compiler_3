@@ -151,7 +151,7 @@ def main():
     from decode import Device
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    ini = workspace / "core/simulator/dram-pim/configs/LPDDR6_PIM_Mobile_4CH.ini"
+    ini = workspace / "core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini"
     paths = [Path(__file__).resolve(), Path(__file__).with_name("npu_elementwise_distribution.py"),
         Path(__file__).with_name("npu_attention_fusion_runtime.py"), root / "runtime/decode.py",
         args.compiler.resolve(), args.emulator.resolve(), args.settings.resolve(), ini,

@@ -50,7 +50,7 @@ def main():
     compiler = root/'build/bin/npu-compile'
     settings = workspace/'research/checkpoint_race/hardware/kernel_probe/settings_4core.toml'
     library = workspace/'core/ramulator2/liblp6_ramulator.so'
-    ini = workspace/'core/simulator/dram-pim/configs/LPDDR6_PIM_Mobile_4CH.ini'
+    ini = workspace/'core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini'
     (out/'provenance.json').write_text(json.dumps({str(p):digest(p) for p in
         [Path(__file__),compiler,settings,library,ini]},indent=2)+'\n')
     results = {}

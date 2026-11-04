@@ -398,7 +398,7 @@ def main():
                         image.seek(argument["addr"])
                         image.write(array.tobytes())
                 simulation = [args.emulator.resolve(), "--settings", args.settings.resolve(),
-                    "--lp6-config", workspace / "core/simulator/dram-pim/configs/LPDDR6_PIM_Mobile_4CH.ini",
+                    "--lp6-config", workspace / "core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini",
                     "--lp6-backend", "ramulator", "--lp6-library", args.lp6_library.resolve(),
                     "--system-program", "system.json", "--lp6-image", "lp6.bin", "--lp6-size", "16GiB",
                     "--command-report", "commands.json", "--sram-timing-out", "timing.json",
@@ -407,7 +407,7 @@ def main():
                 hashes = {str(path): digest(path) for path in (source, manifest, target, directory / "inputs.npz", build / "program.bin", build / "lp6.bin")}
                 (build / "invocation.json").write_text(json.dumps(dict(command=list(map(str, simulation)), source_sha256=hashes), indent=2))
                 begin = time.monotonic()
-                run(simulation, build, build / "run.log", dict(os.environ, LP6_DRAMSIM3_ROOT=str(workspace / "core/simulator/dram-pim")))
+                run(simulation, build, build / "run.log", dict(os.environ))
                 wall = time.monotonic() - begin
                 descriptor = io["outputs"][0]
                 raw = (build / "sram_dump.core0.bin").read_bytes()

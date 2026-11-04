@@ -170,7 +170,7 @@ def main():
                        "--spec",target,"--force=npu","-o",build]
             run(command,workspace,case/f"{mode}.compile.log",dict(os.environ,HYBRID_PROFILE_OPERATIONS="1"))
             device = Device(build, settings=args.settings, emulator=args.emulator,
-                lp6_config=workspace/"core/simulator/dram-pim/configs/LPDDR6_PIM_Mobile_4CH.ini",
+                lp6_config=workspace/"core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini",
                 lp6_backend="ramulator",lp6_library=args.lp6_library)
             for name,value in fixture["inputs"].items(): device.write(name,value)
             output,_,wall=device.run(profile=True,timeline_max_events=500000)

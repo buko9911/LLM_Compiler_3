@@ -48,8 +48,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", type=Path, default=root / "build/bin/npu-compile")
     ap.add_argument("--npu-root", type=Path, default=root.parent / "simulator/npu")
-    ap.add_argument("--pim-root", type=Path, default=root.parent / "simulator/dram-pim")
-    ap.add_argument("--dramsim-library", type=Path, help="explicit library (overrides the emulator's DT_RPATH)")
+    ap.add_argument("--lp6-library", type=Path, default=root.parent / "ramulator2/liblp6_ramulator.so",
+                    help="Ramulator bridge the emulator opens (the DRAMSim3 backend was retired on 2026-11-04)")
     ap.add_argument("--emulator", type=Path, help="frozen simulator executable")
     ap.add_argument("--settings", type=Path, help="simulator settings to copy")
     ap.add_argument("--case", action="append", help="run only these named cases (repeatable)")
@@ -65,16 +65,12 @@ def main():
     settings.write_text(re.sub(r"(?m)^num_cores\s*=\s*\d+", "num_cores = 4",
                                (a.settings or a.npu_root / "plena_settings.toml").read_text()))
     emu = (a.emulator or a.npu_root / "transactional_emulator/target/release/transactional_emulator").resolve()
-    env = dict(os.environ, LP6_DRAMSIM3_ROOT=str(a.pim_root.resolve()))
-    library = (a.dramsim_library or a.pim_root / "libdramsim3.so").resolve()
-    env["LD_PRELOAD"] = str(library)
-    linked = subprocess.check_output(["ldd", str(emu)], text=True, env=env)
-    selected = [line.strip() for line in linked.splitlines() if "libdramsim3.so" in line]
-    assert len(selected) == 1 and str(library) in selected[0], selected
+    library = a.lp6_library.resolve()
+    env = dict(os.environ, LP6_RAMULATOR_LIBRARY=str(library))
     (a.output / "provenance.json").write_text(json.dumps(dict(
         compiler_sha256=sha256(a.compiler), emulator_sha256=sha256(emu),
         library=str(library), library_sha256=sha256(library),
-        loader_library=selected[0].split(" (")[0], settings_sha256=sha256(settings)), indent=2) + "\n")
+        settings_sha256=sha256(settings)), indent=2) + "\n")
     results = {}
     # name, M, K, N, weight tile limit, L2 staging per core, should pipeline
     cases = [("qwen_q_tail", 1, 2560, 4 * 32 * 19, 131072, 1048576, True),

@@ -4,7 +4,9 @@ The workspace keeps the three code repositories under core/:
 
     core/compiler            this repository (LLM_Compiler_3)
     core/simulator/npu       Rust NPU simulator (IESLAB_NPU_Simulator)
-    core/simulator/dram-pim  C++ LPDDR6 DRAM/PIM backend (lp6-pim-simulator)
+    core/ramulator2          LPDDR6-PIM DRAM/PIM backend: Ramulator2 + LP6 PIM, liblp6_ramulator.so
+
+The DRAMSim3-based core/simulator/dram-pim backend was retired on 2026-11-04 (archive/dram-pim-dramsim3).
 
 Measurement data that is no longer part of the code lives in archive/.
 """
@@ -24,8 +26,10 @@ EMULATOR = NPU / "transactional_emulator/target/release/transactional_emulator"
 SETTINGS = NPU / "plena_settings.toml"
 NPU_TOOLS = NPU / "transactional_emulator/tools"
 
-DRAM_PIM = CORE / "simulator/dram-pim"
-LP6_CONFIG = DRAM_PIM / "configs/LPDDR6_PIM_Mobile_4CH.ini"      # four channels, the default
-LP6_CONFIG_1CH = DRAM_PIM / "configs/LPDDR6_PIM_Mobile_2CH.ini"  # one channel
+RAMULATOR = CORE / "ramulator2"
+RAMULATOR_LIBRARY = RAMULATOR / "liblp6_ramulator.so"
+LP6_CONFIGS = RAMULATOR / "configs/lp6"
+LP6_CONFIG = LP6_CONFIGS / "LPDDR6_PIM_Mobile_4CH.ini"      # four channels, the default
+LP6_CONFIG_1CH = LP6_CONFIGS / "LPDDR6_PIM_Mobile_2CH.ini"  # one channel
 
 EVIDENCE = WORKSPACE / "archive/evidence"

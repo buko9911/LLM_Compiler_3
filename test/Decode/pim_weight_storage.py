@@ -128,7 +128,8 @@ def main():
     ap.add_argument('--compiler', type=Path, default=ROOT/'build/bin/npu-compile')
     ap.add_argument('--old-compiler', type=Path)
     ap.add_argument('--emulator', type=Path, required=True)
-    ap.add_argument('--dramsim-library', type=Path, required=True)
+    ap.add_argument("--lp6-library", type=Path, default=Path(__file__).resolve().parents[3] / "ramulator2/liblp6_ramulator.so",
+                    help="Ramulator bridge the emulator opens (the DRAMSim3 backend was retired on 2026-11-04)")
     ap.add_argument('--output', type=Path, required=True)
     a = ap.parse_args(); out = a.output.resolve(); out.mkdir(parents=True, exist_ok=False)
     spec = json.loads((ROOT/'configs/target.json').read_text())
@@ -144,7 +145,7 @@ def main():
     sources = {m: fixture(out/f'input_m{m}',m,model) for m in [4,8]}
     logs = out/'logs'; logs.mkdir()
     result = dict(scope='same PA/bytes across separately launched PIM M8/M4 variants, not dynamic runtime switching',
-                  provenance={str(p):sha(p) for p in [a.compiler,a.emulator,a.dramsim_library,Path(__file__)]},
+                  provenance={str(p):sha(p) for p in [a.compiler,a.emulator,a.lp6_library,Path(__file__)]},
                   negatives=[], native=[])
     if a.old_compiler: result['provenance'][str(a.old_compiler)] = sha(a.old_compiler)
 
@@ -185,7 +186,7 @@ def main():
     for name in ['program.bin','lp6.bin']: assert sha(reused/name)==sha(m4/name),(name,'same-directory sidecar import')
     result['same_directory_sidecar_import_identical']=True
 
-    os.environ['LD_PRELOAD'] = str(a.dramsim_library.resolve())
+    os.environ["LP6_RAMULATOR_LIBRARY"] = str(a.lp6_library.resolve())
     os.environ.pop('LP6PIM_BANKSET_PINGPONG',None)
     for m,build in [(8,m8),(4,m4)]:
         xq = rng.integers(-127,128,(m,512),dtype=np.int8); xq[:,0] = 127

@@ -32,7 +32,6 @@ EMU = workspace.EMULATOR
 # configs/LPDDR6_PIM_Mobile_2CH.ini; the simulator refuses a PIM program laid out for another
 # subchannel count.
 SETTINGS = workspace.SETTINGS
-BACKEND = workspace.DRAM_PIM
 DT = {"f16": np.float16, "f32": np.float32, "i8": np.int8, "i32": np.int32}
 
 
@@ -53,12 +52,11 @@ class Device:
     """The compiled step on the simulator."""
 
     def __init__(self, out: Path, settings: Path = SETTINGS, lp6_config: Path | None = None,
-                 emulator: Path = EMU, *, lp6_backend: str = "dramsim3",
+                 emulator: Path = EMU, *, lp6_backend: str = "ramulator",
                  lp6_library: Path | None = None):
-        if lp6_backend not in ("dramsim3", "ramulator"):
+        # Ramulator2 (liblp6_ramulator.so) is the only LP6 backend; DRAMSim3 was retired on 2026-11-04.
+        if lp6_backend != "ramulator":
             raise ValueError(f"unsupported LP6 backend: {lp6_backend}")
-        if lp6_backend == "dramsim3" and lp6_library is not None:
-            raise ValueError("lp6_library is only valid for ramulator; select DRAMsim3 with LD_PRELOAD")
         self.lp6_backend = lp6_backend
         self.lp6_library = lp6_library.resolve() if lp6_library else None
         self.out = out
@@ -73,7 +71,7 @@ class Device:
 
     def execution_env(self):
         """Match runtime lowering to the versioned, already packed weight image."""
-        env = dict(os.environ, LP6_DRAMSIM3_ROOT=str(BACKEND))
+        env = dict(os.environ)
         kernel = json.loads((self.out / "system.json").read_text()).get("pim_kernel")
         if not kernel or not self.io["pim_commands"]:
             return env
@@ -121,8 +119,7 @@ class Device:
         for f in (self.dump_name, "commands.json"):
             (self.out / f).unlink(missing_ok=True)
         extra = ["--lp6-config", str(self.lp6_config)] if self.lp6_config else []
-        if self.lp6_backend != "dramsim3":
-            extra += ["--lp6-backend", self.lp6_backend]
+        extra += ["--lp6-backend", self.lp6_backend]
         if self.lp6_library:
             extra += ["--lp6-library", str(self.lp6_library)]
         if profile:
@@ -211,7 +208,7 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--settings", type=Path, default=SETTINGS,
                     help="simulator settings (num_cores follows the program); default: four LPDDR6 channels")
-    ap.add_argument("--lp6-config", type=Path, help="LP6 DRAMSim3 INI in place of the settings' one")
+    ap.add_argument("--lp6-config", type=Path, help="LP6 INI (logical address layout) in place of the settings' one")
     a = ap.parse_args()
 
     dev = Device(a.build, a.settings, a.lp6_config)

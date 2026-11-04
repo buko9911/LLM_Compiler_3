@@ -14,7 +14,7 @@ from decode import Device
 
 class BackendRouting(unittest.TestCase):
     def test_default_and_explicit_backends(self):
-        for backend, library in (("dramsim3", None), ("ramulator", Path("/tmp/ramulator.so"))):
+        for backend, library in (("ramulator", None), ("ramulator", Path("/tmp/ramulator.so"))):
             with self.subTest(backend=backend), tempfile.TemporaryDirectory() as tmp:
                 out = Path(tmp)
                 (out / "system.json").write_text(json.dumps({"logical_to_physical": [0]}))
@@ -25,10 +25,7 @@ class BackendRouting(unittest.TestCase):
                                 lp6_backend=backend, lp6_library=library)
 
                 def fake_run(command, **kwargs):
-                    if backend == "ramulator":
-                        self.assertEqual(command[command.index("--lp6-backend") + 1], backend)
-                    else:
-                        self.assertNotIn("--lp6-backend", command)
+                    self.assertEqual(command[command.index("--lp6-backend") + 1], backend)
                     self.assertEqual("--lp6-library" in command, library is not None)
                     if library:
                         self.assertEqual(command[command.index("--lp6-library") + 1], str(library))
@@ -46,9 +43,9 @@ class BackendRouting(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported LP6 backend"):
             Device(Path("/nonexistent"), lp6_backend="typo")
 
-    def test_dramsim_does_not_accept_dynamic_backend_option(self):
-        with self.assertRaisesRegex(ValueError, "only valid for ramulator"):
-            Device(Path("/nonexistent"), lp6_library=Path("/tmp/dramsim.so"))
+    def test_retired_dramsim3_backend_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unsupported LP6 backend"):
+            Device(Path("/nonexistent"), lp6_backend="dramsim3")
 
 
 if __name__ == "__main__":

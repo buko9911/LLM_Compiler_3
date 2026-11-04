@@ -21,23 +21,22 @@ def main():
     root = Path(__file__).resolve().parents[2]
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", type=Path, default=root / "build/bin/npu-compile")
-    ap.add_argument("--dramsim-library", type=Path, required=True)
+    ap.add_argument("--lp6-library", type=Path, help="Ramulator bridge (default core/ramulator2/liblp6_ramulator.so)")
     ap.add_argument("--output", type=Path, required=True)
     a = ap.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     sys.path.insert(0, str(root / "runtime"))
     import workspace
-    npu, pim = workspace.NPU, workspace.DRAM_PIM
+    npu = workspace.NPU
     emu = npu / "transactional_emulator/target/release/transactional_emulator"
-    env = dict(os.environ, LD_PRELOAD=str(a.dramsim_library.resolve()), LP6_DRAMSIM3_ROOT=str(pim))
-    linked = subprocess.check_output(["ldd", str(emu)], text=True, env=env)
-    selected = [s.strip() for s in linked.splitlines() if "libdramsim3.so" in s]
-    assert len(selected) == 1 and str(a.dramsim_library.resolve()) in selected[0]
+    # The emulator opens Ramulator2's liblp6_ramulator.so (the DRAMSim3 backend was retired on 2026-11-04).
+    library = (a.lp6_library or workspace.RAMULATOR_LIBRARY).resolve()
+    env = dict(os.environ, LP6_RAMULATOR_LIBRARY=str(library))
     settings = out / "settings.toml"
     settings.write_text(re.sub(r"(?m)^num_cores\s*=\s*\d+", "num_cores = 4", (npu / "plena_settings.toml").read_text()))
     summary = dict(provenance=dict(compiler_sha256=sha256(a.compiler), emulator_sha256=sha256(emu),
-                                  library_sha256=sha256(a.dramsim_library), loader_library=selected[0]), cases={})
+                                  library=str(library), library_sha256=sha256(library)), cases={})
     # Large full-rank copies, multiple tokens and a tail batch; partial-rank path;
     # and a smaller scratch reserve that forces several chunks inside a DRAM row.
     cases = [("llama_ffn", 1, 14336, 4096, 262144),

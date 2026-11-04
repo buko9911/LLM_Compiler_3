@@ -150,7 +150,8 @@ def main():
     ap.add_argument("--output", type=Path, required=True)
     ap.add_argument("--emulator", type=Path, default=EMU)
     ap.add_argument("--settings", type=Path, default=SETTINGS)
-    ap.add_argument("--dramsim-library", type=Path, required=True)
+    ap.add_argument("--lp6-library", type=Path, default=Path(__file__).resolve().parents[3] / "ramulator2/liblp6_ramulator.so",
+                    help="Ramulator bridge the emulator opens (the DRAMSim3 backend was retired on 2026-11-04)")
     ap.add_argument("--skip-negatives", action="store_true")
     ap.add_argument("--check-default", action="store_true")
     ap.add_argument("--keep-dumps", action="store_true")
@@ -169,7 +170,7 @@ def main():
     frontend = Path(argv[argv.index("--manifest")+1])
     target = baseline / "target.json"
     manifest = baseline / "weight_storage.json"
-    library = args.dramsim_library.resolve()
+    library = args.lp6_library.resolve()
     assert previous["provenance_before"][str(library)] == sha(library), "baseline used another DRAM simulator"
     logs = out / "logs"; logs.mkdir()
     tracked = [args.compiler.resolve(), args.emulator.resolve(), library, args.settings.resolve(), Path(__file__).resolve(),
@@ -212,7 +213,7 @@ def main():
         build = compile_case("feed4", ["--pim-activation-cores=4"])
         result["program_audit"] = check_plan(build, old)
         assert json.loads((build / "pim_weight_storage_verified.json").read_text()) == json.loads(manifest.read_text())
-        os.environ["LD_PRELOAD"] = str(library)
+        os.environ["LP6_RAMULATOR_LIBRARY"] = str(library)
         os.environ.pop("LP6PIM_BANKSET_PINGPONG", None)
         dev = Device(build, args.settings, workspace.LP6_CONFIG, args.emulator)
         dev.write("x", reference["x"])

@@ -20,14 +20,15 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--compiler", type=Path, default=ROOT / "build/bin/npu-compile")
     ap.add_argument("--emulator", type=Path, required=True)
-    ap.add_argument("--dramsim-library", type=Path, required=True)
+    ap.add_argument("--lp6-library", type=Path, default=Path(__file__).resolve().parents[3] / "ramulator2/liblp6_ramulator.so",
+                    help="Ramulator bridge the emulator opens (the DRAMSim3 backend was retired on 2026-11-04)")
     ap.add_argument("--spec", type=Path, default=ROOT / "configs/target.json")
     ap.add_argument("--output", type=Path, required=True)
     a = ap.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    os.environ["LD_PRELOAD"] = str(a.dramsim_library.resolve())
-    result = dict(provenance={k: sha256(getattr(a, k)) for k in ("compiler", "emulator", "dramsim_library")}, cases={})
+    os.environ["LP6_RAMULATOR_LIBRARY"] = str(a.lp6_library.resolve())
+    result = dict(provenance={k: sha256(getattr(a, k)) for k in ("compiler", "emulator", "lp6_library")}, cases={})
     for name, m, k, n in [("full_sc", 1, 4096, 4096), ("partial_tail", 2, 768, 1056),
                            ("large_k", 1, 14336, 4096)]:
         case = out / name

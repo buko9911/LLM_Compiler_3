@@ -167,7 +167,7 @@ def audit_packet_metadata(build: Path, storage, m: int, n: int, k: int, spec):
 
 
 def provenance_files(args):
-    paths = [args.compiler, args.emulator, args.dramsim_library, args.settings, args.lp6_config,
+    paths = [args.compiler, args.emulator, args.lp6_library, args.settings, args.lp6_config,
              Path(__file__), ROOT / "test/Decode/pim_weight_storage.py", ROOT / "runtime/decode.py",
              ROOT / "configs/target.json", workspace.NPU_TOOLS / "isa_v2.py"]
     paths += sorted((ROOT / "lib/Decode").rglob("*.cpp"))
@@ -183,7 +183,8 @@ def main():
     parser.add_argument("--compiler", type=Path, default=ROOT / "build/bin/npu-compile")
     parser.add_argument("--old-compiler", type=Path, help="optional immutable pre-change compiler for default PIM bytes")
     parser.add_argument("--emulator", type=Path, default=EMU)
-    parser.add_argument("--dramsim-library", type=Path, required=True)
+    parser.add_argument("--lp6-library", type=Path, default=Path(__file__).resolve().parents[3] / "ramulator2/liblp6_ramulator.so",
+                        help="Ramulator bridge the emulator opens (the DRAMSim3 backend was retired on 2026-11-04)")
     parser.add_argument("--settings", type=Path, default=SETTINGS)
     parser.add_argument("--lp6-config", type=Path, default=workspace.LP6_CONFIG)
     parser.add_argument("--output", type=Path, required=True)
@@ -355,7 +356,7 @@ def main():
                          expect="supports exactly one driver-requested pim_packet_g4 NPU phase")
 
         if not args.compile_only:
-            os.environ["LD_PRELOAD"] = str(args.dramsim_library.resolve())
+            os.environ["LP6_RAMULATOR_LIBRARY"] = str(args.lp6_library.resolve())
             os.environ.pop("LP6PIM_BANKSET_PINGPONG", None)
             xq = np.random.default_rng(99181 + args.k).integers(-127, 128, (args.m, args.k), dtype=np.int8)
             xq[:, 0] = 127
