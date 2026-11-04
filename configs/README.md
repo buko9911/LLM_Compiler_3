@@ -58,5 +58,6 @@ refresh timing of 32 Gb dies (tRFC 380 ns).
 
 ## Reproducing older results
 
-The per-step presets before 2026-11-02 are at compiler commit `a19bf01`. The NPU-only baseline is tag
-`baseline-qwen3-4b-final`, whose target was `configs/baselines/npu_only_lp6_4ch.json`.
+The per-step presets before 2026-11-02 are at compiler commit `a19bf01`. The baseline with the 32 B/cycle memory bus is
+tag `baseline-qwen3-4b-final`, whose target was `configs/baselines/npu_only_lp6_4ch.json`. The current baseline is tag
+`baseline-qwen3-4b-link64` in the compiler and the simulator.

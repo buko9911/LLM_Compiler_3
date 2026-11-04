@@ -151,7 +151,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 - GEMV 그룹을 NPU와 PIM 중 어디에 둘지, PIM stream 모양: `hyb-partition`과 `hyb-plan-lp6`가 비용으로 고른다. PIM stream 비용 계수는
   `../../research/npu_pim_baseline/fit_pim.py`로 맞춘 값이다.
 
-측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`(tag `baseline-qwen3-4b-final`)와 `../../docs/research/NPU_PIM_BASELINE.md`,
+측정과 남은 차이는 `../../docs/research/NPU_ONLY_BASELINE.md`(tag `baseline-qwen3-4b-link64`)와 `../../docs/research/NPU_PIM_BASELINE.md`,
 스위치가 있던 때(2026-11-02 이전)의 스위치별 기여는 `../../docs/architecture/COMPILER.md` 부록 A에 있다.
 
 ## 테스트
