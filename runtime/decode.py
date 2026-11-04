@@ -27,7 +27,7 @@ from prefill import prefill_kv  # noqa: E402
 import workspace  # noqa: E402
 
 EMU = workspace.EMULATOR
-# The simulator's default settings: four LPDDR6 channels (102.4 GB/s), matching configs/target.json.
+# The simulator's default settings: four LPDDR6 channels (10667 Mbps, 113.8 GB/s), matching configs/target.json.
 # Builds of configs/target_1ch.json (one channel) run with --lp6-config
 # configs/LPDDR6_PIM_Mobile_2CH.ini; the simulator refuses a PIM program laid out for another
 # subchannel count.
