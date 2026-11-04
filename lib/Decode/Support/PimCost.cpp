@@ -52,6 +52,7 @@ Estimate estimate(const TargetSpec &spec, int64_t tokens, int64_t k, llvm::Array
                (spec.npu.clockMHz * std::max(1, spec.npu.cores));
   }
   e.pimUs = double(*std::max_element(load.begin(), load.end())) / spec.pim.clockMHz;
+  if (partitions > spec.pim.channels) e.pimUs *= spec.pim.twoRankFactor;
   return e;
 }
 

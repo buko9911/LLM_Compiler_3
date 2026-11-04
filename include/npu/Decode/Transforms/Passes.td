@@ -78,7 +78,8 @@ def HybPartition : Pass<"hyb-partition", "ModuleOp"> {
     the partitions plus the boundary work: activation written in PIM layout, INT32 outputs read
     back). The groups of one layer are chosen together: the cheapest NPU/PIM combination, where each
     extra run of NPU groups inside the layer (a PIM group between two NPU groups) costs
-    pim.npu_run_split_us. Groups outside the layers (LM head) take the cheaper target. `force` and
+    pim.npu_run_split_us, and a layer with any PIM group costs pim.pim_layer_exposed_us.
+    Groups outside the layers (LM head) take the cheaper target. `force` and
     the spec's `mapping` override the choice. Sets `group` and `target` on the qmatmuls and writes
     the cost table to `report`.
   }];

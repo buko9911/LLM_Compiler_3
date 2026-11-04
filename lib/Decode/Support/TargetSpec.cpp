@@ -44,8 +44,9 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
   static constexpr llvm::StringLiteral kPimKeys[] = {
       "clock_mhz", "pus", "lanes", "accumulators", "k_per_sweep", "channels", "ranks", "partitions",
-      "concurrent_ranks", "nlld_ck", "bankset_pingpong_lead", "ldmac_ck", "sweep_ck", "stream_ck",
-      "readback_gbps", "act_write_gbps", "readback_ns_per_output", "npu_run_split_us", "stream_accs", "max_split_k"};
+      "concurrent_ranks", "nlld_ck", "bankset_pingpong_lead", "ldmac_ck", "sweep_ck", "stream_ck", "two_rank_factor",
+      "readback_gbps", "act_write_gbps", "readback_ns_per_output", "npu_run_split_us", "pim_layer_exposed_us", "stream_accs",
+      "max_split_k"};
   static constexpr llvm::StringLiteral kLp6Keys[] = {"capacity_bytes"};
   auto unknownKey = [&](llvm::json::Object *o, llvm::StringRef name, llvm::ArrayRef<llvm::StringLiteral> keys) {
     if (o)
@@ -93,6 +94,8 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(p, "readback_gbps", s.pim.readbackGBps); num(p, "act_write_gbps", s.pim.actWriteGBps);
   num(p, "readback_ns_per_output", s.pim.readbackNsPerOutput);
   num(p, "npu_run_split_us", s.pim.npuRunSplitUs);
+  num(p, "pim_layer_exposed_us", s.pim.layerExposedUs);
+  num(p, "two_rank_factor", s.pim.twoRankFactor);
   num(p, "max_split_k", s.pim.maxSplitK); num(p, "bankset_pingpong_lead", s.pim.banksetPingPongLead);
   if (p) {
     if (auto v = p->getBoolean("concurrent_ranks")) s.pim.concurrentRanks = *v;
@@ -104,6 +107,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   }
   if (s.pim.ldmacCK < s.pim.nlldCK || s.pim.sweepCK < 0 || s.pim.streamCK < 0 || !(s.pim.readbackGBps > 0) ||
       !(s.pim.actWriteGBps > 0) || s.pim.readbackNsPerOutput < 0 || s.pim.npuRunSplitUs < 0 ||
+      s.pim.layerExposedUs < 0 || !(s.pim.twoRankFactor >= 1) ||
       s.pim.maxSplitK < 1 || s.pim.streamAccs.empty() || s.pim.banksetPingPongLead < 0 ||
       s.pim.banksetPingPongLead > 63) {
     error = "pim stream costs: ldmac_ck >= nlld_ck, the others nonnegative (rates positive), max_split_k >= 1, "

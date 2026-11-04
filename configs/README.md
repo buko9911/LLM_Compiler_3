@@ -44,6 +44,8 @@ two disagree.
 | `readback_gbps`, `act_write_gbps` | 32, 96 | estimate | NPU gather of INT32 outputs and scatter of INT8 activations |
 | `readback_ns_per_output` | 0.33 | measured | NPU time per PIM output and token beyond the gather bytes: LM head 151,936 outputs in 69 us |
 | `npu_run_split_us` | 45 | measured | NPU time lost when a PIM group splits a layer's NPU weight stream, 2-layer fixture, 4 and 8 tokens |
+| `pim_layer_exposed_us` | 125 | measured | A layer with any group on PIM runs its attention, norms and SiLU in the open; an all-NPU layer hides them under weight reads. (Measured layer minus computed GEMV and boundary, PIM layer minus NPU layer: 119, 131, 116, 129 µs at 1 to 4 tokens, 2-layer fixture, layer 1) |
+| `two_rank_factor` | 1.05 | measured | A PIM phase on both ranks takes this much longer than the one-rank stream cost, because the two ranks of a subchannel share its command bus and DQ. Measured / computed time of the two-rank phases of the 2-layer fixture: 1.051 at 1 to 4 tokens, 1.051 at 5 to 8 tokens |
 | `stream_accs`, `max_split_k` | 2..16, 8 | search | Accumulator counts and split-K tried by the stream layout search |
 
 ## LP6

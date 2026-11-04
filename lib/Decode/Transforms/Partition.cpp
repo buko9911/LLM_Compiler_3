@@ -6,7 +6,8 @@
 // streamed from LP6 at the sustained GDMA rate) and set the `target` attribute. The group is the
 // decision unit because its members share one activation broadcast (PIM) or one weight stream
 // pass (NPU). The groups of one layer are chosen together: a PIM group between two NPU groups of
-// the layer splits the NPU weight stream, which costs npu_run_split_us (measured).
+// the layer splits the NPU weight stream, which costs npu_run_split_us, and any PIM group takes the
+// layer's NPU work out from under its weight reads, which costs pim_layer_exposed_us (both measured).
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -108,25 +109,27 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
     std::map<int64_t, SmallVector<size_t>> byLayer;   // program order inside a layer
     for (size_t i = 0; i < list.size(); ++i)
       if (list[i].layer >= 0) byLayer[list[i].layer].push_back(i);
-    double splitUs = 0;
+    double splitUs = 0, exposedUs = 0;
     for (auto &[layer, members] : byLayer) {
       SmallVector<size_t> free;
       for (size_t i : members)
         if (list[i].why == "cost") free.push_back(i);
       if (free.empty() || free.size() > 12) continue;
       splitUs = specOr->pim.npuRunSplitUs;
+      exposedUs = specOr->pim.layerExposedUs;
       auto layerUs = [&](uint32_t mask) {
         double us = 0;
         int runs = 0;
-        bool prevNpu = false;
+        bool prevNpu = false, anyPim = false;
         for (size_t i : members) {
           auto at = llvm::find(free, i);
           bool npu = at != free.end() ? !((mask >> (at - free.begin())) & 1) : list[i].target == "npu";
           us += npu ? list[i].c.npuUs : list[i].c.pimUs + list[i].c.pimBoundaryUs;
           if (npu && !prevNpu) runs++;
+          anyPim |= !npu;
           prevNpu = npu;
         }
-        return us + splitUs * std::max(0, runs - 1);
+        return us + splitUs * std::max(0, runs - 1) + (anyPim ? exposedUs : 0);
       };
       uint32_t incumbent = 0;   // bit set = PIM, start from the per-group answer
       for (size_t f = 0; f < free.size(); ++f)
@@ -140,7 +143,7 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
         }
       for (size_t f = 0; f < free.size(); ++f) {
         std::string t = (chosen >> f) & 1 ? "pim" : "npu";
-        if (t != list[free[f]].target) list[free[f]].why = "cost, layer (NPU run split)";
+        if (t != list[free[f]].target) list[free[f]].why = "cost, layer";
         list[free[f]].target = t;
       }
     }
@@ -161,7 +164,8 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       llvm::raw_fd_ostream os(report, ec);
       if (!ec)
         os << llvm::formatv("{0:2}", llvm::json::Value(llvm::json::Object{
-                                         {"tokens", M}, {"npu_run_split_us", splitUs}, {"groups", std::move(table)}}));
+                                         {"tokens", M}, {"npu_run_split_us", splitUs}, {"pim_layer_exposed_us", exposedUs},
+                                         {"groups", std::move(table)}}));
     }
   }
 };

@@ -82,6 +82,9 @@ struct TargetSpec {
     double ldmacCK = 0;
     /// Fixed DRAM CK per stream sweep (its activation register loads) and per stream (clear, store).
     double sweepCK = 0, streamCK = 0;
+    /// A phase on both ranks takes this much longer than the one-rank cost: the ranks of a subchannel
+    /// share its command bus and DQ (measured ratio).
+    double twoRankFactor = 1;
     /// NPU gather of INT32 PIM outputs and scatter of INT8 activations.
     double readbackGBps = 32, actWriteGBps = 96;
     /// NPU time per PIM output per token to bring it back and dequantize it (hyb-partition; the NPU
@@ -90,6 +93,9 @@ struct TargetSpec {
     /// hyb-partition: NPU time lost when a PIM group splits a layer's NPU weight stream into two runs
     /// (the NPU work next to the split is no longer hidden behind weight reads).
     double npuRunSplitUs = 0;
+    /// A layer with any group on PIM: the time its NPU work (attention, norms, SiLU) takes in the open,
+    /// which an all-NPU layer hides under its weight reads (measured).
+    double layerExposedUs = 0;
     /// Accumulator counts a stream may use (even, 2..16) and the largest split-K.
     std::vector<int> streamAccs = {2, 4, 6, 8, 10, 12, 14, 16};
     int maxSplitK = 8;
