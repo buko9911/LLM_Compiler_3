@@ -1,6 +1,6 @@
 # LP6 decode compiler
 
-Llama/Qwen3 decode step 하나(토큰 M개, KV capacity P)를 NPU(PLENA ISA 2.0)와 LPDDR6-PIM이
+Llama/Qwen3/Qwen3.5 decode step 하나(토큰 M개, KV capacity P)를 NPU(PLENA ISA 2.0)와 LPDDR6-PIM이
 함께 실행하는 단일 프로그램으로 컴파일한다. 입력은 `frontend/export.py`가 만든 linalg 그래프와
 manifest이고, 출력은 시뮬레이터가 읽는 `program.bin`, `system.json`, `io.json`, `lp6.bin`이다.
 

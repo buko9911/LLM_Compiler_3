@@ -19,10 +19,9 @@
 //  * tile ids are dense per kind; the runtime places weight rows from the
 //    kernel row, then activation rows, then output rows (no scale rows).
 //
-// LP6 byte addresses follow core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini (C = 8)
-// and LPDDR6_PIM_Mobile_2CH.ini (C = 2), address_mapping = rarobacobgch (MSB ->
-// LSB: rank, row, bank, column, bank group, subchannel above the 32 B offset):
-// the strides below the rank grow with C; a rank is 8 GiB in both.
+// LP6 byte addresses follow core/ramulator2/configs/lp6/LPDDR6_PIM_Mobile_4CH.ini (C = 8),
+// address_mapping = rarobacobgch (MSB -> LSB: rank, row, bank, column, bank group,
+// subchannel above the 32 B offset): the strides below the rank grow with C; a rank is 8 GiB.
 #include "npu/Target/Result.h"
 #include "npu/Target/PimPrimitive.h"
 #include <algorithm>
