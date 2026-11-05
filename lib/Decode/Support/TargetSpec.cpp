@@ -40,7 +40,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       "clock_mhz", "cores", "sa_rows", "sa_cols", "l1_bytes", "l2_bytes", "gemv_fixed_us",
       "l1_read_bytes_per_cycle", "l1_write_bytes_per_cycle", "mma_k_per_cycle", "mma_pipeline_cycles",
       "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps", "ldma_gbps_per_core", "command_fetch_words_per_cycle",
-      "core_split_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
+      "core_split_us", "core_split_no_stream_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
       "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
   static constexpr llvm::StringLiteral kPimKeys[] = {
       "clock_mhz", "pus", "lanes", "accumulators", "k_per_sweep", "channels", "ranks", "partitions",
@@ -78,14 +78,14 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(n, "mma_k_per_cycle", s.npu.mmaKPerCycle); num(n, "mma_pipeline_cycles", s.npu.mmaPipelineCycles);
   num(n, "vector_lanes", s.npu.vectorLanes); num(n, "vector_exp_per_cycle", s.npu.vectorExpPerCycle);
   num(n, "vector_rcp_per_cycle", s.npu.vectorRcpPerCycle); num(n, "vector_sqrt_per_cycle", s.npu.vectorSqrtPerCycle);
-  num(n, "gdma_read_gbps", s.npu.gdmaReadGBps); num(n, "core_split_us", s.npu.coreSplitUs);
+  num(n, "gdma_read_gbps", s.npu.gdmaReadGBps); num(n, "core_split_us", s.npu.coreSplitUs); num(n, "core_split_no_stream_us", s.npu.coreSplitNoStreamUs);
   num(n, "ldma_gbps_per_core", s.npu.ldmaGBpsPerCore);
   num(n, "command_fetch_words_per_cycle", s.npu.commandFetchWordsPerCycle);
   if (s.npu.l1ReadBytesPerCycle <= 0 || s.npu.l1WriteBytesPerCycle <= 0 || s.npu.mmaKPerCycle <= 0 ||
       s.npu.mmaPipelineCycles < 0 || s.npu.vectorLanes <= 0 || s.npu.vectorExpPerCycle <= 0 ||
       s.npu.vectorRcpPerCycle <= 0 || s.npu.vectorSqrtPerCycle <= 0 || !(s.npu.gdmaReadGBps > 0) || !(s.npu.ldmaGBpsPerCore > 0) || s.npu.commandFetchWordsPerCycle < 1 ||
-      !(s.npu.coreSplitUs >= 0)) {
-    error = "npu timing values must be positive (core_split_us non-negative)";
+      !(s.npu.coreSplitUs >= 0) || !(s.npu.coreSplitNoStreamUs >= 0)) {
+    error = "npu timing values must be positive (core_split costs non-negative)";
     return failure();
   }
   num(p, "clock_mhz", s.pim.clockMHz); num(p, "pus", s.pim.pus); num(p, "lanes", s.pim.lanes);

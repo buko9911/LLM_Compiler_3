@@ -100,8 +100,6 @@ struct HybNpuProjectionFusionPass : mlir::hybrid::impl::HybNpuProjectionFusionBa
   void runOnOperation() override {
     auto target = loadTargetSpec(getOperation(), spec);
     if (failed(target)) return signalPassFailure();
-    // A fixed PIM weight storage is a different image contract; never repack its weights.
-    if (getOperation()->hasAttr("hyb.pim_weight_storage_requested")) return;
     for (func::FuncOp fn : getNpuPhases(getOperation())) {
       // Group projections by their quantized input and its scale.
       SmallVector<SmallVector<Projection>> groups;

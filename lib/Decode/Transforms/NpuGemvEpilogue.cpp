@@ -8,6 +8,10 @@
 // (SiLU(gate) * up) is split so that core c computes the same column range of both halves and
 // applies the op itself; only the op's result is published (no FP16 gate/up round trip through
 // L2 and no row redistribution for the op).
+//
+// Results of a PIM phase: dequants whose accumulators are phase arguments and whose results are read only by one
+// elementwise op (SiLU(gate) * up) run in one core loop. Core c dequantizes the same columns of each result and applies
+// the op, so only the op's result goes to L2. Chosen from the time the cores save (NpuCost.h) and from L1 capacity.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -47,6 +51,11 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
       int64_t count = 0;
       for (auto d : candidates)
         if (fusePaired(d, *target) || fuse(d, *target)) ++count;
+      SmallVector<linalg::GenericOp> consumers;
+      for (Operation &op : fn.front())
+        if (auto g = dyn_cast<linalg::GenericOp>(op)) consumers.push_back(g);
+      for (linalg::GenericOp g : consumers)
+        if (fuseResults(g, fn, *target)) ++count;
       fn->setAttr("hyb.gemv_epilogue_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), count));
     }
   }
@@ -270,6 +279,113 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
     d.erase();
     ch->collapse.erase();
     ch->gemv.erase();
+    return true;
+  }
+
+  /// An elementwise op on the dequants of PIM results and nothing else, see the file header.
+  bool fuseResults(linalg::GenericOp op, func::FuncOp fn, const TargetSpec &target) {
+    if (op.getNumDpsInits() != 1 || op.getNumReductionLoops() || !op.hasPureTensorSemantics() ||
+        op->hasAttr("hyb.npu_gemv") || !op.getDpsInits()[0].getDefiningOp<tensor::EmptyOp>() ||
+        !llvm::all_of(op.getIndexingMapsArray(), [](AffineMap m) { return m.isIdentity(); }))
+      return false;
+    auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
+    if (!type || !type.hasStaticShape() || !type.getElementType().isF16() || type.getRank() > 2) return false;
+    // Each input is a dequant of a phase argument, directly or through the rank-1 form of a single row.
+    llvm::SetVector<Operation *> dequants;
+    SmallVector<tensor::CollapseShapeOp> collapses;
+    DenseMap<Value, hyb::DequantOp> source;
+    for (Value v : op.getDpsInputs()) {
+      Value value = v;
+      auto collapse = value.getDefiningOp<tensor::CollapseShapeOp>();
+      if (collapse) value = collapse.getSrc();
+      auto d = value.getDefiningOp<hyb::DequantOp>();
+      if (!d || !isa<BlockArgument>(d.getAcc()) || d->getBlock() != op->getBlock()) return false;
+      auto onlyOp = [&](Value r) {
+        return llvm::all_of(r.getUsers(), [&](Operation *u) { return u == op.getOperation(); });
+      };
+      if (collapse ? !(collapse->getBlock() == op->getBlock() && d.getResult(0).hasOneUse() && onlyOp(collapse.getResult()))
+                   : !onlyOp(d.getResult(0)))
+        return false;
+      if (collapse && !llvm::is_contained(collapses, collapse)) collapses.push_back(collapse);
+      dequants.insert(d);
+      source[v] = d;
+    }
+    if (dequants.empty()) return false;
+    auto first = cast<hyb::DequantOp>(dequants.front());
+    auto shape = cast<RankedTensorType>(first.getInit().getType());
+    if (!shape.hasStaticShape() || shape.getRank() != 2) return false;
+    const int64_t m = shape.getDimSize(0), n = shape.getDimSize(1);
+    for (Operation *o : dequants)
+      if (cast<hyb::DequantOp>(o).getInit().getType() != first.getInit().getType()) return false;
+    const int64_t blocks = n / 32, cores = largestDivisorAtMost(blocks, target.npu.cores);
+    if (n % 32 || cores < 2) return false;
+    const int64_t perCore = blocks / cores;
+    const double cycles = cost::genericCycles(target.npu, op) +
+                          double(dequants.size()) * double(m * n) * cost::dequantCyclesPerElement(target.npu);
+    const bool pays = cost::splitPays(target.npu, fn, cycles, cores);
+    cost::recordDecision(fn, "split result consumer", op->getName().getStringRef(), pays ? "split" : "one core",
+                         {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(target.npu)},
+                          {"saving_us", cost::splitSavingUs(target.npu, cycles, cores)},
+                          {"split_cost_us", cost::splitCostUs(target.npu, fn)}});
+    if (!pays) return false;
+    // Each dequant's INT32, scale and FP16 and the op's output, at most the whole L1 less the reserve.
+    auto bytesFor = [&](int64_t part) {
+      const int64_t columns = part * 32;
+      return int64_t(dequants.size()) * (m * columns * 6 + columns * 4) + m * columns * 2 + m * 4 +
+             target.npu.l1ReservedBytes + 4096;
+    };
+    const int64_t chunks = columnChunks(first, "PIM results", perCore, bytesFor, target);
+    if (!chunks) return false;
+    const int64_t part = perCore / chunks, columns = part * 32;
+
+    OpBuilder builder(op);
+    Location loc = op.getLoc();
+    const int64_t rank = type.getRank();
+    Value shared = rank == 2 ? op.getDpsInits()[0]
+                             : tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{1, n}, builder.getF16Type()).getResult();
+    for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+      builder.setInsertionPoint(op);
+      auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{shared}, std::nullopt);
+      loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
+      loop->setAttr("hyb.pim_result_consumer", builder.getUnitAttr());
+      builder.setInsertionPointToStart(loop.getBody());
+      auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
+      Value start = arith::AddIOp::create(builder, loc,
+          arith::MulIOp::create(builder, loc, loop.getInductionVar(0), index(columns)), index(chunk * cores * columns));
+      OpFoldResult z = builder.getIndexAttr(0);
+      DenseMap<Operation *, Value> local;
+      for (Operation *o : dequants) {
+        auto d = cast<hyb::DequantOp>(o);
+        Value acc = slice(builder, loc, d.getAcc(), {z, start}, {m, columns});
+        Value scale = slice(builder, loc, d.getWscale(), {start}, {columns});
+        Value empty = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, columns}, builder.getF16Type());
+        local[o] = hyb::DequantOp::create(builder, loc, TypeRange{empty.getType()}, acc, d.getScale(), scale, empty,
+                                          d.getWeightAttr()).getResult(0);
+      }
+      SmallVector<Value> inputs;
+      for (Value v : op.getDpsInputs()) inputs.push_back(local.lookup(source.lookup(v).getOperation()));
+      Value output = tensor::EmptyOp::create(builder, loc, ArrayRef<int64_t>{m, columns}, builder.getF16Type());
+      AffineMap id = builder.getMultiDimIdentityMap(2);
+      auto generic = linalg::GenericOp::create(builder, loc, TypeRange{output.getType()}, inputs, ValueRange{output},
+          SmallVector<AffineMap>(inputs.size() + 1, id), SmallVector<utils::IteratorType>(2, utils::IteratorType::parallel));
+      IRMapping mapping;
+      op.getRegion().cloneInto(&generic.getRegion(), mapping);
+      for (NamedAttribute a : op->getDiscardableAttrs()) generic->setAttr(a.getName(), a.getValue());
+      builder.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
+      tensor::ParallelInsertSliceOp::create(builder, loc, generic.getResult(0), loop.getRegionOutArgs()[0],
+          SmallVector<OpFoldResult>{z, start}, attrs(builder, {m, columns}), attrs(builder, {1, 1}));
+      shared = loop.getResult(0);
+    }
+    Value result = shared;
+    if (rank != 2) {
+      builder.setInsertionPoint(op);
+      result = tensor::CollapseShapeOp::create(builder, loc, op.getResult(0).getType(), result,
+                                               SmallVector<ReassociationIndices>{{0, 1}});
+    }
+    op.getResult(0).replaceAllUsesWith(result);
+    op.erase();
+    for (tensor::CollapseShapeOp c : collapses) c.erase();
+    for (Operation *o : dequants) o->erase();
     return true;
   }
 

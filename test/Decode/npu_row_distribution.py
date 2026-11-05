@@ -75,10 +75,10 @@ def main():
         "norm_only": ({"quant": False}, {}, [1], 4),
         "shared_norm": ({"share_norm": True}, {}, [1, 0], 4),
         # Tiny shapes exercise the rewrite with no split cost; the cost rule itself is below.
-        "row_divisor": ({"rows": 6, "columns": 256}, {"core_split_us": 0}, [2], 3),
-        "not_worth_splitting": ({"rows": 4, "columns": 64}, {}, [], None),
+        "row_divisor": ({"rows": 6, "columns": 256}, {"core_split_us": 0, "core_split_no_stream_us": 0}, [2], 3),
+        "not_worth_splitting": ({"rows": 4, "columns": 64}, {"core_split_no_stream_us": 0.5}, [], None),
         "one_row": ({"rows": 1}, {}, [], None),
-        "small": ({"rows": 8, "columns": 64}, {}, [], None),
+        "small": ({"rows": 8, "columns": 64}, {"core_split_no_stream_us": 0.5}, [], None),
         "pim": ({"phase": "pim"}, {}, [], None),
     }
     results = {}

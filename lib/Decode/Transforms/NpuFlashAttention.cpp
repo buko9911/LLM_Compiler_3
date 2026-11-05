@@ -855,7 +855,7 @@ struct HybNpuFlashAttentionPass
       }
     for (auto fn : getOperation().getOps<func::FuncOp>()) {
       auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-      if (!phase || phase.getValue() != "npu" || fn->hasAttr("hyb.npu_kernel")) continue;
+      if (!phase || phase.getValue() != "npu") continue;
       SmallVector<linalg::BatchMatmulOp> candidates;
       fn.walk([&](linalg::BatchMatmulOp mm) {
         if (!mm->hasAttr("hyb.flash_tile") && !mm->getParentOfType<scf::ForallOp>() &&

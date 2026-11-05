@@ -46,13 +46,13 @@ MLIR 기본 pass 13단계). 모든 pass가 항상 돌고, 각 pass가 텐서 크
 | | `hyb-lower-npu-gemv` | NPU GEMV → `[N/32, K, 32]` INT8 weight의 INT32 contraction | |
 | | `hyb-outline-phases` | 연속 NPU 연산/PIM 그룹을 phase 함수로 분리 | NPU phase는 층 경계에서 끊음 |
 | 3. 묶기·타일링 | `hyb-npu-projection-fusion` | q/k/v, gate/up을 출력 방향으로 이어 GEMV 하나로 | SA 열 블록 하나의 코어 몫이 L1에 들어갈 때 |
-| | `hyb-npu-rope` | rotate-half RoPE를 head 축으로 코어에 나누고 head 단위 배치에 바로 씀 | 아끼는 시간 > `core_split_us` |
+| | `hyb-npu-rope` | rotate-half RoPE를 head 축으로 코어에 나누고 head 단위 배치에 바로 씀 | 아끼는 시간 > 분할 비용 |
 | | `hyb-npu-flash-attention` | key 타일 단위 online softmax(FP32 running max/sum/output), cache 조각 직접 읽기, KV head가 코어보다 적으면 Flash-Decoding. 반올림이 FP16 softmax와 다름 | 전체 행 attention이 L2·L1에 안 들어갈 때(`--flash-attention`). PIM phase가 있는 프로그램은 제외 |
 | | `hyb-npu-attention-fusion` | head 하나의 QK·mask·softmax·PV를 한 코어에(M>1의 reshape 통과) | 패턴 |
 | | `hyb-npu-state-fusion` | FP32 recurrent state(Qwen3.5 GDN)의 토큰별 갱신을 head 묶음으로 코어에 | FP32 state 인자가 있을 때 |
-| | `hyb-npu-gemv-epilogue` | GEMV 출력 열을 코어별로 나눠 같은 코어에서 역양자화, gate·up 짝을 같은 열로 | 코어 몫이 L1에 안 들어가면 열 묶음 |
+| | `hyb-npu-gemv-epilogue` | GEMV 출력 열을 코어별로 나눠 같은 코어에서 역양자화, gate·up 짝을 같은 열로. PIM 결과의 역양자화와 그 elementwise 소비자(SiLU×up)도 한 코어 loop에 | 코어 몫이 L1에 안 들어가면 열 묶음. PIM 결과는 아끼는 시간 > 분할 비용 |
 | | `hyb-npu-tile` | 코어 분배(`scf.forall`)와 weight 타일 루프(`scf.for {hyb.stream}`) | |
-| | `hyb-npu-elementwise-distribute` | 큰 elementwise 연산, quant·행 reduction 사슬(토큰 행), 전치를 코어에 분배 | 아끼는 시간 > `core_split_us` |
+| | `hyb-npu-elementwise-distribute` | 큰 elementwise 연산, quant·행 reduction 사슬(토큰 행), 전치를 코어에 분배 | 아끼는 시간 > 분할 비용 |
 | 4. buffer | `hyb-private-phase-results` | PIM이 읽는 NPU 결과에 전용 buffer | |
 | | `hyb-npu-activation-residency` | phase 출력과 phase 내부 activation의 buffer 분리 | |
 | | `one-shot-bufferize`, `buffer-results-to-out-params` | tensor → memref | |
@@ -117,9 +117,6 @@ $PY -B runtime/decode.py out-npu --prompt "..." --steps 8 --check               
 | `--flash-attention=auto\|on\|off` | online softmax attention. `auto`(기본)는 전체 행이 L2·L1에 안 들어갈 때만, `on`은 NPU-only 프로그램의 모든 attention(PIM phase가 있으면 오류), `off`는 쓰지 않음(안 들어가면 오류) |
 | `--no-image`, `--no-output-collect`, `--debug-collect [--debug-phases=a,b]` | `lp6.bin` 생략, 출력 회수 생략, phase 사이 값 회수 |
 | `--pim-bankset-pingpong=N` | PIM weight row bank-set 교대. -1(기본)은 target의 `pim.bankset_pingpong_lead`, 0은 끔, 1은 lead 12, 2..63은 그 lead |
-| `--pim-weight-storage-export/-import` | PIM weight 저장 위치 고정 |
-| `--pim-packet-npu=g4` | NPU가 PIM packet layout weight를 직접 읽음(`--force=npu` + import 필요) |
-| `--pim-activation-cores=4` | 독립된 quant/PIM activation 공급 phase를 4코어로(`--force=pim`) |
 
 pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 `build/bin/npu-opt ir/step.mlir --pass-pipeline="$(cat out/pipeline.txt)" --mlir-print-ir-after-all --mlir-disable-threading`.
@@ -141,7 +138,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 텐서 크기와 target의 수치로 계산한 시간·용량으로 정한다(`include/npu/Decode/Transforms/NpuCost.h`, PIM은 `include/npu/Decode/Support/PimCost.h`).
 모든 결정과 근거 숫자는 `io.json`의 `phases[].decisions`에 남는다. 그래서 크기가 같으면 step이 달라도 프로그램이 같다. 예:
 
-- op를 코어에 나눌지: 나눠서 아끼는 시간이 `core_split_us`보다 클 때.
+- op를 코어에 나눌지: 나눠서 아끼는 시간이 분할 비용보다 클 때. 분할 비용은 phase에 NPU GEMV(weight stream)가 있으면 `core_split_us`, 없으면 `core_split_no_stream_us`다(local DMA가 비어 있다).
 - attention: 전체 행 softmax의 L2 복사본(K·V 전체)과 그 주변 activation, 코어당 weight ring 3칸이 L2에, head 하나의 K·V·score
   행이 L1에 들어가면 전체 행 softmax, 아니면 key 조각을 cache에서 바로 읽는 online softmax(`hyb-npu-flash-attention`). KV
   head가 코어보다 적으면 key를 코어에 나눈다(Flash-Decoding). online softmax의 query·key 조각은 L1 용량으로 정한다(head 하나의
@@ -169,7 +166,7 @@ pass를 하나씩 보려면 `pipeline.txt`의 문자열을 `npu-opt`에 준다:
 | `decode-frontend` | export한 그래프를 HF 모델과 비교 |
 | `decode-runtime-backend` | runtime이 시뮬레이터에 넘기는 LP6 backend 인자 |
 | `decode-target-simulators` | `configs/target.json`, `plena_settings.toml`, LP6 INI가 같은 하드웨어를 적는지 비교 |
-| `e2e-weight-prefetch`, `e2e-pim-scatter`, `e2e-pim-pingpong`, `e2e-pim-weight-storage`, `e2e-pim-packet-npu`, `e2e-pim-activation-cores`, `e2e-pim-activation-ranks`, `e2e-vector-schedule`, `e2e-gemv-optimizations`, `e2e-attention-fusion`, `e2e-dependency-schedule`, `e2e-elementwise-distribution`, `e2e-flash-attention`, `e2e-matmul-layout`, `e2e-projection-fusion` | 라벨 `e2e`. 작은 합성 입력을 컴파일해 NPU emulator와 Ramulator로 실행하고 독립 reference와 비교 |
+| `e2e-weight-prefetch`, `e2e-pim-scatter`, `e2e-pim-pingpong`, `e2e-pim-boundary`, `e2e-pim-result-consumer`, `e2e-vector-schedule`, `e2e-gemv-optimizations`, `e2e-attention-fusion`, `e2e-dependency-schedule`, `e2e-elementwise-distribution`, `e2e-flash-attention`, `e2e-matmul-layout`, `e2e-projection-fusion` | 라벨 `e2e`. 작은 합성 입력을 컴파일해 NPU emulator와 Ramulator로 실행하고 독립 reference와 비교 |
 | `e2e-l2-dependencies` | 라벨 `e2e`. `e2e-weight-prefetch`가 만든 프로그램의 L2 접근과 의존성을 정적으로 검사 |
 
 CTest 밖의 모델 회귀는 `test/Decode/run_layer1.sh`다(Qwen3-4B 1층을 NPU+PIM, NPU-only, 혼합 분할로 실행해 logits와 K/V를 byte 비교). 각 스크립트 설명은

@@ -41,7 +41,7 @@ struct TargetSpec {
     int64_t commandFetchWordsPerCycle = 0;
     // Fixed cost of running one op on several cores instead of one (dispatch, the cross-core events
     // and the per-core copies of its operands): measured, see npu.core_split_us in the target files.
-    double coreSplitUs = 0.5;
+    double coreSplitUs = 0.5, coreSplitNoStreamUs = 0.2;
 
     // ---- memory plan (hyb-npu-memplan, backend) ---------------------------------------------------
     // L1 [4 KiB, 4 KiB + l1Reserved) holds the backend's constant pool and scratch.

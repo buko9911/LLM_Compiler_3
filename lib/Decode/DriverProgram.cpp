@@ -9,7 +9,6 @@
 #include "DriverProgram.h"
 #include "DriverPackage.h"
 #include "npu/Decode/PimMetadata.h"
-#include "npu/Decode/Target/PacketMatmul.h"
 #include "npu/Decode/Transforms/Passes.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
@@ -167,29 +166,23 @@ bool driver::emitPimCommands(pim::Program &prog, std::vector<pim::Primitive> &pi
   return true;
 }
 
-void driver::setPimKernel(plena::ProgramBuilder &program, const pim::Program &prog, bool fixedStorage,
-                          uint32_t pimCommandCount) {
+void driver::setPimKernel(plena::ProgramBuilder &program, const pim::Program &prog) {
   json::Object kernel{{"channel", 0},        {"rank", 0},           {"row", prog.kernelRow},
                       {"start_column", 0},   {"bank_set", 1},       {"weight_bits", 8},
                       {"activation_bits", 8}, {"scale_bits", 0},    {"input_register_count", 8},
                       {"output_register_count", 8}, {"subchannels", prog.channels},
                       {"weight_layout", prog.weightLayout()},
                       {"bankset_pingpong_lead", prog.banksetPingPongLead}};
-  // Weight placement is an input in this mode. Inferring runtime bases from
-  // only the selected executable primitives can move activations/outputs.
-  if (fixedStorage && pimCommandCount != 0)
-    kernel["storage_layout"] = ::npu::decode::pimRuntimeStorageLayout(prog);
   program.pimKernelJson = llvm::formatv("{0}", json::Value(std::move(kernel))).str();
 }
 
 bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
                         const std::vector<pim::Primitive> &pimCommands, const TargetSpec &spec,
-                        plena::ProgramBuilder &program, LP6Extra &extra, int pimActivationCores,
+                        plena::ProgramBuilder &program, LP6Extra &extra,
                         std::vector<int> &exit, int &logicalCores, json::Array &report, std::string &err) {
   program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
   program.l1Bytes = uint64_t(spec.npu.l1Bytes);
   program.commandSchedule = true;
-  int parallelActivationPhases = 0;
   CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)
   struct { std::vector<int> records, ranks, before; } pimBefore;   // the PIM phase just before
   for (Operation &op : step.getBody().front()) {
@@ -237,17 +230,14 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     in.pim = &prog;
     in.spec = &spec;
     in.program = &program;
-    in.pimActivationCores = pimActivationCores;
-    const bool packet = callee->hasAttr("hyb.npu_kernel");
-    if (packet) carried = {};
-    else in.carried = &carried;
+    in.carried = &carried;
     in.pimRecords = pimBefore.records;
     in.pimRanks = pimBefore.ranks;
     in.beforePim = pimBefore.before;
     pimBefore = {};
     program.beginPhase(name, exit);
     NpuPhaseStats stats;
-    LogicalResult emitted = packet ? emitPimPacketNpuPhase(in, stats, err) : emitNpuPhase(in, extra, stats, err);
+    LogicalResult emitted = emitNpuPhase(in, extra, stats, err);
     if (failed(emitted)) {
       llvm::errs() << "NPU codegen failed in " << name << ": " << err << "\n";
       return false;
@@ -255,51 +245,13 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     exit = program.endPhase();
     for (auto &a : carried.l2) a.id = program.scheduledId(a.id);
     for (auto &a : carried.lp6) a.id = program.scheduledId(a.id);
-    // The parallel activation feed reports command indices; give them after the reorder.
-    if (stats.pimActivationCores > 1 && !stats.pimActivationPlanJson.empty()) {
-      auto plan = json::parse(stats.pimActivationPlanJson);
-      if (!plan || !plan->getAsObject()) {
-        llvm::errs() << "parallel PIM activation feed reported an invalid plan\n";
-        return false;
-      }
-      json::Object &object = *plan->getAsObject();
-      if (json::Array *events = object.getArray("activation_store_events"))
-        for (json::Value &event : *events)
-          if (auto id = event.getAsInteger()) event = program.scheduledId(int(*id));
-      if (auto id = object.getInteger("q_ready_event")) object["q_ready_event"] = program.scheduledId(int(*id));
-      stats.pimActivationPlanJson = llvm::formatv("{0}", json::Value(std::move(*plan))).str();
-      callee->setAttr("hyb.pim_activation_plan", StringAttr::get(callee.getContext(), stats.pimActivationPlanJson));
-    }
     logicalCores = std::max(logicalCores, int(stats.cores));
     if (extra.cursor > extra.limit) {
       llvm::errs() << "NPU constant pools overflow the reserved LP6 region\n";
       return false;
     }
     json::Object phaseReport = npuPhaseReport(name, callee, stats, spec, program);
-    if (auto kernel = callee->getAttrOfType<StringAttr>("hyb.npu_kernel")) {
-      phaseReport["kernel"] = kernel.getValue().str();
-      auto plan = callee->getAttrOfType<StringAttr>("hyb.packet_plan");
-      if (!plan) { llvm::errs() << "packet kernel did not report its checked memory plan\n"; return false; }
-      auto value = json::parse(plan.getValue());
-      if (!value) { llvm::errs() << llvm::toString(value.takeError()) << '\n'; return false; }
-      phaseReport["packet_plan"] = std::move(*value);
-    }
-    if (stats.pimActivationCores > 1) {
-      if (stats.pimActivationCores != pimActivationCores || stats.pimActivationPlanJson.empty()) {
-        llvm::errs() << "parallel PIM activation feed did not report its checked plan\n";
-        return false;
-      }
-      auto value = json::parse(stats.pimActivationPlanJson);
-      if (!value) { llvm::errs() << llvm::toString(value.takeError()) << '\n'; return false; }
-      phaseReport["pim_activation_cores"] = stats.pimActivationCores;
-      phaseReport["pim_activation_plan"] = std::move(*value);
-      ++parallelActivationPhases;
-    }
     report.push_back(std::move(phaseReport));
-  }
-  if (pimActivationCores == 4 && parallelActivationPhases == 0) {
-    llvm::errs() << "--pim-activation-cores=4 did not find a supported isolated PIM activation-feed phase\n";
-    return false;
   }
   return true;
 }

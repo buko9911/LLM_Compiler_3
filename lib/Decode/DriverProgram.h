@@ -20,15 +20,14 @@ namespace mlir::hybrid::driver {
 bool emitPimCommands(pim::Program &prog, std::vector<pim::Primitive> &pimCommands);
 
 /// system.json pim_kernel: the PIM kernel configuration of the program.
-void setPimKernel(plena::ProgramBuilder &program, const pim::Program &prog, bool fixedStorage,
-                  uint32_t pimCommandCount);
+void setPimKernel(plena::ProgramBuilder &program, const pim::Program &prog);
 
 /// The phases called by `step`, in program order: one PIM record per PIM phase, the NPU codegen
 /// records of every NPU phase. `exit` is the records the next phase follows; `report` gets the
 /// io.json entry of every phase.
 bool emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
                 const std::vector<pim::Primitive> &pimCommands, const TargetSpec &spec,
-                plena::ProgramBuilder &program, LP6Extra &extra, int pimActivationCores,
+                plena::ProgramBuilder &program, LP6Extra &extra,
                 std::vector<int> &exit, int &logicalCores, llvm::json::Array &report, std::string &err);
 
 /// The final "collect" phase: the step outputs into L1 (read back from the SRAM dump), and with

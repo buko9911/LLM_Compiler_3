@@ -105,17 +105,6 @@ private:
   std::string opError;
 
   std::vector<NpuPhaseStats::WeightStream> weightStreams;
-  struct ParallelActivationFeed {
-    Operation *copy = nullptr;
-    int64_t m = 0, k = 0, batchPackets = 0;
-    std::vector<int> ranks;
-    uint64_t sharedQ = 0, qBytes = 0, dupBytes = 0;
-    uint64_t qL1 = 0, scaleL1 = 0, l1Peak = 0;
-    int publishEvent = -1;
-    std::vector<int> storeEvents;
-    std::vector<int64_t> activationIds;
-  };
-  std::optional<ParallelActivationFeed> parallelActivationFeed;
   // hyb.read_after_gather: the GDMA reads of the PIM results so far, the last one per core, and whether the copy being
   // lowered waits for them (its GDMA reads then queue behind them in the DMA read engine).
   std::map<int, int> lastGatherRead;
@@ -344,9 +333,6 @@ private:
 
   // ---- PIM boundary (CodegenPim.cpp) ---------------------------------------------------------
   LogicalResult gatherPimOut(const View &s, const View &d, std::string &err);
-  LogicalResult planParallelActivationFeed(func::FuncOp fn, std::string &err);
-  LogicalResult scatterPimActParallel(const View &s, const View &, std::string &err);
-  std::string parallelActivationPlanJSON() const;
   LogicalResult scatterPimAct(const View &s, const View &d, std::string &err);
   LogicalResult scatterPimActCores(const View &s, const View &d, int feedCores, std::string &err);
   void storeActivationPackets(int64_t actIndex, uint64_t l2, int64_t first, int64_t count);
@@ -358,6 +344,10 @@ private:
   LogicalResult lowerMatmul(linalg::LinalgOp mm, std::string &err);
   LogicalResult lowerGemv(linalg::GenericOp g, std::string &err);
   LogicalResult lowerQuant(hyb::QuantOp q, std::string &err);
+  LogicalResult lowerQuantCores(hyb::QuantOp q, std::string &err);
+  void quantMax(uint64_t src, int64_t K);
+  void quantApply(uint64_t src, uint64_t dst, int64_t K);
+  std::optional<uint64_t> quantSourceL2;
   void reduceToScalar(uint64_t src, int64_t elements, uint32_t funct, uint64_t dst);
   LogicalResult lowerDequant(hyb::DequantOp d, std::string &err, int64_t row0 = 0, int64_t rows = -1,
                              int64_t col0 = 0, int64_t cols = -1);

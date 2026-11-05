@@ -209,14 +209,14 @@ bool pays(func::FuncOp fn, const Rope &r, const TargetSpec &target) {
   double cycles = cost::genericCycles(target.npu, r.rope) + cost::genericCycles(target.npu, r.negation) + copy;
   if (r.transpose) cycles += copy;
   int64_t cores = largestDivisorAtMost(x.getDimSize(1), target.npu.cores);
-  bool split = cost::splitPays(target.npu, cycles, cores);
+  bool split = cost::splitPays(target.npu, fn, cycles, cores);
   std::string label;
   llvm::raw_string_ostream os(label);
   os << "rope " << r.x.getType();
   cost::recordDecision(fn, "split rope", label, split ? "split" : "one core",
                        {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(target.npu)},
                         {"saving_us", cost::splitSavingUs(target.npu, cycles, cores)},
-                        {"split_cost_us", target.npu.coreSplitUs}});
+                        {"split_cost_us", cost::splitCostUs(target.npu, fn)}});
   return split;
 }
 

@@ -183,7 +183,7 @@ def main():
         # tiny fixtures exercise the distributed code with no split cost.
         for mode, enabled in (("compiler", True),):
             spec = json.loads((root / "configs/target.json").read_text())
-            spec["npu"].update(l2_staging_bytes_per_core=0, core_split_us=0)
+            spec["npu"].update(l2_staging_bytes_per_core=0, core_split_us=0, core_split_no_stream_us=0)
             target = case / f"{mode}.json"
             target.write_text(json.dumps(spec, indent=2))
             build = case / mode

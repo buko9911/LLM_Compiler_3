@@ -27,7 +27,8 @@ two disagree.
 | `gdma_read_gbps` | 101.1 | measured | Sustained LP6 read of one GDMA, link 64 B/cycle (`v2_lp6_bandwidth_micro.py`, 7 MiB, 2026-11-04) |
 | `ldma_gbps_per_core` | 26.9 | measured | Sustained L2 -> L1 local DMA per core (same tool, 4 cores 107.65 GB/s) |
 | `command_fetch_words_per_cycle` | 4 | simulator | System command words read per cycle (`fetch_words_per_cycle` in the NPU settings) |
-| `core_split_us` | 0.5 | measured | Fixed cost of running one op on 4 cores instead of 1, Qwen3-4B 1-layer, M = 1, 4, 8 (2026-10-31) |
+| `core_split_us` | 0.5 | measured | Fixed cost of running one op on 4 cores instead of 1 in a phase with an NPU GEMV (weights stream through L2 and the local DMA), Qwen3-4B 1-layer, M = 1, 4, 8 (2026-10-31). 2-layer M = 1, 8 re-measured 2026-11-05: 0.5 is the fastest for M = 1 (6,005.1 us against 6,014.7 at 0.2) and within 0.05% for M = 8 |
+| `core_split_no_stream_us` | 0.2 | measured | The same in a phase without an NPU GEMV: the local DMA is free. Qwen3-4B 2-layer, NPU+PIM one and two ranks, M = 1, 3, 4, swept 0.1, 0.2, 0.3, 0.5 (2026-11-05): 0.2 is within 0.05% of the fastest at every point, 0.5 is 1.2% slower at M = 1 |
 | `gemv_fixed_us` | 2.0 | estimate | Fixed cost per NPU GEMV in `hyb-partition` |
 | `l1_reserved_bytes`, `l2_staging_bytes_per_core` | 256 KiB, 0 | plan | L1 constant pool and scratch; 0 sizes the L2 staging window per phase |
 | `gemv_tile_bytes`, `input_tile_columns`, `weight_stream_max_slots`, `gdma_lookahead`, `staging_misc_bytes` | 128 KiB, 128, 0, 2, 64 KiB | plan | Tile sizes and weight stream limits |

@@ -12,7 +12,7 @@
 //
 // Whether an op (or a row chain) is split is a cost comparison, never a step kind: one core's VPU
 // time for it (NpuCost.h, from its shape and body) against the time `cores` cores save and the
-// fixed cost of a split (npu.core_split_us). Every choice is recorded in hyb.decisions.
+// fixed cost of a split (cost::splitCostUs). Every choice is recorded in hyb.decisions.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/PassSupport.h"
@@ -55,13 +55,13 @@ double oneCoreCycles(Operation *op, const TargetSpec &target) {
 bool splitDecision(func::FuncOp fn, Operation *op, StringRef kind, double cycles, int64_t cores,
                    const TargetSpec &target) {
   const auto &npu = target.npu;
-  bool split = cost::splitPays(npu, cycles, cores);
+  bool split = cost::splitPays(npu, fn, cycles, cores);
   std::string label;
   llvm::raw_string_ostream os(label);
   os << op->getName().getStringRef() << ' ' << op->getResult(0).getType();
   cost::recordDecision(fn, kind, label, split ? "split" : "one core",
                        {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(npu)},
-                        {"saving_us", cost::splitSavingUs(npu, cycles, cores)}, {"split_cost_us", npu.coreSplitUs}});
+                        {"saving_us", cost::splitSavingUs(npu, cycles, cores)}, {"split_cost_us", cost::splitCostUs(npu, fn)}});
   return split;
 }
 

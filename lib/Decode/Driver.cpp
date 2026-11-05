@@ -12,14 +12,12 @@
 //   lp6.bin                LP6 image: FP16 dense weights, per-row weight scales, PIM weight
 //                          packets (INT8, per-row symmetric), NPU constant pools
 // This file holds the options and the order of the steps; DriverProgram.cpp emits the program,
-// DriverPackage.cpp the metadata files, DriverImage.cpp the image, and DriverStorage.cpp the
-// fixed PIM weight storage import / export.
+// DriverPackage.cpp the metadata files and DriverImage.cpp the image.
 //===----------------------------------------------------------------------===//
 
 #include "DriverImage.h"
 #include "DriverPackage.h"
 #include "DriverProgram.h"
-#include "DriverStorage.h"
 #include "npu/Decode/Dialect/Hyb/HybDialect.h"
 #include "npu/Decode/Support/TargetSpec.h"
 #include "npu/Decode/Target/NpuCodegen.h"
@@ -62,15 +60,6 @@ static cl::opt<std::string> flashAttention("flash-attention",
     cl::init("auto"));
 static cl::list<std::string> mapOverrides("map", cl::desc("substring:target, e.g. --map=o_proj:npu (repeatable)"));
 static cl::opt<bool> noImage("no-image", cl::desc("do not write lp6.bin"), cl::init(false));
-static cl::opt<std::string> weightStorageExport("pim-weight-storage-export",
-    cl::desc("export verified PIM-only weight/scale storage (requires image generation)"), cl::init(""));
-static cl::opt<std::string> weightStorageImport("pim-weight-storage-import",
-    cl::desc("fix PIM weight/scale PA from a verified manifest; omitted ping-pong option follows manifest"), cl::init(""));
-static cl::opt<std::string> packetNpu("pim-packet-npu",
-    cl::desc("g4: opt-in NPU packet kernel; requires --force=npu and imported PIM weight storage"), cl::init(""));
-static cl::opt<int> pimActivationCores("pim-activation-cores",
-    cl::desc("1 default; 4 opts into checked isolated quant/PIM activation-feed parallelism with --force=pim"),
-    cl::init(1));
 static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
     cl::desc("PIM weight rows on alternating bank sets: -1 the target's pim.bankset_pingpong_lead (default), "
              "0 off, 1 lead 12, 2..63 lead"), cl::init(-1));
@@ -88,25 +77,9 @@ double seconds(std::chrono::steady_clock::time_point t0) {
   return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 }
 
-/// Combinations of the experimental PIM options that the driver supports.
-bool checkOptions(bool fixedStorage) {
+bool checkOptions() {
   if (flashAttention != "auto" && flashAttention != "on" && flashAttention != "off") {
     llvm::errs() << "--flash-attention must be auto, on or off\n";
-    return false;
-  }
-  if ((pimActivationCores != 1 && pimActivationCores != 4) ||
-      (pimActivationCores == 4 &&
-       (forceTarget != "pim" || !mapOverrides.empty() || !packetNpu.empty()))) {
-    llvm::errs() << "PIM activation cores must be 1 or 4; 4 requires --force=pim, no --map overrides, and no --pim-packet-npu\n";
-    return false;
-  }
-  if (!packetNpu.empty() &&
-      (packetNpu != "g4" || weightStorageImport.empty() || forceTarget != "npu" || !mapOverrides.empty())) {
-    llvm::errs() << "PIM packet NPU requires g4, --force=npu, --pim-weight-storage-import, and no --map overrides\n";
-    return false;
-  }
-  if (fixedStorage && noImage) {
-    llvm::errs() << "PIM weight storage import/export is incompatible with --no-image: content verification is required\n";
     return false;
   }
   return true;
@@ -116,9 +89,7 @@ bool checkOptions(bool fixedStorage) {
 /// bypass the checks of the CLI options that set them or pretend a pass already ran.
 constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     // CLI requests (set on the module before the pipeline runs).
-    "hyb.pim_weight_storage_requested", "hyb.pim_weight_storage_import", "hyb.pim_packet_npu_requested",
     // PIM packet kernel and 4-core activation feed.
-    "hyb.npu_packet", "hyb.npu_kernel", "hyb.packet_projection", "hyb.packet_plan", "hyb.pim_activation_plan",
     // hyb-npu-projection-fusion
     "hyb.weight_segments", "hyb.projection_fusions",
     // hyb-npu-flash-attention
@@ -213,30 +184,7 @@ int compileDecode(int argc, char **argv) {
   hybrid::registerHybridPasses();
   cl::ParseCommandLineOptions(argc, argv, "hybrid NPU + LPDDR6-PIM compiler\n");
   auto t0 = std::chrono::steady_clock::now();
-  // The import may be this output directory's previous verified sidecar. Keep
-  // its bytes before unlinking the old artifact; validate them after cleanup.
-  std::unique_ptr<llvm::MemoryBuffer> importedStorageBuffer;
-  std::error_code importedStorageReadError;
-  if (!weightStorageImport.empty()) {
-    auto file = llvm::MemoryBuffer::getFile(weightStorageImport);
-    if (file) importedStorageBuffer = std::move(*file);
-    else importedStorageReadError = file.getError();
-  }
-  // A reused output directory must not retain a previous content-verification
-  // sidecar when this invocation fails even before reading its input graph.
-  if (auto ec = llvm::sys::fs::remove(outDir + "/pim_weight_storage_verified.json")) {
-    llvm::errs() << "cannot remove previous PIM weight storage verification: " << ec.message() << '\n';
-    return 1;
-  }
-  const bool fixedStorage = !weightStorageExport.empty() || !weightStorageImport.empty();
-  std::optional<::npu::decode::PimWeightStorage> importedStorage;
-  if (!checkOptions(fixedStorage)) return 1;
-  if (!weightStorageImport.empty()) {
-    importedStorage = driver::parsePimWeightStorageImport(importedStorageBuffer.get(), importedStorageReadError,
-                                                          banksetPingPong, banksetPingPong.getNumOccurrences());
-    if (!importedStorage) return 1;
-    banksetPingPong = importedStorage->banksetPingPongLead;
-  }
+  if (!checkOptions()) return 1;
 
   DialectRegistry registry;
   registerAllDialects(registry);
@@ -259,13 +207,6 @@ int compileDecode(int argc, char **argv) {
     llvm::errs() << "reserved compiler IR attributes are driver-owned; use the CLI with a frontend graph\n";
     return 1;
   }
-  if (fixedStorage) module->getOperation()->setAttr("hyb.pim_weight_storage_requested", UnitAttr::get(&ctx));
-  if (importedStorage)
-    module->getOperation()->setAttr("hyb.pim_weight_storage_import",
-        StringAttr::get(&ctx, llvm::formatv("{0}", ::npu::decode::toJSON(*importedStorage)).str()));
-  if (!packetNpu.empty())
-    module->getOperation()->setAttr("hyb.pim_packet_npu_requested", StringAttr::get(&ctx, packetNpu.getValue()));
-
   std::string overrideOpt;
   for (const std::string &m : mapOverrides) overrideOpt += (overrideOpt.empty() ? " overrides=" : ";") + m;
   std::string pipeline = decodePipeline(overrideOpt);
@@ -302,14 +243,6 @@ int compileDecode(int argc, char **argv) {
     return 1;
   }
   pim::Program prog = ::npu::decode::fromJSON(*planJson);
-  if (!packetNpu.empty()) {
-    int packetPhases = 0;
-    for (auto fn : mod.getOps<func::FuncOp>()) packetPhases += fn->hasAttr("hyb.npu_kernel");
-    if (packetPhases != 1 || prog.projections.size() != 1 || !prog.activations.empty() || !prog.phases.empty()) {
-      llvm::errs() << "PIM packet NPU g4 currently supports one projection with storage-only PIM metadata\n";
-      return 1;
-    }
-  }
   uint64_t denseEnd = uint64_t(mod->getAttrOfType<IntegerAttr>("hyb.lp6_dense_end").getInt());
   uint64_t extraLimit = uint64_t(mod->getAttrOfType<IntegerAttr>("hyb.lp6_extra_limit").getInt());
   LP6Extra extra{denseEnd, extraLimit, {}};
@@ -318,20 +251,16 @@ int compileDecode(int argc, char **argv) {
   std::vector<pim::Primitive> pimCommands;
   if (!driver::emitPimCommands(prog, pimCommands)) return 1;
   const uint32_t pimCommandCount = uint32_t(pimCommands.size());
-  if (!packetNpu.empty() && pimCommandCount != 0) {
-    llvm::errs() << "PIM packet NPU storage-only plan unexpectedly emitted PIM commands\n";
-    return 1;
-  }
   if (!driver::writePimPrimitives(outDir, pimCommands)) return 1;
 
   // ---- NPU / PIM phases in program order, one program --------------------------------------
   plena::ProgramBuilder program;
   program.traceOperations = std::getenv("HYBRID_PROFILE_OPERATIONS") != nullptr;
-  driver::setPimKernel(program, prog, fixedStorage, pimCommandCount);
+  driver::setPimKernel(program, prog);
   std::vector<int> exit;           // records the next phase follows
   int logicalCores = 1;
   json::Array report;
-  if (!driver::emitPhases(mod, step, prog, pimCommands, *spec, program, extra, pimActivationCores,
+  if (!driver::emitPhases(mod, step, prog, pimCommands, *spec, program, extra,
                           exit, logicalCores, report, err))
     return 1;
 
@@ -358,25 +287,11 @@ int compileDecode(int argc, char **argv) {
                   std::move(outputs), std::move(report), std::move(missing));
   llvm::outs() << llvm::formatv("codegen: {0:f1} s, {1} PIM commands, LP6 image {2:f2} GB\n", seconds(t0),
                                 pimCommandCount, double(imageBytes) / 1e9);
-  // This checked plan is produced during ISA emission, after the initial IR dump.
-  // Preserve it even without a storage manifest or with --no-image.
-  if (pimActivationCores > 1) {
-    std::error_code ec;
-    llvm::raw_fd_ostream os(outDir + "/compiled.mlir", ec);
-    if (ec) { llvm::errs() << ec.message() << '\n'; return 1; }
-    mod.print(os, OpPrintingFlags().elideLargeElementsAttrs());
-  }
   if (noImage) return 0;
 
   // ---- LP6 image -----------------------------------------------------------------------------
-  ::npu::decode::PimWeightStorage storage;
   size_t quantized = 0;
-  if (!driver::writeImage(model, outDir, imageBytes, mod, step, prog, *spec, extra, fixedStorage, importedStorage,
-                          storage, quantized, err))
-    return 1;
-  if (fixedStorage &&
-      !driver::finishPimWeightStorage(storage, importedStorage, mod, ctx, outDir, weightStorageExport, err))
-    return 1;
+  if (!driver::writeImage(model, outDir, imageBytes, mod, step, prog, *spec, extra, quantized, err)) return 1;
   llvm::outs() << llvm::formatv("image: {0:f1} s ({1} quantized weights)\n", seconds(t0), quantized);
   return 0;
 }

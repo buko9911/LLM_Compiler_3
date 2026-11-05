@@ -58,13 +58,18 @@ double copyCyclesPerElement(const TargetSpec::Npu &npu, int64_t bytes);
 double transposeCycles(const TargetSpec::Npu &npu, ArrayRef<int64_t> outputShape, ArrayRef<int64_t> permutation,
                        int64_t elementBytes);
 
+/// The fixed cost of splitting an op of phase `fn` over the cores. A phase with an NPU GEMV streams weights through L2 and
+/// the local DMA, so the op's exchange between the cores competes with the stream (npu.core_split_us); without one the
+/// local DMA is free (npu.core_split_no_stream_us).
+double splitCostUs(const TargetSpec::Npu &npu, func::FuncOp fn);
+
 /// Splitting work of `cycles` on one core over `cores` cores saves (1 - 1/cores) of it; it pays when
-/// that saving exceeds the fixed cost of a split (coreSplitUs).
+/// that saving exceeds the fixed cost of a split.
 inline double splitSavingUs(const TargetSpec::Npu &npu, double cycles, int64_t cores) {
   return cores > 1 ? cycles * (1.0 - 1.0 / double(cores)) / cyclesPerUs(npu) : 0.0;
 }
-inline bool splitPays(const TargetSpec::Npu &npu, double cycles, int64_t cores) {
-  return cores > 1 && splitSavingUs(npu, cycles, cores) > npu.coreSplitUs;
+inline bool splitPays(const TargetSpec::Npu &npu, func::FuncOp fn, double cycles, int64_t cores) {
+  return cores > 1 && splitSavingUs(npu, cycles, cores) > splitCostUs(npu, fn);
 }
 
 /// Appends {kind, op, choice, numbers...} to the phase's `hyb.decisions` (io.json phases[].decisions).

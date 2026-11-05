@@ -83,7 +83,7 @@ def main():
     # (source args, spec overrides, expected distributed ops, partition axis/cores).
     cases = {
         "m8_rows": ({}, {}, 1, (0, 4)),
-        "m1_columns": ({"rows": 1}, {"core_split_us": 0}, 1, (1, 4)),
+        "m1_columns": ({"rows": 1}, {"core_split_us": 0, "core_split_no_stream_us": 0}, 1, (1, 4)),
         # 9728 elements on one core take about 1.5 us, so four cores save more than core_split_us.
         "m1_cost_rule": ({"rows": 1}, {}, 1, (1, 4)),
         "broadcast_columns": ({"broadcast": True}, {}, 1, (0, 4)),
@@ -91,13 +91,13 @@ def main():
         "strided_view": ({"strided_input": True}, {}, 1, (0, 4)),
         "read_destination": ({"read_init": True}, {}, 0, None),
         "producer_consumer": ({"chain": True}, {}, 2, (0, 4)),
-        "row_divisor_tail": ({"rows": 6, "columns": 65}, {"core_split_us": 0}, 1, (0, 3)),
-        "inner_divisor": ({"rows": 1, "columns": 96}, {"core_split_us": 0}, 1, (1, 3)),
+        "row_divisor_tail": ({"rows": 6, "columns": 65}, {"core_split_us": 0, "core_split_no_stream_us": 0}, 1, (0, 3)),
+        "inner_divisor": ({"rows": 1, "columns": 96}, {"core_split_us": 0, "core_split_no_stream_us": 0}, 1, (1, 3)),
         # The cost rule (NpuCost.h): the same op stays on one core when splitting saves less than the
         # fixed cost of a split, and is split when the cost is lowered.
-        "cost_one_core": ({"rows": 1, "columns": 96}, {"core_split_us": 0.5}, 0, None),
-        "cost_split": ({"rows": 1, "columns": 96}, {"core_split_us": 0.001}, 1, (1, 3)),
-        "inner_unaligned": ({"rows": 1, "columns": 100}, {"core_split_us": 0}, 0, None),
+        "cost_one_core": ({"rows": 1, "columns": 96}, {"core_split_us": 0.5, "core_split_no_stream_us": 0.5}, 0, None),
+        "cost_split": ({"rows": 1, "columns": 96}, {"core_split_us": 0.001, "core_split_no_stream_us": 0.001}, 1, (1, 3)),
+        "inner_unaligned": ({"rows": 1, "columns": 100}, {"core_split_us": 0, "core_split_no_stream_us": 0}, 0, None),
         "single_core": ({}, {"cores": 1}, 0, None),
         "small": ({"rows": 1, "columns": 32}, {}, 0, None),
         "capacity": ({}, {"l1_bytes": 262400}, 0, None),

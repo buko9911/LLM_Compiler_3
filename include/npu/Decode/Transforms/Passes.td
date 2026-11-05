@@ -194,7 +194,8 @@ def HybNpuGemvEpilogue : Pass<"hyb-npu-gemv-epilogue", "ModuleOp"> {
   let description = [{
     A single-consumer GEMV + dequant is split by output columns over the cores; each core
     dequantizes its own INT32 partition and publishes only FP16, so the INT32 result no longer
-    round-trips through L2. hyb-npu-tile then tiles the weights inside each partition.
+    round-trips through L2. hyb-npu-tile then tiles the weights inside each partition. The dequants of PIM results and
+    the one elementwise op that reads only them (SiLU * up) run in one core loop when the split pays (NpuCost.h).
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
   let dependentDialects = ["hyb::HybDialect", "tensor::TensorDialect", "linalg::LinalgDialect",
@@ -252,7 +253,7 @@ def HybNpuActivationResidency : Pass<"hyb-npu-activation-residency", "ModuleOp">
     CSE may let phase-local activations share the tensor.empty of an escaping output, so that
     bufferization writes them into the phase's LP6 out-parameter. Each escaping output gets a
     private destination; the local values then stay on chip (hyb-npu-place puts shared ones in
-    L2). Runs on every NPU phase, also next to PIM phases; not with --pim-packet-npu.
+    L2). Runs on every NPU phase, also next to PIM phases.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
   let dependentDialects = ["tensor::TensorDialect", "func::FuncDialect"];
@@ -361,12 +362,13 @@ def HybNpuMemPlan : Pass<"hyb-npu-memplan", "ModuleOp"> {
 }
 
 def HybPimBoundary : Pass<"hyb-pim-boundary", "ModuleOp"> {
-  let summary = "Order LP6 reads after small PIM results; share the activation feed among the cores";
+  let summary = "Order LP6 reads after small PIM results; share the activation feed and the quant among the cores";
   let description = [{
     Decides from sizes and hardware numbers. An LP6 read larger than the PIM results read before it in the phase gets
     `hyb.read_after_gather`: it queues behind them in the in-order DMA read engine. An activation copy of a phase whose
     quant ran on one core gets `hyb.feed_cores` when sharing the copy among the cores saves time (publishing the input
-    costs less than the local DMA it divides). Every choice is recorded on the phase.
+    costs less than the local DMA it divides). The quant of one row with such a feed gets `hyb.quant_cores` when the cores
+    exchanging their maxima and quantizing and feeding their own columns costs less. Every choice is recorded on the phase.
   }];
   let options = [Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
 }

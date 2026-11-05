@@ -5,7 +5,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "DriverImage.h"
-#include "DriverStorage.h"
 #include "npu/Decode/Support/SafeTensors.h"
 #include "npu/Decode/Transforms/Passes.h"
 #include "llvm/Support/JSON.h"
@@ -105,8 +104,7 @@ private:
 
 bool driver::writeImage(const std::string &model, const std::string &outDir, uint64_t imageBytes, ModuleOp mod,
                         func::FuncOp step, const pim::Program &prog, const TargetSpec &spec, const LP6Extra &extra,
-                        bool fixedStorage, const std::optional<::npu::decode::PimWeightStorage> &importedStorage,
-                        ::npu::decode::PimWeightStorage &storage, size_t &quantized, std::string &err) {
+                        size_t &quantized, std::string &err) {
   auto st = SafeTensors::open(model, err);
   if (!st) {
     llvm::errs() << err << "\n";
@@ -146,7 +144,6 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
     std::vector<int64_t> shape;
   };
   std::map<std::string, std::vector<NpuWeight>> npuWeights;
-  std::map<std::string, std::pair<uint64_t, uint64_t>> scaleSlots;
   if (auto wa = mod->getAttrOfType<StringAttr>("hyb.weights"))
     if (auto wj = json::parse(wa.getValue()))
       for (const json::Value &v : *wj->getAsArray()) {
@@ -156,13 +153,7 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
         npuWeights[o->getString("name")->str()].push_back(
             {o->getString("layout")->str(), uint64_t(*o->getInteger("addr")),
              uint64_t(*o->getInteger("bytes")),std::move(shape)});
-        if (fixedStorage && o->getString("layout") == "row_scale")
-          scaleSlots[o->getString("name")->str()] = {uint64_t(*o->getInteger("addr")), uint64_t(*o->getInteger("bytes"))};
       }
-  std::map<std::string, size_t> storageIndex;
-  if (fixedStorage &&
-      !collectPimWeightStorage(prog, scaleSlots, spec.lp6.capacityBytes, storage, storageIndex))
-    return false;
   std::vector<std::string> names;
   for (const pim::Projection &p : prog.projections)
     if (std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
@@ -180,16 +171,6 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
       llvm::errs() << msg << "\n";
       ok = false;
     };
-    ::npu::decode::PimWeightStorageEntry *storageWeight = nullptr;
-    const ::npu::decode::PimWeightStorageEntry *expectedStorage = nullptr;
-    if (fixedStorage) {
-      const auto index = storageIndex.find(names[i]);
-      if (index == storageIndex.end()) return fail("PIM weight storage unsupported non-PIM matrix " + names[i]);
-      storageWeight = &storage.weights[index->second];
-      if (importedStorage) expectedStorage = &importedStorage->weights[index->second];
-      std::string sourceError = recordStorageSource(*st, names[i], storageWeight, expectedStorage);
-      if (!sourceError.empty()) return fail(sourceError);
-    }
     if (!quantizeRows(*st, names[i], q, s, n, k, e)) return fail(e);
     if (auto it = npuWeights.find(names[i]); it != npuWeights.end())
       for (const NpuWeight &nw : it->second) {
@@ -197,12 +178,6 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
           if (nw.bytes != uint64_t(n)*4 || nw.shape != std::vector<int64_t>{n})
             return fail("row_scale shape mismatch: " + names[i]);
           img.write(nw.addr, s.data(), s.size() * 4);
-          if (storageWeight) {
-            ::npu::decode::PimStorageDigest h;
-            h.text("lp6-pim-scale-v1"); h.integer(nw.addr); h.integer(s.size() * 4);
-            h.bytes(llvm::ArrayRef<uint8_t>(reinterpret_cast<const uint8_t *>(s.data()), s.size() * 4));
-            storageWeight->scaleSHA256 = h.finish();
-          }
         } else if (nw.layout == "npu_nk32") {
           if (n % 32) return fail("npu_nk32 needs N % 32 == 0: " + names[i]);
           if (nw.bytes != uint64_t(n)*k || nw.shape != std::vector<int64_t>{n/32,k,32})
@@ -221,21 +196,10 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
     for (const pim::Projection &p : prog.projections) {
       if (p.name != names[i]) continue;
       if (p.n != n || p.k != k) return fail("projection " + p.name + " shape mismatch");
-      ::npu::decode::PimStorageDigest packetDigest;
-      if (storageWeight) packetDigest.text("lp6-pim-packet-v1");
       prog.forEachWeightPacket(p, q.data(), [&](uint64_t addr, const std::array<uint8_t, 32> &pkt) {
         img.write(addr, pkt.data(), 32);
-        if (storageWeight) {
-          packetDigest.integer(addr);
-          packetDigest.bytes(llvm::ArrayRef<uint8_t>(pkt.data(), pkt.size()));
-        }
       });
-      if (storageWeight) storageWeight->packetSHA256 = packetDigest.finish();
     }
-    if (expectedStorage && storageWeight->packetSHA256 != expectedStorage->packetSHA256)
-      return fail("PIM weight storage packet SHA256 mismatch: " + names[i]);
-    if (expectedStorage && storageWeight->scaleSHA256 != expectedStorage->scaleSHA256)
-      return fail("PIM weight storage scale SHA256 mismatch: " + names[i]);
   });
   if (!ok) return false;
   quantized = names.size();

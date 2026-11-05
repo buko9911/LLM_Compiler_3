@@ -48,7 +48,6 @@ struct NpuPhaseInput {
   const pim::Program *pim = nullptr;
   const TargetSpec *spec = nullptr;
   plena::ProgramBuilder *program = nullptr;   // the step's single program (phase already begun)
-  int pimActivationCores = 1;            // explicit bounded isolated quant/activation-feed experiment
   CarriedAccesses *carried = nullptr;    // in: the previous NPU phase's accesses; out: this phase's
   // NPU+PIM: the PIM phase just before this one, the LP6 ranks it computes on and the records it waited
   // for. A GDMA that touches none of those ranks and has no other hazard follows `beforePim` instead of
@@ -60,8 +59,6 @@ struct NpuPhaseStats {
   int64_t coreWords = 0, commands = 0, l1Peak = 0, cores = 1;
   int64_t l2StagingPerCore = 0;
   int64_t stagingMiscBytes = 0;          // npu.staging_misc_bytes as planned for the phase
-  int64_t pimActivationCores = 1;
-  std::string pimActivationPlanJson;      // checked scratch/ownership plan when parallel feed is used
   struct WeightStream {
     int64_t tileBytes, iterations, slots, batch;
     bool prefetch, crossBatch;

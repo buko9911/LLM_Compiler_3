@@ -30,27 +30,6 @@ json::Array driver::shapeOf(Type t) {
   return a;
 }
 
-bool driver::writeAtomicJSON(const std::string &path, const json::Value &value, std::string &err) {
-  llvm::SmallString<256> parent(path), temporary;
-  llvm::sys::path::remove_filename(parent);
-  if (!parent.empty())
-    if (auto ec = llvm::sys::fs::create_directories(parent)) { err = ec.message(); return false; }
-  int fd = -1;
-  if (auto ec = llvm::sys::fs::createUniqueFile(path + ".tmp-%%%%%%", fd, temporary)) {
-    err = ec.message(); return false;
-  }
-  llvm::raw_fd_ostream os(fd, true);
-  os << llvm::formatv("{0:2}", value) << '\n';
-  os.close();
-  if (os.has_error()) {
-    err = "cannot write " + path; llvm::sys::fs::remove(temporary); return false;
-  }
-  if (auto ec = llvm::sys::fs::rename(temporary, path)) {
-    err = ec.message(); llvm::sys::fs::remove(temporary); return false;
-  }
-  return true;
-}
-
 void driver::removeStaleOutputs(const std::string &outDir) {
   std::error_code ec;
   for (llvm::sys::fs::directory_iterator it(outDir, ec), end; it != end && !ec; it.increment(ec)) {
@@ -116,20 +95,4 @@ void driver::writeIO(const std::string &outDir, const std::string &manifestFile,
   std::error_code ec;
   llvm::raw_fd_ostream os(outDir + "/io.json", ec);
   os << llvm::formatv("{0:1}", json::Value(std::move(io))) << "\n";
-}
-
-bool driver::addStorageToIO(const std::string &outDir, const std::string &layoutHash,
-                            const std::string &manifestHash, std::string &err) {
-  auto file = llvm::MemoryBuffer::getFile(outDir + "/io.json");
-  if (!file) { llvm::errs() << "cannot update verified storage io.json\n"; return false; }
-  auto io = json::parse((*file)->getBuffer());
-  if (!io || !io->getAsObject()) {
-    if (!io) llvm::consumeError(io.takeError());
-    llvm::errs() << "invalid generated io.json\n"; return false;
-  }
-  (*io->getAsObject())["pim_weight_storage"] = json::Object{
-    {"layout_sha256", layoutHash}, {"manifest_sha256", manifestHash}, {"content_verified", true},
-    {"verified_manifest", "pim_weight_storage_verified.json"}};
-  if (!writeAtomicJSON(outDir + "/io.json", *io, err)) { llvm::errs() << err << '\n'; return false; }
-  return true;
 }

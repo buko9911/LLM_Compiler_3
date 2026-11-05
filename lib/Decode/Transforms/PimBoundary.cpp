@@ -10,6 +10,9 @@
 //    groups x subchannels of one DRAM column). One core copies at the local DMA rate of one core. The copy gets
 //    `hyb.feed_cores`, the number of cores that share it, when publishing the input to the others costs less than it
 //    saves.
+//  * Quant of one row with that feed. The scale is the maximum over the row, so the quant runs on one core and its input
+//    and output cross L2. It gets `hyb.quant_cores` when the cores exchanging their maxima and quantizing and feeding
+//    their own columns costs less.
 //===----------------------------------------------------------------------===//
 
 #include "npu/Decode/Transforms/NpuCost.h"
@@ -45,6 +48,32 @@ int64_t bytesOf(Type t) {
 
 struct HybPimBoundaryPass : mlir::hybrid::impl::HybPimBoundaryBase<HybPimBoundaryPass> {
   using Base::Base;
+
+  /// [x(L2) -> L1 row] [hyb.quant] [Q -> activation, shared by the cores]: split when, per the numbers below, it saves
+  /// time. One core: the L2 row to L1, the VPU, Q to L2 for the others. Split: each step on K / cores, plus the exchange.
+  void splitQuant(func::FuncOp fn, memref::CopyOp feed, int64_t k, const TargetSpec &target) {
+    hyb::QuantOp quant;
+    for (Operation *op = feed->getPrevNode(); op && !quant; op = op->getPrevNode())
+      if (auto q = dyn_cast<hyb::QuantOp>(op)) quant = q;
+    if (!quant || quant.getQInit() != feed.getSource()) return;
+    memref::CopyOp input;
+    for (Operation *op = quant->getPrevNode(); op && !input; op = op->getPrevNode())
+      if (auto c = dyn_cast<memref::CopyOp>(op); c && c.getTarget() == quant.getInput()) input = c;
+    auto source = input ? dyn_cast<MemRefType>(input.getSource().getType()) : MemRefType();
+    const int cores = target.npu.cores;
+    if (!source || source.getMemorySpaceAsInt() != 2 || k % cores || (k / cores) % 32) return;
+    const double ldma = target.npu.ldmaGBpsPerCore * 1e3, vpu = double(k) * cost::quantCyclesPerElement(target.npu) / target.npu.clockMHz;
+    const double oneCoreUs = double(k) * 2 / ldma + vpu + double(k) / ldma;
+    const double splitUs = (double(k) * 2 / ldma + vpu) / cores + cost::splitCostUs(target.npu, fn);
+    const bool split = splitUs < oneCoreUs;
+    cost::recordDecision(fn, "split quant", "row K " + std::to_string(k), split ? "split" : "one core",
+                         {{"cores", double(split ? cores : 1)}, {"one_core_us", oneCoreUs}, {"split_us", splitUs}});
+    if (!split) return;
+    quant->setAttr("hyb.quant_cores", IntegerAttr::get(IntegerType::get(&getContext(), 64), cores));
+    input->setAttr("hyb.quant_source", UnitAttr::get(&getContext()));
+    feed->setAttr("hyb.quant_feeds", UnitAttr::get(&getContext()));
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     auto target = loadTargetSpec(module, spec);
@@ -55,7 +84,6 @@ struct HybPimBoundaryPass : mlir::hybrid::impl::HybPimBoundaryBase<HybPimBoundar
     step.walk([&](func::CallOp call) {
       auto fn = symbols.lookup<func::FuncOp>(call.getCallee());
       if (!fn || !fn->hasAttr(kPhase) || cast<StringAttr>(fn->getAttr(kPhase)).getValue() != "npu") return;
-      if (fn->hasAttr("hyb.npu_kernel")) return;
       auto layoutOf = [&](Value v) -> StringRef {
         auto arg = dyn_cast<BlockArgument>(rootOf(v));
         if (!arg || arg.getOwner() != &fn.getBody().front()) return {};
@@ -93,11 +121,12 @@ struct HybPimBoundaryPass : mlir::hybrid::impl::HybPimBoundaryBase<HybPimBoundar
         const int cores = target->npu.cores;
         const double replicaBytes = double(rows * k) * 32;
         const double oneCoreUs = replicaBytes / l1Copy + replicaBytes / ldma;
-        const double splitUs = double(rows * k) / ldma * (1.0 + 1.0 / cores) + oneCoreUs / cores + target->npu.coreSplitUs;
+        const double splitUs = double(rows * k) / ldma * (1.0 + 1.0 / cores) + oneCoreUs / cores + cost::splitCostUs(target->npu, fn);
         const bool split = cores > 1 && splitUs < oneCoreUs && k <= target->npu.stagingMiscBytes / 2;
         if (split) copy->setAttr("hyb.feed_cores", IntegerAttr::get(IntegerType::get(&getContext(), 64), cores));
         cost::recordDecision(fn, "input feed", "activation K " + std::to_string(k), split ? "split" : "one core",
                              {{"cores", double(split ? cores : 1)}, {"one_core_us", oneCoreUs}, {"split_us", splitUs}});
+        if (split && rows == 1) splitQuant(fn, copy, k, *target);
       });
     });
   }

@@ -20,6 +20,7 @@
     "ldma_gbps_per_core": 26.9,
     "command_fetch_words_per_cycle": 4,
     "core_split_us": 0.5,
+    "core_split_no_stream_us": 0.2,
     "l2_staging_bytes_per_core": 0,
     "l1_reserved_bytes": 262144,
     "gemv_tile_bytes": 131072,

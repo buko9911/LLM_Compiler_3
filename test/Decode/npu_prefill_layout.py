@@ -140,7 +140,7 @@ def main():
         "two_transposes": (rope_source(users=2), dict(), True, False),
         "not_rope": (rope_source(body="x*c-r*s"), dict(), False, False),
         # The split rule of NpuCost.h: splitting saves less than a split costs.
-        "split_does_not_pay": (rope_source(), dict(core_split_us=100.0), False, False),
+        "split_does_not_pay": (rope_source(), dict(core_split_us=100.0, core_split_no_stream_us=100.0), False, False),
         "pim": (rope_source(phase="pim"), dict(), False, False),
     }
     for name, (text, options, rewritten, head_major) in rope_cases.items():

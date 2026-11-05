@@ -32,8 +32,7 @@ namespace {
 struct LowerNpuGemv : OpRewritePattern<hyb::QMatmulOp> {
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(hyb::QMatmulOp op, PatternRewriter &rewriter) const override {
-    if (!op.getTarget() || *op.getTarget() != "npu" || op->getNumResults() != 1 ||
-        op->hasAttr("hyb.npu_packet")) return failure();
+    if (!op.getTarget() || *op.getTarget() != "npu" || op->getNumResults() != 1) return failure();
     auto qT = cast<RankedTensorType>(op.getInput().getType());
     auto accT = cast<RankedTensorType>(op.getResult(0).getType());
     int64_t M = qT.getDimSize(0), K = qT.getDimSize(1), N = accT.getDimSize(1);
@@ -71,18 +70,6 @@ struct LowerNpuGemv : OpRewritePattern<hyb::QMatmulOp> {
 
 struct HybLowerNpuGemvPass : mlir::hybrid::impl::HybLowerNpuGemvBase<HybLowerNpuGemvPass> {
   void runOnOperation() override {
-    auto module = getOperation()->getParentOfType<ModuleOp>();
-    if (auto requested = module->getAttrOfType<StringAttr>("hyb.pim_packet_npu_requested")) {
-      bool invalid = requested.getValue() != "g4";
-      getOperation().walk([&](hyb::QMatmulOp q) {
-        if (!q.getTarget() || *q.getTarget() != "npu") invalid = true;
-        else q->setAttr("hyb.npu_packet", requested);
-      });
-      if (invalid) {
-        getOperation().emitError("PIM packet NPU requires g4 and NPU qmatmul targets");
-        return signalPassFailure();
-      }
-    }
     RewritePatternSet patterns(&getContext());
     patterns.add<LowerNpuGemv>(&getContext());
     if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) signalPassFailure();
@@ -229,14 +216,14 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
       if (cores < 2) continue;
       // The split rule of NpuCost.h.
       double cycles = double(t.getNumElements()) * cost::dequantCyclesPerElement(target.npu);
-      bool split = cost::splitPays(target.npu, cycles, cores);
+      bool split = cost::splitPays(target.npu, fn, cycles, cores);
       std::string label;
       llvm::raw_string_ostream os(label);
       os << "hyb.dequant " << d.getInit().getType();
       cost::recordDecision(fn, "split dequant", label, split ? "split" : "one core",
                            {{"cores", double(cores)}, {"one_core_us", cycles / cost::cyclesPerUs(target.npu)},
                             {"saving_us", cost::splitSavingUs(target.npu, cycles, cores)},
-                            {"split_cost_us", target.npu.coreSplitUs}});
+                            {"split_cost_us", cost::splitCostUs(target.npu, fn)}});
       if (!split) continue;
       scf::SCFTilingOptions opts;
       opts.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);

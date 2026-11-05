@@ -27,9 +27,17 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
   FailureOr<View> s0 = viewOf(srcV, err), d0 = viewOf(dstV, err);
   if (failed(s0) || failed(d0)) return failure();
   if (s0->layout == "pim_out") return gatherPimOut(*s0, *d0, err);
+  // hyb-pim-boundary: the quant reads this L2 row core by core and feeds its own packets (lowerQuantCores).
+  if (op->hasAttr("hyb.quant_source")) {
+    if (s0->space != kL2) {
+      err = "the input of a quant split by columns must be in L2";
+      return failure();
+    }
+    quantSourceL2 = addr(*s0);
+    return success();
+  }
+  if (op->hasAttr("hyb.quant_feeds")) return success();
   if (d0->layout == "pim_act") {
-    if (parallelActivationFeed && parallelActivationFeed->copy == op)
-      return scatterPimActParallel(*s0, *d0, err);
     if (auto c = op->getAttrOfType<IntegerAttr>("hyb.feed_cores"))
       return scatterPimActCores(*s0, *d0, int(c.getInt()), err);
     return scatterPimAct(*s0, *d0, err);
@@ -360,76 +368,86 @@ LogicalResult Codegen::emitPendingDequant(int64_t done, int64_t total, std::stri
   return success();
 }
 
+/// s0 = max|x| of K FP16 elements at `src`. v2 accumulates the lane-wise max of the full chunks, a tail chunk is reduced
+/// on its own (lanes past VL are not defined).
+void Codegen::quantMax(uint64_t src, int64_t K) {
+  const int64_t full = K / 32 * 32;
+  int64_t s = 0;
+  if (full) {
+    setVL(32);
+    vload(0, src, 1);
+    emit(rform(OP_V_UN, 2, 0, 0, 0, 6));                        // v2 = |x| of chunk 0
+    s = 32;
+  }
+  // Four chunks per iteration of a hardware loop, |x| in v7..v10, then folded into v2.
+  if (const int64_t iterations = (full - s) / 128; iterations >= 2) {
+    guardLoopRange(src + uint64_t(s) * 2, src + uint64_t(s + iterations * 128) * 2, false);
+    load(kLoopPointers[0], uint32_t(src + uint64_t(s) * 2));
+    loopBegin(uint32_t(iterations));
+    for (uint32_t u = 0; u < 4; ++u) {
+      vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
+      emit(rform(OP_V_UN, 7 + u, 3 + u, 0, 0, 6));
+    }
+    for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_BIN, 2, 2, 7 + u, 0, 4));
+    advance(kLoopPointers[0], 256);
+    loopEnd();
+    s += iterations * 128;
+  }
+  for (; s < full; s += 32) {
+    setVL(32);
+    vload(0, src + s * 2, 1);
+    emit(rform(OP_V_UN, 1, 0, 0, 0, 6));                        // |x|
+    emit(rform(OP_V_BIN, 2, 2, 1, 0, 4));                       // v2 = max(v2, |x|)
+  }
+  if (full) emit(rform(OP_V_RED, 0, 2, 0, 0, 2));               // s0 = max of v2 (FP32)
+  if (K > full) {
+    setVL(uint32_t(K - full));
+    vload(0, src + full * 2, 1);
+    emit(rform(OP_V_UN, 1, 0, 0, 0, 6));
+    emit(rform(OP_V_RED, full ? 1 : 0, 1, 0, 0, 2));
+    if (full) emit(rform(OP_S_ALU, 0, 0, 1, 0, 4));             // s0 = max(s0, s1)
+  }
+}
+
+/// q[i] = round(x[i] / s0), INT8, for K FP16 elements at `src`; s0 holds the scale.
+void Codegen::quantApply(uint64_t src, uint64_t dst, int64_t K) {
+  int64_t s = 0;
+  // Four chunks per iteration through two pointers (x: 64 B, q: 32 B per chunk).
+  if (const int64_t iterations = K / 128; iterations >= 2) {
+    guardLoopRange(src, src + uint64_t(iterations * 128) * 2, false);
+    guardLoopRange(dst, dst + uint64_t(iterations * 128), true);
+    load(kLoopPointers[0], uint32_t(src));
+    load(kLoopPointers[1], uint32_t(dst));
+    setVL(32);
+    loopBegin(uint32_t(iterations));
+    for (uint32_t u = 0; u < 4; ++u) vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
+    for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_CONV, 7 + u, 3 + u, 0, 0, 1));
+    for (uint32_t u = 0; u < 4; ++u) vstoreAt(kLoopPointers[1], u * 32, 7 + u, 6);
+    advance(kLoopPointers[0], 256);
+    advance(kLoopPointers[1], 128);
+    loopEnd();
+    s = iterations * 128;
+  }
+  for (; s < K; s += 32) {
+    setVL(uint32_t(std::min<int64_t>(32, K - s)));
+    vload(0, src + s * 2, 1);
+    emit(rform(OP_V_CONV, 2, 0, 0, 0, 1));       // V_QUANT_F16_I8 with s0
+    vstore(dst + s, 2, 6);
+  }
+}
+
 LogicalResult Codegen::lowerQuant(hyb::QuantOp q, std::string &err) {
+  if (q->hasAttr("hyb.quant_cores")) return lowerQuantCores(q, err);
   FailureOr<View> X = viewOf(q.getInput(), err), Q = viewOf(q.getQInit(), err), S = viewOf(q.getScaleInit(), err);
   if (failed(X) || failed(Q) || failed(S)) return failure();
   int64_t M = X->shape[0], K = X->shape[1];
   for (int64_t m = 0; m < M; ++m) {
     uint64_t src = addr(*X, m * X->strides[0]), dst = addr(*Q, m * Q->strides[0]);
-    // s0 = max|x|: v2 accumulates the lane-wise max of the full chunks, a tail chunk is
-    // reduced on its own (lanes past VL are not defined).
-    const int64_t full = K / 32 * 32;
-    int64_t s = 0;
-    if (full) {
-      setVL(32);
-      vload(0, src, 1);
-      emit(rform(OP_V_UN, 2, 0, 0, 0, 6));                        // v2 = |x| of chunk 0
-      s = 32;
-    }
-    // Four chunks per iteration of a hardware loop, |x| in v7..v10, then folded into v2.
-    if (const int64_t iterations = (full - s) / 128; iterations >= 2) {
-      guardLoopRange(src + uint64_t(s) * 2, src + uint64_t(s + iterations * 128) * 2, false);
-      load(kLoopPointers[0], uint32_t(src + uint64_t(s) * 2));
-      loopBegin(uint32_t(iterations));
-      for (uint32_t u = 0; u < 4; ++u) {
-        vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
-        emit(rform(OP_V_UN, 7 + u, 3 + u, 0, 0, 6));
-      }
-      for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_BIN, 2, 2, 7 + u, 0, 4));
-      advance(kLoopPointers[0], 256);
-      loopEnd();
-      s += iterations * 128;
-    }
-    for (; s < full; s += 32) {
-      setVL(32);
-      vload(0, src + s * 2, 1);
-      emit(rform(OP_V_UN, 1, 0, 0, 0, 6));                        // |x|
-      emit(rform(OP_V_BIN, 2, 2, 1, 0, 4));                       // v2 = max(v2, |x|)
-    }
-    if (full) emit(rform(OP_V_RED, 0, 2, 0, 0, 2));               // s0 = max of v2 (FP32)
-    if (K > full) {
-      setVL(uint32_t(K - full));
-      vload(0, src + full * 2, 1);
-      emit(rform(OP_V_UN, 1, 0, 0, 0, 6));
-      emit(rform(OP_V_RED, full ? 1 : 0, 1, 0, 0, 2));
-      if (full) emit(rform(OP_S_ALU, 0, 0, 1, 0, 4));             // s0 = max(s0, s1)
-    }
+    quantMax(src, K);
     sload(1, uint64_t(poolL1 + scalarConst(1.0f / 127.0f)));
     emit(rform(OP_S_ALU, 0, 0, 1, 0, 3));          // s0 = max / 127
     sstore(addr(*S, m * S->strides[0]), 0);
-    s = 0;
-    // Four chunks per iteration through two pointers (x: 64 B, q: 32 B per chunk).
-    if (const int64_t iterations = K / 128; iterations >= 2) {
-      guardLoopRange(src, src + uint64_t(iterations * 128) * 2, false);
-      guardLoopRange(dst, dst + uint64_t(iterations * 128), true);
-      load(kLoopPointers[0], uint32_t(src));
-      load(kLoopPointers[1], uint32_t(dst));
-      setVL(32);
-      loopBegin(uint32_t(iterations));
-      for (uint32_t u = 0; u < 4; ++u) vloadAt(3 + u, kLoopPointers[0], u * 64, 1);
-      for (uint32_t u = 0; u < 4; ++u) emit(rform(OP_V_CONV, 7 + u, 3 + u, 0, 0, 1));
-      for (uint32_t u = 0; u < 4; ++u) vstoreAt(kLoopPointers[1], u * 32, 7 + u, 6);
-      advance(kLoopPointers[0], 256);
-      advance(kLoopPointers[1], 128);
-      loopEnd();
-      s = iterations * 128;
-    }
-    for (; s < K; s += 32) {
-      setVL(uint32_t(std::min<int64_t>(32, K - s)));
-      vload(0, src + s * 2, 1);
-      emit(rform(OP_V_CONV, 2, 0, 0, 0, 1));       // V_QUANT_F16_I8 with s0
-      vstore(dst + s, 2, 6);
-    }
+    quantApply(src, dst, K);
   }
   return success();
 }
@@ -473,15 +491,45 @@ LogicalResult Codegen::lowerDequant(hyb::DequantOp d, std::string &err, int64_t 
     rows = M;
     cols = N - col0;
   }
+  // Up to four full chunks at a time, each in its own registers, their instructions grouped so that a chunk's convert
+  // overlaps the others' (a chunk alone waits for its loads and for the convert's latency). A long row is a hardware
+  // loop over the groups: the command processor routes a core block's words at a fixed rate.
+  auto bytesB = uint64_t(B->eb);
+  auto convert = [&](uint32_t u) { emit(rform(OP_V_CONV, 3 * u + 2, 3 * u, 0, 3 * u + 1, 3)); };   // v2 = v0 * s0 * v1
   for (int64_t m = row0; m < row0 + rows; ++m) {
     sload(0, addr(*S, m * S->strides[0]));
     uint64_t src = addr(*A, m * A->strides[0]), dst = addr(*Y, m * Y->strides[0]);
-    for (int64_t s = col0; s < col0 + cols; s += 16) {
-      setVL(uint32_t(std::min<int64_t>(16, col0 + cols - s)));
-      vload(0, src + s * 4, 7);
-      vload(1, addr(*B, s), 3);
-      emit(rform(OP_V_CONV, 2, 0, 0, 1, 3));        // V_DEQUANT_I32_F16 v2 = v0 * s0 * v1
-      vstore(dst + s * 2, 2, 2);
+    int64_t s = col0;
+    const int64_t end = col0 + cols, iterations = cols / 64;
+    if (iterations >= 2) {
+      const uint64_t span = uint64_t(iterations * 64);
+      guardLoopRange(src + uint64_t(s) * 4, src + (uint64_t(s) + span) * 4, false);
+      guardLoopRange(addr(*B, s), addr(*B, s) + span * bytesB, false);
+      guardLoopRange(dst + uint64_t(s) * 2, dst + (uint64_t(s) + span) * 2, true);
+      load(kLoopPointers[0], uint32_t(src + uint64_t(s) * 4));
+      load(kLoopPointers[1], uint32_t(addr(*B, s)));
+      load(kLoopPointers[2], uint32_t(dst + uint64_t(s) * 2));
+      setVL(16);
+      loopBegin(uint32_t(iterations));
+      for (uint32_t u = 0; u < 4; ++u) vloadAt(3 * u, kLoopPointers[0], u * 64, 7);
+      for (uint32_t u = 0; u < 4; ++u) vloadAt(3 * u + 1, kLoopPointers[1], u * 16 * bytesB, 3);
+      for (uint32_t u = 0; u < 4; ++u) convert(u);
+      for (uint32_t u = 0; u < 4; ++u) vstoreAt(kLoopPointers[2], u * 32, 3 * u + 2, 2);
+      advance(kLoopPointers[0], 256);
+      advance(kLoopPointers[1], uint32_t(64 * bytesB));
+      advance(kLoopPointers[2], 128);
+      loopEnd();
+      s += int64_t(span);
+    }
+    while (s < end) {
+      const uint32_t full = uint32_t(std::min<int64_t>(4, (end - s) / 16));
+      const uint32_t group = std::max<uint32_t>(full, 1);
+      setVL(uint32_t(std::min<int64_t>(16, end - s)));
+      for (uint32_t u = 0; u < group; ++u) vload(3 * u, src + uint64_t(s + u * 16) * 4, 7);
+      for (uint32_t u = 0; u < group; ++u) vload(3 * u + 1, addr(*B, s + u * 16), 3);
+      for (uint32_t u = 0; u < group; ++u) convert(u);
+      for (uint32_t u = 0; u < group; ++u) vstore(dst + uint64_t(s + u * 16) * 2, 3 * u + 2, 2);
+      s += int64_t(group) * 16;
     }
   }
   return success();

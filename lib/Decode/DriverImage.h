@@ -21,8 +21,7 @@ namespace mlir::hybrid::driver {
 /// `quantized` is the number of quantized weights.
 bool writeImage(const std::string &model, const std::string &outDir, uint64_t imageBytes, ModuleOp mod,
                 func::FuncOp step, const pim::Program &prog, const TargetSpec &spec, const LP6Extra &extra,
-                bool fixedStorage, const std::optional<::npu::decode::PimWeightStorage> &importedStorage,
-                ::npu::decode::PimWeightStorage &storage, size_t &quantized, std::string &err);
+                size_t &quantized, std::string &err);
 
 } // namespace mlir::hybrid::driver
 

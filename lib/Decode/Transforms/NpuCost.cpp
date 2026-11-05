@@ -11,6 +11,13 @@
 using namespace mlir;
 using namespace mlir::hybrid;
 
+double cost::splitCostUs(const TargetSpec::Npu &npu, func::FuncOp fn) {
+  const bool stream = fn.walk([](linalg::GenericOp g) {
+    return g->hasAttr("hyb.npu_gemv") ? WalkResult::interrupt() : WalkResult::advance();
+  }).wasInterrupted();
+  return stream ? npu.coreSplitUs : npu.coreSplitNoStreamUs;
+}
+
 double cost::gemvTileCycles(const TargetSpec::Npu &npu, int64_t m, int64_t k, int64_t columns) {
   const double feed = std::ceil(double(k) / 32.0) * std::ceil(32.0 / double(npu.mmaKPerCycle));
   const double drain = double(npu.saRows + npu.saCols - 3 + npu.mmaPipelineCycles);

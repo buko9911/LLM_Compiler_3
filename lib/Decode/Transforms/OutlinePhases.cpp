@@ -81,7 +81,6 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
       int64_t group = -1;
       SmallVector<Operation *> ops;
       std::optional<int64_t> gemvLayer;     // layer of the NPU GEMVs in this segment
-      bool packetKernel = false;          // a single packet qmatmul owns a separate NPU phase
     };
     auto layerOf = [](StringRef weight) -> int64_t {
       size_t at = weight.find("layers.");
@@ -94,15 +93,13 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
     for (Operation &op : body.without_terminator()) {
       if (isFree(&op)) continue;
       std::string kind = isPimOp(&op) ? "pim" : "npu";
-      bool packetKernel = op.hasAttr("hyb.npu_packet");
       int64_t g = kind == "pim" ? cast<hyb::QMatmulOp>(op).getGroup().value_or(-1) : -1;
       std::optional<int64_t> layer;
       if (auto w = op.getAttrOfType<StringAttr>("hyb.npu_gemv")) layer = layerOf(w.getValue());
       bool split = layer && !segments.empty() && segments.back().kind == "npu" &&
                    segments.back().gemvLayer && *segments.back().gemvLayer != *layer;
-      if (segments.empty() || segments.back().kind != kind || segments.back().group != g || split ||
-          packetKernel || segments.back().packetKernel)
-        segments.push_back({kind, g, {}, std::nullopt, packetKernel});
+      if (segments.empty() || segments.back().kind != kind || segments.back().group != g || split)
+        segments.push_back({kind, g, {}, std::nullopt});
       segments.back().ops.push_back(&op);
       if (layer) segments.back().gemvLayer = layer;
     }
@@ -145,7 +142,6 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
       auto fn = func::FuncOp::create(b, step.getLoc(), name, fnType);
       fn.setPrivate();
       fn->setAttr(kPhase, b.getStringAttr(seg.kind));
-      if (seg.packetKernel) fn->setAttr("hyb.npu_kernel", b.getStringAttr("pim_packet_g4"));
       if (seg.kind == "pim") fn->setAttr("hyb.group", b.getI64IntegerAttr(seg.group));
       Block *entry = fn.addEntryBlock();
       OpBuilder fb = OpBuilder::atBlockBegin(entry);

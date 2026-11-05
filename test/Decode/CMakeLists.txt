@@ -80,14 +80,8 @@ if(NPU_TEST_EMULATOR AND NPU_TEST_LIBRARY)
   add_e2e_test(e2e-weight-prefetch weight_prefetch.py ${lib})
   add_e2e_test(e2e-pim-scatter pim_scatter.py ${lib})
   add_e2e_test(e2e-pim-boundary pim_boundary.py ${lib})
+  add_e2e_test(e2e-pim-result-consumer pim_result_consumer.py ${lib})
   add_e2e_test(e2e-pim-pingpong pim_pingpong.py ${emu})
-  add_e2e_test(e2e-pim-weight-storage pim_weight_storage.py ${emu})
-  add_e2e_test(e2e-pim-packet-npu pim_packet_npu.py ${lib})
-  add_e2e_test(e2e-pim-activation-cores pim_activation_cores.py --compiler $<TARGET_FILE:npu-compile>
-    --baseline "${NPU_E2E_OUTPUT}/e2e-pim-packet-npu" ${lib})
-  set_tests_properties(e2e-pim-activation-cores PROPERTIES DEPENDS e2e-pim-packet-npu)
-  add_e2e_test(e2e-pim-activation-ranks pim_activation_ranks.py --compiler $<TARGET_FILE:npu-compile>
-    --emulator "${NPU_TEST_EMULATOR}" --library "${NPU_TEST_LIBRARY}")
   add_e2e_test(e2e-l2-dependencies npu_l2_dependencies.py
     "${NPU_E2E_OUTPUT}/e2e-weight-prefetch/auto_ring/pipeline" --negative-control)
   set_tests_properties(e2e-l2-dependencies PROPERTIES DEPENDS e2e-weight-prefetch)

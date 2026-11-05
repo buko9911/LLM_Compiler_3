@@ -24,13 +24,12 @@ inline FailureOr<TargetSpec> loadTargetSpec(Operation *op, StringRef path) {
   return spec;
 }
 
-/// The NPU phase functions the NPU passes transform: outlined functions with hyb.phase = "npu",
-/// except the isolated PIM packet kernel (hyb.npu_kernel), which owns a separately checked plan.
+/// The NPU phase functions the NPU passes transform: outlined functions with hyb.phase = "npu".
 inline SmallVector<func::FuncOp> getNpuPhases(ModuleOp module) {
   SmallVector<func::FuncOp> phases;
   for (auto fn : module.getOps<func::FuncOp>()) {
     auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-    if (phase && phase.getValue() == "npu" && !fn.isExternal() && !fn->hasAttr("hyb.npu_kernel"))
+    if (phase && phase.getValue() == "npu" && !fn.isExternal())
       phases.push_back(fn);
   }
   return phases;

@@ -65,42 +65,6 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       module.emitError() << "pim.partitions " << program.partitions << " must be 1 .. pim.channels x " << pim::kRanks;
       return signalPassFailure();
     }
-    const bool fixedStorage = module->hasAttr("hyb.pim_weight_storage_requested");
-    auto packetRequest = module->getAttrOfType<StringAttr>("hyb.pim_packet_npu_requested");
-    const bool packetRequested = bool(packetRequest);
-    if (module->hasAttr("hyb.pim_packet_npu_requested") &&
-        (!packetRequest || packetRequest.getValue() != "g4")) {
-      module.emitError("packet NPU requires the driver-owned g4 request");
-      return signalPassFailure();
-    }
-    std::optional<::npu::decode::PimWeightStorage> importedStorage;
-    if (fixedStorage && (specOr->pim.pus != pim::kPUs || specOr->pim.lanes != pim::kLanes ||
-                         specOr->pim.ranks != pim::kRanks || (program.channels != 2 && program.channels != 8))) {
-      module.emitError("PIM weight storage requires the supported PU8/lane4/rank2, SC2/8 hardware");
-      return signalPassFailure();
-    }
-    if (auto input = module->getAttrOfType<StringAttr>("hyb.pim_weight_storage_import")) {
-      auto json = llvm::json::parse(input.getValue());
-      if (!json) {
-        llvm::consumeError(json.takeError());
-        module.emitError("invalid PIM weight storage import JSON");
-        return signalPassFailure();
-      }
-      auto parsed = ::npu::decode::parsePimWeightStorage(*json);
-      if (!parsed) { module.emitError(parsed.error); return signalPassFailure(); }
-      importedStorage = std::move(parsed.value);
-      if (importedStorage->capacityBytes != specOr->lp6.capacityBytes) {
-        module.emitError("PIM weight storage target capacity differs from import");
-        return signalPassFailure();
-      }
-    }
-    if (packetRequested && (!fixedStorage || !importedStorage || specOr->npu.cores != 4 ||
-                            specOr->npu.saRows != 32 || specOr->npu.saCols != 32 ||
-                            program.channels != 8 || program.banksetPingPongLead != 0)) {
-      module.emitError("packet NPU g4 requires imported PIM storage, 4 cores, a 32x32 SA, 8 SC and even bankset");
-      return signalPassFailure();
-    }
-
     // When the plan does not fit, every PIM phase reuses the same activation and output tiles (below),
     // unless a PIM output is a step result (it must survive to the end) or the driver collects
     // intermediate buffers. Plans that fit keep distinct tiles: reused rows made a decode layer's QKV
@@ -116,47 +80,12 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     });
     DenseMap<Value, DictionaryAttr> pimBuffers;   // PIM-laid-out buffers
     int64_t records = 0;
-    int64_t packetPhases = 0;
     bool placementOK = true;
     step.walk([&](func::CallOp call) {
       if (!placementOK) return;
       auto callee = symbols.lookup<func::FuncOp>(call.getCallee());
       if (!callee || !callee->hasAttr(kPhase)) return;
       const StringRef phase = cast<StringAttr>(callee->getAttr(kPhase)).getValue();
-      if (auto kernel = callee->getAttrOfType<StringAttr>("hyb.npu_kernel")) {
-        auto fail = [&](StringRef message) { call.emitError(message); placementOK = false; };
-        if (kernel.getValue() != "pim_packet_g4" || phase != "npu" || !packetRequested || ++packetPhases != 1) {
-          fail("packet NPU supports exactly one driver-requested pim_packet_g4 NPU phase");
-          return;
-        }
-        SmallVector<hyb::QMatmulOp> ops;
-        callee.walk([&](hyb::QMatmulOp q) { ops.push_back(q); });
-        if (ops.size() != 1) { fail("packet NPU phase must contain exactly one qmatmul"); return; }
-        hyb::QMatmulOp q = ops.front();
-        auto kind = q->getAttrOfType<StringAttr>("hyb.npu_packet");
-        auto x = dyn_cast<BlockArgument>(q.getInput()), out = dyn_cast<BlockArgument>(q.getInit());
-        auto xt = dyn_cast<MemRefType>(q.getInput().getType()), yt = dyn_cast<MemRefType>(q.getInit().getType());
-        if (!kind || kind.getValue() != "g4" || !q.getTarget() || *q.getTarget() != "npu" ||
-            !x || !out || x.getOwner() != &callee.getBody().front() || out.getOwner() != x.getOwner() || x == out ||
-            !xt || !yt || xt.getRank() != 2 || yt.getRank() != 2 || !xt.hasStaticShape() || !yt.hasStaticShape() ||
-            !xt.getElementType().isInteger(8) || !yt.getElementType().isInteger(32)) {
-          fail("packet NPU needs direct phase arguments I8[M,K] input and I32[M,N] output");
-          return;
-        }
-        const int64_t M = xt.getDimSize(0), K = xt.getDimSize(1), N = yt.getDimSize(1);
-        if (M < 1 || M > 8 || yt.getDimSize(0) != M || N <= 0 || N % 4096 || K <= 0 || K % 256) {
-          fail("packet NPU g4 requires M in 1..8, N % 4096 == 0 and K % 256 == 0");
-          return;
-        }
-        // Reuse the physical weight descriptor without creating a PIM invocation:
-        // no activation IDs, output tiles, phase range or executable PIM primitive.
-        std::map<int, int64_t> loads;
-        int64_t pi = program.addProjection(q.getWeight().str(), N, K, {}, loads);
-        program.projections[size_t(pi)].computeFirst = records;
-        program.projections[size_t(pi)].computeCount = 0;
-        q->setAttr("hyb.packet_projection", b.getI64IntegerAttr(pi));
-        return;
-      }
       if (phase != "pim") return;
       // The group's INT8 input: one activation vector per token.
       Value qx = call.getOperand(0);
@@ -222,7 +151,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       int open = 0;
       for (int c = 0; c < program.partitions; ++c) open += loads.count(c) == 0;
       std::vector<pimcost::Shape> shapes(group.size());
-      if (!fixedStorage && !group.empty()) {
+      if (!group.empty()) {
         pimcost::Estimate best, plain = pimcost::estimate(*specOr, M, K, rows, shapes, open);
         shapes = pimcost::choose(*specOr, M, K, rows, open, allowSplit, best);
         std::string label, choice;
@@ -280,53 +209,6 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                                             b.getNamedAttr("acts", b.getI64ArrayAttr(acts))});
     });
     if (!placementOK) return signalPassFailure();
-    if (packetRequested && (packetPhases != 1 || program.projections.size() != 1 || !program.phases.empty() ||
-                            !program.activations.empty() || program.nextActivation || program.nextOutput || records)) {
-      module.emitError("packet NPU first version needs one storage-only projection and no PIM invocation");
-      return signalPassFailure();
-    }
-
-    std::set<std::string> fixedNames;
-    if (fixedStorage) {
-      for (const auto &p : program.projections)
-        if (!fixedNames.insert(p.name).second || p.n <= 0 || p.k <= 0 || p.k % pim::kKPerSweep) {
-          module.emitError("PIM weight storage needs unique projection names, positive shapes and K % 256 == 0");
-          return signalPassFailure();
-        }
-      if (fixedNames.empty()) {
-        module.emitError("PIM weight storage requires at least one PIM projection");
-        return signalPassFailure();
-      }
-    }
-    if (importedStorage) {
-      auto bound = ::npu::decode::bindPimWeightStorage(program, *importedStorage);
-      if (!bound) { module.emitError(bound.error); return signalPassFailure(); }
-      if (!specOr->pim.concurrentRanks)
-        for (auto [first, count] : program.phases) {
-          std::set<int> ranks;
-          for (const auto &p : program.projections)
-            if (p.computeCount > 0 && p.computeFirst >= first && p.computeFirst < first + count)
-              for (int part : p.streamPart) ranks.insert(program.partRank(part));
-          if (ranks.size() > 1) {
-            module.emitError("PIM weight storage import makes a phase span non-concurrent ranks");
-            return signalPassFailure();
-          }
-        }
-    }
-    if (packetRequested) {
-      std::set<int> channels;
-      for (int part : program.projections.front().streamPart) {
-        if (program.partRank(part) != 0) {
-          module.emitError("packet NPU first version only supports imported rank 0 storage");
-          return signalPassFailure();
-        }
-        channels.insert(program.partChannel(part));
-      }
-      if (channels.size() != 8) {
-        module.emitError("packet NPU first version needs all 8 subchannels in imported storage");
-        return signalPassFailure();
-      }
-    }
 
     // Dense region.
     uint64_t cursor = 0x10000;
@@ -386,33 +268,9 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       weights.push_back({key.first, key.second, t.getNumElements() * eb, SmallVector<int64_t>(t.getShape()),
                          0, w->getAttrOfType<ArrayAttr>("hyb.weight_segments")});
     });
-    if (fixedStorage) {
-      std::set<std::string> scaleNames;
-      for (const W &w : weights) {
-        if (w.layout != "row_scale" || !fixedNames.count(w.name)) {
-          module.emitError("PIM weight storage only supports PIM matrices and their row_scale; npu_nk32 is unsupported");
-          return signalPassFailure();
-        }
-        scaleNames.insert(w.name);
-      }
-      if (scaleNames != fixedNames) {
-        module.emitError("PIM weight storage needs a row_scale for every projection");
-        return signalPassFailure();
-      }
-    }
-    const uint64_t mutableEnd = cursor;
     for (W &w : weights)
       if (w.layout == "row_scale") {
-        if (!importedStorage) { w.addr = place(w.bytes); continue; }
-        const auto it = std::find_if(importedStorage->weights.begin(), importedStorage->weights.end(),
-                                    [&](const auto &e) { return e.name == w.name; });
-        if (it == importedStorage->weights.end() || w.shape.size() != 1 || w.shape[0] != it->n ||
-            uint64_t(w.bytes) != it->scaleBytes || mutableEnd > it->scaleAddress) {
-          module.emitError("PIM weight storage scale shape mismatch or overlap with mutable dense buffers");
-          return signalPassFailure();
-        }
-        w.addr = it->scaleAddress;
-        cursor = std::max(cursor, w.addr + it->scaleBytes);
+        w.addr = place(w.bytes);
       }
     uint64_t denseEnd = cursor;
     // Room for the NPU code generator's constant pools (one small blob per phase).
@@ -465,12 +323,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         module.emitError("fused weight segments do not cover allocation"); return signalPassFailure();
       }
     }
-    if (!importedStorage) {
-      program.kernelRow = int64_t((npuWeightEnd + program.rowBytes() - 1) / program.rowBytes()) + 1;
-    } else if (npuWeightEnd > uint64_t(program.kernelRow) * uint64_t(program.rowBytes())) {
-      module.emitError("PIM weight storage constant reserve/dense buffers overlap fixed kernel rows");
-      return signalPassFailure();
-    }
+    program.kernelRow = int64_t((npuWeightEnd + program.rowBytes() - 1) / program.rowBytes()) + 1;
     for (auto &[v, attr] : pimBuffers) {
       SmallVector<NamedAttribute> attrs(attr.getValue());
       attrs.push_back(b.getNamedAttr("bytes", b.getI64IntegerAttr(bytesOf(v.getType()))));

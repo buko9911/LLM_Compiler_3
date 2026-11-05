@@ -175,8 +175,7 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
       w.sourceOperations.push_back(llvm::formatv("{0}", llvm::json::Value(std::move(origin))).str());
     });
   }
-  if (failed(planParallelActivationFeed(fn, err))) return failure();
-  cores = parallelActivationFeed ? 4 : 1;
+  cores = 1;
   fn.walk([&](scf::ForallOp f) {
     if (auto c = f->getAttrOfType<IntegerAttr>("hyb.cores")) cores = std::max<int>(cores, int(c.getInt()));
   });
@@ -236,11 +235,6 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
   stats.vectorScalarReuses = vectorScalarReuses;
   stats.vectorPipelineGroups = vectorPipelineGroups;
   stats.vectorPipelinedChunks = vectorPipelinedChunks;
-  if (parallelActivationFeed) {
-    stats.pimActivationCores = 4;
-    stats.pimActivationPlanJson = parallelActivationPlanJSON();
-    fn->setAttr("hyb.pim_activation_plan", StringAttr::get(fn.getContext(), stats.pimActivationPlanJson));
-  }
   return success();
 }
 
