@@ -132,10 +132,12 @@ int64_t Program::addCommonProjection(const std::string &name, const std::vector<
     nextWeight[size_t(part)] += p.streamTiles(g);
   }
   // Keep the partitions of the set level: a tail on fewer subchannels would shift the next projection's rows.
-  int64_t most = 0;
-  for (int c2 = 0; c2 < partitions; ++c2) most = std::max(most, nextWeight[size_t(c2)]);
-  for (int c2 = 0; c2 < partitions; ++c2)
-    if (nextWeight[size_t(c2)] != 0) nextWeight[size_t(c2)] = (most + kPacketsPerRow * 2 - 1) / (kPacketsPerRow * 2) * (kPacketsPerRow * 2);
+  for (int rk = 0; rk * channels < partitions; ++rk) {
+    int64_t most = 0;
+    for (int c2 = rk * channels; c2 < (rk + 1) * channels && c2 < partitions; ++c2) most = std::max(most, nextWeight[size_t(c2)]);
+    for (int c2 = rk * channels; c2 < (rk + 1) * channels && c2 < partitions; ++c2)
+      if (most) nextWeight[size_t(c2)] = (most + kPacketsPerRow * 2 - 1) / (kPacketsPerRow * 2) * (kPacketsPerRow * 2);
+  }
   p.assignOutputSlots();
   nextOutput += int64_t(inputs.size()) * p.splitK * p.outputSlots;
   for (int64_t a : inputs)
