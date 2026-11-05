@@ -24,6 +24,9 @@ struct LP6Extra {
   uint64_t cursor, limit;
   std::vector<LP6Blob> blobs;
   uint64_t add(std::vector<uint8_t> bytes);
+  // Research option --common-layout (PimLayout.h): NPU GEMV weights in the common placement, the GDMA size of a tile read.
+  std::vector<pim::CommonWeight> commonWeights = {};
+  int commonChunkRows = 8;
 };
 
 /// L2 and LP6 accesses that an NPU phase leaves for the next NPU phase:
@@ -53,6 +56,9 @@ struct NpuPhaseInput {
   // for. A GDMA that touches none of those ranks and has no other hazard follows `beforePim` instead of
   // the phase entry, so its DRAM traffic overlaps the PIM work on the other rank.
   std::vector<int> pimRecords, pimRanks, beforePim;
+  // Research option --common-layout: where the NPU GEMV weights really are, and the GDMA size of their rows.
+  const std::vector<pim::CommonWeight> *commonWeights = nullptr;
+  int commonChunkRows = 8;
 };
 
 struct NpuPhaseStats {

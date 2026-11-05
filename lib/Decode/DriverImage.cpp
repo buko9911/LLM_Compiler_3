@@ -156,7 +156,7 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
       }
   std::vector<std::string> names;
   for (const pim::Projection &p : prog.projections)
-    if (std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
+    if (!p.common && std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
   for (auto &[name, list] : npuWeights)
     if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
   std::atomic<bool> ok{true};
@@ -182,6 +182,20 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
           if (n % 32) return fail("npu_nk32 needs N % 32 == 0: " + names[i]);
           if (nw.bytes != uint64_t(n)*k || nw.shape != std::vector<int64_t>{n/32,k,32})
             return fail("npu_nk32 shape mismatch: " + names[i]);
+          // Research option --common-layout: the same rows at the placement's addresses (NPU view of the common layout).
+          const pim::CommonWeight *common = nullptr;
+          for (const pim::CommonWeight &c : extra.commonWeights)
+            if (nw.addr >= c.logical && nw.addr < c.logical + c.bytes) common = &c;
+          if (common) {
+            const int64_t firstTile = int64_t(nw.addr - common->logical) / (k * 32);
+            std::vector<int8_t> line(32);
+            for (int64_t j = 0; j < n / 32; ++j)
+              for (int64_t kk = 0; kk < k; ++kk) {
+                for (int c = 0; c < 32; ++c) line[size_t(c)] = q[size_t((j * 32 + c) * k + kk)];
+                img.write(common->address(firstTile + j, kk), line.data(), 32);
+              }
+            continue;
+          }
           // Block j = rows 32j..32j+31 as the [K, 32] MMA weight tile: T[k][c] = q[32j + c][k].
           std::vector<int8_t> blk(size_t(k * 32));
           for (int64_t j = 0; j < n / 32; ++j) {
@@ -194,7 +208,7 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
         }
       }
     for (const pim::Projection &p : prog.projections) {
-      if (p.name != names[i]) continue;
+      if (p.common || p.name != names[i]) continue;
       if (p.n != n || p.k != k) return fail("projection " + p.name + " shape mismatch");
       prog.forEachWeightPacket(p, q.data(), [&](uint64_t addr, const std::array<uint8_t, 32> &pkt) {
         img.write(addr, pkt.data(), 32);
@@ -202,6 +216,31 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
     }
   });
   if (!ok) return false;
-  quantized = names.size();
+  // Research option --common-layout: a group of GEMVs is one projection with the rows of its tensors in order.
+  std::vector<size_t> commons;
+  for (size_t i = 0; i < prog.projections.size(); ++i)
+    if (prog.projections[i].common) commons.push_back(i);
+  llvm::parallelFor(0, commons.size(), [&](size_t i) {
+    const pim::Projection &p = prog.projections[commons[i]];
+    std::vector<int8_t> all(size_t(p.n * p.k));
+    int64_t at = 0;
+    for (const auto &seg : p.segments) {
+      std::vector<int8_t> q;
+      std::vector<float> s;
+      int64_t n, k;
+      std::string e;
+      if (!quantizeRows(*st, seg.first, q, s, n, k, e) || n != seg.second || k != p.k) {
+        std::lock_guard<std::mutex> g(errMutex);
+        llvm::errs() << "common projection " << seg.first << ": " << e << "\n";
+        ok = false;
+        return;
+      }
+      std::memcpy(all.data() + at * p.k, q.data(), q.size());
+      at += n;
+    }
+    prog.forEachWeightPacket(p, all.data(), [&](uint64_t addr, const std::array<uint8_t, 32> &pkt) { img.write(addr, pkt.data(), 32); });
+  });
+  if (!ok) return false;
+  quantized = names.size() + commons.size();
   return true;
 }

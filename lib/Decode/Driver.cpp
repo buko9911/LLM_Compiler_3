@@ -63,6 +63,11 @@ static cl::opt<bool> noImage("no-image", cl::desc("do not write lp6.bin"), cl::i
 static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
     cl::desc("PIM weight rows on alternating bank sets: -1 the target's pim.bankset_pingpong_lead (default), "
              "0 off, 1 lead 12, 2..63 lead"), cl::init(-1));
+static cl::opt<int> commonLayout("common-layout",
+    cl::desc("research: one weight placement that PIM computes on and the NPU reads through a byte transposer (PimLayout.h, "
+             "commonShape): 0 off (default), 1 one rank per PIM phase, 2 K halves on the two ranks, computed in turn"), cl::init(0));
+static cl::opt<int> commonChunk("common-chunk-rows",
+    cl::desc("research, with --common-layout: an NPU weight tile is read in GDMAs of this many 128-byte rows"), cl::init(8));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
                                   cl::init(false));
 static cl::opt<bool> noOutputCollect("no-output-collect",
@@ -159,6 +164,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
   // 5. Memory: LP6 addresses, L1/L2 placement, explicit copies, layout rewrites, SRAM offsets.
   const std::string memory =
       "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) +
+      (commonLayout ? " common-layout=" + std::to_string(commonLayout) : std::string()) +
       " reuse-pim-buffers=" + (debugCollect ? "false" : "true") + "},"
       "loop-invariant-code-motion,"
       "hyb-npu-place,"                                        // L1 (one core) or L2 (shared)
@@ -242,6 +248,29 @@ int compileDecode(int argc, char **argv) {
   uint64_t denseEnd = uint64_t(mod->getAttrOfType<IntegerAttr>("hyb.lp6_dense_end").getInt());
   uint64_t extraLimit = uint64_t(mod->getAttrOfType<IntegerAttr>("hyb.lp6_extra_limit").getInt());
   LP6Extra extra{denseEnd, extraLimit, {}};
+  uint64_t commonEnd = 0;
+  if (auto cw = mod->getAttrOfType<StringAttr>("hyb.common_weights")) {
+    auto parsed = json::parse(cw.getValue());
+    if (!parsed) {
+      llvm::errs() << "bad hyb.common_weights\n";
+      return 1;
+    }
+    for (const json::Value &v : *parsed->getAsArray()) {
+      const json::Object *o = v.getAsObject();
+      pim::CommonWeight c;
+      c.logical = uint64_t(*o->getInteger("logical"));
+      c.bytes = uint64_t(*o->getInteger("bytes"));
+      c.n = *o->getInteger("n");
+      c.k = *o->getInteger("k");
+      c.rowBase = *o->getInteger("row");
+      c.paired = *o->getBoolean("paired");
+      c.kHalves = *o->getBoolean("k_halves");
+      commonEnd = std::max<uint64_t>(commonEnd, (c.kHalves ? uint64_t(pim::kRankBytes) : 0) +
+                                                    uint64_t(c.rowBase + c.rowsUsed() + 2) * uint64_t(prog.rowBytes()));
+      extra.commonWeights.push_back(c);
+    }
+    extra.commonChunkRows = commonChunk;
+  }
 
   // ---- PIM commands --------------------------------------------------------------------------
   std::vector<pim::Primitive> pimCommands;
@@ -274,7 +303,7 @@ int compileDecode(int argc, char **argv) {
   }
 
   // ---- io.json -------------------------------------------------------------------------------
-  uint64_t imageBytes = std::max(prog.endAddress(), extra.limit);
+  uint64_t imageBytes = std::max({prog.endAddress(), extra.limit, commonEnd});
   json::Array args = driver::argumentsJSON(step);
   std::string model = modelDir.empty() ? mod->getAttrOfType<StringAttr>("hyb.model").str() : modelDir.getValue();
   json::Array missing;

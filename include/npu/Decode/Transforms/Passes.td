@@ -280,7 +280,10 @@ def HybPlanLP6 : Pass<"hyb-plan-lp6", "ModuleOp"> {
                         "when the plan exceeds LP6 capacity, give all PIM phases one set of activation/output tiles (off for collected buffers)">,
                  Option<"banksetPingPong", "bankset-pingpong", "int", "-1",
                         "weight rows on alternating bank sets: -1 target pim.bankset_pingpong_lead, 0 off, "
-                        "1 lead 12, 2..63 lead">];
+                        "1 lead 12, 2..63 lead">,
+                 Option<"commonLayout", "common-layout", "int", "0",
+                        "research: one weight placement for NPU and PIM (npu/Target/PimLayout.h, commonShape): "
+                        "0 off, 1 one rank per phase, 2 K halves on the two ranks">];
 }
 
 def HybNpuPlace : Pass<"hyb-npu-place", "ModuleOp"> {

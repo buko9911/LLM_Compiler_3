@@ -75,6 +75,11 @@ struct Projection {
   std::vector<int64_t> streamWeightBase;    // first weight tile of each stream, in its partition
   std::vector<int64_t> activations;         // activation per token
   std::vector<int> streamPart;              // partition of each stream (sorted inside each piece)
+  // Common layout (--common-layout, research option; see commonShape below): the GEMVs of a group are one projection whose
+  // outputs follow `segments` (checkpoint tensor, rows); `streamOrder` is the emission order of the streams.
+  bool common = false;
+  std::vector<std::pair<std::string, int64_t>> segments;
+  std::vector<int64_t> streamOrder;
   int64_t computeFirst = 0, computeCount = 0;   // executable primitive range
   int64_t mainBlocks() const {
     return (nPad - tailBlocks * int64_t(kPUs) * kLanes * tailAccs) / (int64_t(kPUs) * kLanes * accs);
@@ -96,7 +101,16 @@ struct Projection {
   int64_t tilesPerPU() const { return nPad / (kPUs * 8); }   // output tiles of 8 per PU, per piece and token
   int streamAccs(int64_t g) const { return blockAccs(g % blocks()); }
   int64_t tilesPerStream(int64_t g) const { return streamAccs(g) / 2; }   // per PU
-  int64_t streamTiles(int64_t g) const { return pieceSweeps() * streamAccs(g) * kInTiles; }
+  // Weight tiles per sweep. Common layout: an empty row per sweep when a sweep takes an even number of rows, so that the rows of one
+  // accumulator pair in consecutive sweeps alternate bank sets (the NPU can open the next one early).
+  int64_t sweepTiles(int accs) const {
+    return accs * kInTiles + (common && (accs / 2) % 2 == 0 ? kPacketsPerRow : 0);
+  }
+  int64_t streamTiles(int64_t g) const { return pieceSweeps() * sweepTiles(streamAccs(g)); }
+  // Common layout: outputs of two equal segments (gate, up) lie on the odd and even PUs of a bank group, others in PU order.
+  bool pairedSegments() const { return segments.size() == 2 && segments[0].second == segments[1].second; }
+  int commonPU(int index) const { return pairedSegments() ? (index < 4 ? 2 * index : 2 * (index - 4) + 1) : index; }
+  int commonPUIndex(int pu) const { return pairedSegments() ? (pu % 2 ? 4 + pu / 2 : pu / 2) : pu; }
   int tokens() const { return int(activations.size()); }
   // Output tiles. For each token and K piece, every partition numbers the tiles of its streams from
   // the same id: stream g's register r is tile outputTile(m, piece, g, r). One LP6 column (one tile
@@ -125,6 +139,8 @@ struct Program {
   int partitions = 4;   // at most channels x kRanks
   // 0: even banks; 2..63: alternate weight rows across bank sets with this lead.
   int banksetPingPongLead = 0;
+  // Research option --common-layout: 0 off, 1 one rank per phase, 2 K halves on the two ranks, computed in turn (see commonShape).
+  int commonLayout = 0;
   const char *weightLayout() const {
     return banksetPingPongLead ? "bankset-row-alternating-v1" : "even-v1";
   }
@@ -168,6 +184,9 @@ struct Program {
   // Packet ranges of activation `index` that the streams on rank `rank` read (sorted, merged). A rank that computes
   // only some K pieces needs only their packets.
   std::vector<std::pair<int64_t, int64_t>> activationPackets(int64_t index, int rank) const;
+  // Common layout: one projection for a group of GEMVs. `rank` is the rank of this phase when commonLayout == 1.
+  int64_t addCommonProjection(const std::string &name, const std::vector<std::pair<std::string, int64_t>> &segments, int64_t k,
+                              const std::vector<int64_t> &activations, int rank, bool mayCutK);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
   // Output tile ids of every projection again, in order (after the streams were rebound).
@@ -205,6 +224,79 @@ struct Program {
   uint64_t endAddress() const;
 };
 
+// Common layout, the research option --common-layout (2026-11-05, research/race_decoding/common_layout). One placement of the weights
+// that PIM computes on directly and the NPU reads through a byte transposer on its read path:
+//   output n of the group = PU index x rows + 64 R + 8 s + 2 l + x
+//   R register of the PU (one row per sweep, stream after stream), s subchannel, l lane, x accumulator parity.
+// So a register holds 8 consecutive outputs and a column of a PU holds 64 consecutive ones over the 8 subchannels. An NPU tile of 32
+// outputs is 4 subchannels x 2 accumulators of one PU. K is whole per output on a rank; commonLayout 2 puts K halves on the two ranks.
+struct CommonShape {
+  int accs = 16, tailAccs = 0;
+  int64_t mainBlocks = 0, tailBlocks = 0, nPad = 0;
+};
+inline CommonShape commonShape(int64_t n) {
+  CommonShape c;
+  const int64_t rowsPerRegister = 512;        // over the 8 subchannels and 8 PUs
+  const int64_t registers = (n + rowsPerRegister - 1) / rowsPerRegister;
+  if (registers <= 8) {
+    c.accs = int(2 * registers);
+    c.mainBlocks = kPUs;
+  } else {
+    c.accs = kAccs;
+    c.mainBlocks = (registers / 8) * kPUs;
+    const int64_t rest = registers % 8;
+    if (rest) {
+      c.tailAccs = int(2 * rest);
+      const int64_t rows = n - c.mainBlocks * 32 * c.accs;
+      c.tailBlocks = (rows + 32 * c.tailAccs - 1) / (32 * c.tailAccs);
+    } else if (n % rowsPerRegister) {
+      c.mainBlocks -= kPUs;
+      c.tailAccs = kAccs;
+      c.tailBlocks = (n - c.mainBlocks * 32 * c.accs + 32 * kAccs - 1) / (32 * kAccs);
+    }
+  }
+  c.nPad = c.mainBlocks * 32 * c.accs + c.tailBlocks * 32 * c.tailAccs;
+  return c;
+}
+
+// The same placement seen from the NPU: where the 32 B row k of tile j of an NPU weight goes. The NPU reads a row as one burst; the
+// bursts of a K group are the 8 packets PIM uses for it (research/race_decoding/common_layout/check_layout). Fetch order per sweep:
+// 64 columns x 4 subchannels. rowBase: first row in every PU, the same on both ranks.
+struct CommonWeight {
+  uint64_t logical = 0, bytes = 0;     // the weight's logical address range, which the compiler plans with; never reaches DRAM
+  int64_t n = 0, k = 0, rowBase = 0;
+  bool paired = false, kHalves = false;
+  int64_t sweeps() const { return k / kKPerSweep; }
+  int64_t pieceSweeps() const { return kHalves ? sweeps() / 2 : sweeps(); }
+  int64_t rowsUsed() const {
+    const CommonShape c = commonShape(n);
+    const auto step = [](int a) { return int64_t(a / 2 + ((a / 2) % 2 == 0 ? 1 : 0)); };
+    return (c.mainBlocks / kPUs) * pieceSweeps() * step(c.accs) + (c.tailBlocks ? pieceSweeps() * step(c.tailAccs) : 0) + 2;
+  }
+  // PA of the 32-byte row k of tile j, for 8 subchannels (rarobacobgch).
+  uint64_t address(int64_t j, int64_t row) const {
+    const CommonShape c = commonShape(n);
+    const int64_t rows = c.nPad / kPUs, n0 = j * 32;
+    const int index = int(n0 / rows);
+    const int pu = paired ? (index < 4 ? 2 * index : 2 * (index - 4) + 1) : index;
+    const int64_t local = n0 - index * rows, R = local / 64, half = (local % 64) / 32;
+    const int64_t regsMain = (c.mainBlocks / kPUs) * (c.accs / 2);
+    const auto step = [](int a) { return int64_t(a / 2 + ((a / 2) % 2 == 0 ? 1 : 0)); };
+    const int64_t v = row / kKPerSweep, inner = row % kKPerSweep, piece = v / pieceSweeps(), vv = v % pieceSweeps();
+    int64_t dramRow = rowBase;
+    if (R < regsMain) {
+      dramRow += (R / (c.accs / 2)) * pieceSweeps() * step(c.accs) + vv * step(c.accs) + R % (c.accs / 2);
+    } else {
+      dramRow += (c.mainBlocks / kPUs) * pieceSweeps() * step(c.accs) + vv * step(c.tailAccs) + (R - regsMain);
+    }
+    const int rank = kHalves ? int(piece) : 0;
+    const uint64_t bank = uint64_t(2 * (pu % 2)) + uint64_t(dramRow & 1);
+    const uint64_t column = uint64_t(inner / 4), sc = uint64_t(4 * half + inner % 4), group = uint64_t(pu / 2);
+    return uint64_t(rank) * uint64_t(kRankBytes) + uint64_t(dramRow) * (uint64_t(1) << 18) + bank * (uint64_t(1) << 16) +
+           column * (uint64_t(1) << 10) + group * (uint64_t(1) << 8) + sc * 32;
+  }
+};
+
 template <typename Fn>
 void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
   const int64_t streams = p.streams(), sweeps = p.pieceSweeps(), rows = p.rowsPerPU(), blocks = p.blocks();
@@ -214,13 +306,16 @@ void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
     for (int64_t s = 0; s < sweeps; ++s)
       for (int o = 0; o < accs; ++o)
         for (int i = 0; i < kInTiles; ++i) {
-          int64_t tile = p.streamWeightBase[size_t(g)] + (s * accs + o) * kInTiles + i;
+          int64_t tile = p.streamWeightBase[size_t(g)] + s * p.sweepTiles(accs) + o * kInTiles + i;
           for (int pu = 0; pu < kPUs; ++pu) {
             WeightPacketLocation location;
             location.address = weightPacketAddress(tile, pu, p.streamPart[size_t(g)]);
             location.inputBegin = ((piece * sweeps + s) * kInTiles + i) * kGroup;
             for (int l = 0; l < kLanes; ++l)
-              location.outputChannels[size_t(l)] = pu * rows + (tile0 + o / 2) * 8 + 2 * l + (o % 2);
+              location.outputChannels[size_t(l)] =
+                  p.common ? p.commonPUIndex(pu) * rows +
+                                 64 * (p.streamSlot[size_t(g)] + o / 2) + 8 * partChannel(p.streamPart[size_t(g)]) + 2 * l + (o % 2)
+                           : pu * rows + (tile0 + o / 2) * 8 + 2 * l + (o % 2);
             fn(location);
           }
         }

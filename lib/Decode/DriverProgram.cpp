@@ -7,6 +7,9 @@
 
 #include <optional>
 #include "DriverProgram.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include "DriverPackage.h"
 #include "npu/Decode/PimMetadata.h"
 #include "npu/Decode/Transforms/Passes.h"
@@ -200,6 +203,38 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
       auto recordsAttr = call->getAttrOfType<IntegerAttr>("hyb.pim_records");
       const int records = recordsAttr ? int(recordsAttr.getInt()) : 1;
       bool samePhase = false;
+      if (prog.commonLayout == 2) {
+        // Research option --common-layout 2: a subchannel computes on one rank at a time. Each run of primitives on one rank per
+        // subchannel waits for the run before it. Inside a run the records are cut as usual, so only its first read is exposed.
+        std::vector<std::vector<pim::Primitive>> runs;
+        std::map<int, int> rankOf;
+        for (const pim::Primitive &q : primitives) {
+          const int sc = prog.partChannel(int(q.partition)), rk = prog.partRank(int(q.partition));
+          auto it = rankOf.find(sc);
+          if (runs.empty() || (it != rankOf.end() && it->second != rk)) {
+            runs.emplace_back();
+            rankOf.clear();
+          }
+          rankOf[sc] = rk;
+          runs.back().push_back(q);
+        }
+        std::vector<int> before = pimBefore.before;
+        for (const auto &run : runs) {
+          const double fetchUs = double(run.size()) * pim::kRecordWordsPerPrimitive / spec.npu.commandFetchWordsPerCycle / spec.npu.clockMHz;
+          std::map<uint32_t, int64_t> sweeps;
+          for (const pim::Primitive &q : run) sweeps[q.partition] += q.opcode == pim::Opcode::GemvStream;
+          int64_t rounds = std::numeric_limits<int64_t>::max();
+          for (auto [partition, count] : sweeps) rounds = std::min(rounds, count);
+          const int cut = int(std::clamp<int64_t>(int64_t(std::ceil(fetchUs / spec.pim.recordFetchUs)), 1, std::min<int64_t>(spec.pim.maxRecords, rounds)));
+          std::vector<int> ids;
+          for (const auto &part : splitPimRecords(run, cut)) {
+            ids.push_back(program.pimRecord(name, before, part, samePhase));
+            samePhase = true;
+          }
+          before = ids;
+          pimBefore.records.insert(pimBefore.records.end(), ids.begin(), ids.end());
+        }
+      } else
       for (const auto &part : splitPimRecords(primitives, records)) {
         pimBefore.records.push_back(program.pimRecord(name, pimBefore.before, part, samePhase));
         samePhase = true;
@@ -234,6 +269,8 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     in.pimRecords = pimBefore.records;
     in.pimRanks = pimBefore.ranks;
     in.beforePim = pimBefore.before;
+    in.commonWeights = extra.commonWeights.empty() ? nullptr : &extra.commonWeights;
+    in.commonChunkRows = extra.commonChunkRows;
     pimBefore = {};
     program.beginPhase(name, exit);
     NpuPhaseStats stats;
@@ -377,7 +414,7 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
           }
         } else if (layout == "pim_out") {
           const pim::Projection &p = prog.projections[size_t(a.getAs<IntegerAttr>("proj").getInt())];
-          if (p.splitK != 1) {   // its K pieces are partial sums that only the NPU's gather adds
+          if (p.splitK != 1 || p.common) {   // its K pieces are partial sums that only the NPU's gather adds
             uncollected.push_back(name);
             continue;
           }

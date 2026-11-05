@@ -20,16 +20,27 @@ llvm::json::Value toJSON(const Program &program) {
     if (x.accs != kAccs) o["accs"] = x.accs;
     if (x.splitK != 1) o["split_k"] = x.splitK;
     if (x.tailBlocks) { o["tail_accs"] = x.tailAccs; o["tail_blocks"] = x.tailBlocks; }
+    if (x.common) {
+      o["common"] = true;
+      o["stream_order"] = llvm::json::Array(x.streamOrder);
+      llvm::json::Array segments;
+      for (const auto &seg : x.segments) segments.push_back(llvm::json::Array{seg.first, seg.second});
+      o["segments"] = std::move(segments);
+    }
     p.push_back(std::move(o));
   }
   for (auto [f, c] : program.phases) ph.push_back(llvm::json::Array{f, c});
-  return llvm::json::Object{{"channels", program.channels}, {"partitions", program.partitions}, {"kernel_row", program.kernelRow},
+  llvm::json::Object common;
+  if (program.commonLayout) common["common_layout"] = program.commonLayout;
+  llvm::json::Object out{{"channels", program.channels}, {"partitions", program.partitions}, {"kernel_row", program.kernelRow},
                             {"weight_layout", program.weightLayout()}, {"bankset_pingpong_lead", program.banksetPingPongLead},
                             {"next_w", llvm::json::Array(program.nextWeight)},
                             {"next_a", program.nextActivation}, {"next_o", program.nextOutput},
                             {"peak_a", program.activationTiles()}, {"peak_o", program.outputTiles()},
                             {"reuse_buffers", program.reuseBuffers}, {"acts", std::move(a)},
                             {"projections", std::move(p)}, {"phases", std::move(ph)}};
+  for (auto &kv : common) out[kv.first] = std::move(kv.second);
+  return out;
 }
 
 Program fromJSON(const llvm::json::Value &v) {
@@ -39,6 +50,7 @@ Program fromJSON(const llvm::json::Value &v) {
   pr.partitions = int(*o->getInteger("partitions"));
   pr.kernelRow = *o->getInteger("kernel_row");
   pr.banksetPingPongLead = int(o->getInteger("bankset_pingpong_lead").value_or(0));
+  pr.commonLayout = int(o->getInteger("common_layout").value_or(0));
   if (pr.banksetPingPongLead < 0 || pr.banksetPingPongLead > 63 || pr.banksetPingPongLead == 1 ||
       o->getString("weight_layout").value_or("even-v1") != pr.weightLayout())
     llvm::report_fatal_error("inconsistent PIM weight layout / ping-pong lead");
@@ -68,6 +80,14 @@ Program fromJSON(const llvm::json::Value &v) {
     if (auto v = xo->getInteger("split_k")) p.splitK = int(*v);
     if (auto v = xo->getInteger("tail_accs")) p.tailAccs = int(*v);
     if (auto v = xo->getInteger("tail_blocks")) p.tailBlocks = *v;
+    if (auto v = xo->getBoolean("common")) p.common = *v;
+    if (const llvm::json::Array *a = xo->getArray("stream_order"))
+      for (const llvm::json::Value &c : *a) p.streamOrder.push_back(*c.getAsInteger());
+    if (const llvm::json::Array *a = xo->getArray("segments"))
+      for (const llvm::json::Value &c : *a) {
+        const llvm::json::Array *pair = c.getAsArray();
+        p.segments.push_back({(*pair)[0].getAsString()->str(), *(*pair)[1].getAsInteger()});
+      }
     for (const llvm::json::Value &c : *xo->getArray("stream_weight_base")) p.streamWeightBase.push_back(*c.getAsInteger());
     p.outputBase = *xo->getInteger("output_base");
     for (const llvm::json::Value &c : *xo->getArray("acts")) p.activations.push_back(*c.getAsInteger());

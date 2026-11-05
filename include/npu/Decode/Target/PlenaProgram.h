@@ -52,6 +52,7 @@ public:
   /// share a core's window. Aggregate admission is bounded by N * logical cores;
   /// histories are separate because core streams are emitted sequentially.
   uint32_t gdmaLookahead = 0;
+  int gdmaChainGroup = 0;   // weight reads of one core in several independent chains (research: common layout)
   uint64_t l1Bytes = 4 * 1024 * 1024;  // one core's L1 (target spec npu.l1_bytes; the driver sets it)
   bool commandSchedule = false;  // reorder system commands by their first consumer (the driver sets it)
   struct ScheduleStats {
@@ -90,6 +91,7 @@ public:
   void reserveL2(uint64_t addr, uint64_t size) { l2HighWater = std::max(l2HighWater, addr + size); }
   /// Writes <dir>/program.bin and <dir>/system.json (with pim_kernel when there are PIM records);
   /// returns false on I/O error or a record that does not fit ISA ver 2.0.
+  void relayFarDependencies();
   bool finish(const std::string &dir, int logicalCores);
 
   int64_t coreWords() const { return int64_t(isa.size() + cur.size()); }

@@ -25,6 +25,7 @@ namespace mlir::hybrid::codegen {
 /// (INT32, so the sum is exact and independent of the split).
 LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &err) {
   const pim::Projection &p = in.pim->projections[size_t(s.lp6.getAs<IntegerAttr>("proj").getInt())];
+  if (p.common) return gatherPimCommon(s, d, err);
   if (s.shape.size() != 2 || s.strides[1] != 1 || d.space != kL1 || d.strides.back() != 1) {
     err = "PIM output copy must be [rows, cols] into contiguous L1 rows";
     return failure();
@@ -121,6 +122,123 @@ LogicalResult Codegen::gatherPimOut(const View &s, const View &d, std::string &e
     }
   }
   return success();
+}
+
+/// Research option --common-layout (PimLayout.h, commonShape). A column of a PU holds 64 consecutive outputs over the 8 subchannels, so
+/// one GDMA per run of columns and one contiguous LDMA per PU put a K piece in order. Further K pieces are added as in gatherPimOut.
+LogicalResult Codegen::gatherPimCommon(const View &s, const View &d, std::string &err) {
+  const pim::Projection &p = in.pim->projections[size_t(s.lp6.getAs<IntegerAttr>("proj").getInt())];
+  if (s.shape.size() != 2 || s.strides[1] != 1 || d.space != kL1 || d.strides.back() != 1) {
+    err = "PIM output copy must be [rows, cols] into contiguous L1 rows";
+    return failure();
+  }
+  const int64_t segBase = s.lp6.getAs<IntegerAttr>("seg_base").getInt();
+  int64_t N = s.strides[0], m0 = s.offset / N, n0 = s.offset % N, rows = s.shape[0], cols = s.shape[1];
+  int64_t dRow = d.shape.size() == 2 ? d.strides[0] : cols;
+  const int channels = in.pim->channels;
+  const int64_t slice = int64_t(pim::kChBytes) * channels, colBytes = in.pim->colBytes(), perPU = p.rowsPerPU();
+  const uint64_t win = windowBase(curCore), winEnd = win + uint64_t(window());
+  int64_t chunk = window() / 4 / 64 * 64;
+  const uint64_t partial = scratchBase;
+  if (p.splitK > 1) {
+    const int64_t scratch = (in.spec->npu.l1ReservedBytes - kPoolMax) / 4 / 64 * 64;
+    if (scratch < 64) {
+      err = "split-K PIM output needs L1 scratch for one partial-sum chunk";
+      return failure();
+    }
+    chunk = std::min(chunk, scratch);
+  }
+  uint64_t &stage = gatherStage.try_emplace(curCore, win).first->second;
+  for (int64_t r = 0; r < rows; ++r) {
+    const int m = int(m0 + r);
+    for (int64_t c0 = n0; c0 < n0 + cols; c0 += chunk) {
+      const int64_t c1 = std::min(n0 + cols, c0 + chunk), f0 = segBase + c0, f1 = segBase + c1;
+      const uint64_t dst = addr(d, r * dRow + (c0 - n0));
+      for (int piece = 0; piece < p.splitK; ++piece) {
+        const uint64_t target = piece == 0 ? dst : partial;
+        const int rank = in.pim->partRank(p.streamPart[size_t(piece * p.blocks())]);
+        for (int index = 0; index < pim::kPUs; ++index) {
+          const int pu = p.commonPU(index);
+          const int64_t lo = std::max(f0, index * perPU), hi = std::min(f1, (index + 1) * perPU);
+          if (lo >= hi) continue;
+          const int64_t nl = lo - index * perPU, nh = hi - index * perPU, Ra = nl / 64, Rb = (nh + 63) / 64;
+          const uint64_t need = uint64_t(Rb - Ra) * uint64_t(slice);
+          if (need > uint64_t(window())) {
+            err = "PIM output gather: one PU's columns exceed the L2 staging window";
+            return failure();
+          }
+          if (stage + need > winEnd) stage = win;   // reuse waits for the earlier readers (L2 hazards)
+          const uint64_t base = stage;
+          stage += need;
+          const int64_t idBase = p.outputBase + (int64_t(m) * p.splitK + piece) * p.outputSlots;
+          for (int64_t R = Ra; R < Rb;) {
+            const int64_t id = idBase + R, n = std::min(Rb - R, pim::kPacketsPerRow - id % pim::kPacketsPerRow);
+            lastGatherRead[curCore] = gdmaLoad(in.pim->outputTileAddress(id, pu, rank * channels), base + uint64_t((R - Ra) * slice),
+                                               uint32_t(slice), uint32_t(n), uint32_t(colBytes), uint32_t(slice));
+            R += n;
+          }
+          ldma(target + uint64_t((lo - f0) * 4), base + uint64_t((nl - Ra * 64) * 4), uint32_t((nh - nl) * 4), 1, 0, 0, true);
+        }
+        if (piece == 0) continue;
+        for (int64_t e = 0; e < c1 - c0; e += 16) {
+          const uint32_t lanes = uint32_t(std::min<int64_t>(16, c1 - c0 - e));
+          setVL(lanes);
+          vload(0, dst + uint64_t(e * 4), 7);        // I32
+          vload(1, partial + uint64_t(e * 4), 7);
+          rec(typedVector(T_ADD, DT_I32, 2, 0, 1, 0, lanes));
+          vstore(dst + uint64_t(e * 4), 2, 8);
+        }
+      }
+    }
+  }
+  return success();
+}
+
+/// Research option --common-layout: the read of one NPU weight tile, in GDMAs of commonChunkRows x 128 B per 4 subchannels. The tile's
+/// subchannel group has its own admission chain, so the tiles on the two groups are read at once, and the chains of the cores interleave.
+/// Only the first two GDMAs wait for the slot's earlier users and the last two guard the slot: inside a chain each follows the one two back.
+bool Codegen::commonWeightLoad(uint64_t logical, uint64_t slot, uint32_t bytes) {
+  if (!in.commonWeights) return false;
+  const pim::CommonWeight *cw = nullptr;
+  for (const pim::CommonWeight &c : *in.commonWeights)
+    if (logical >= c.logical && logical < c.logical + c.bytes) { cw = &c; break; }
+  if (!cw) return false;
+  const int64_t tile = int64_t(logical - cw->logical) / (cw->k * 32);
+  assert(int64_t(bytes) == cw->k * 32);
+  const uint64_t end = slot + bytes;
+  for (const Acc &a : l2acc)
+    if (a.id < 0 && a.core == curCore && overlaps(a.s, a.e, slot, end)) {
+      flush();
+      break;
+    }
+  std::vector<int> deps;
+  for (const Acc &a : l2acc)
+    if (overlaps(a.s, a.e, slot, end) && a.id >= 0) deps.push_back(a.id);
+  if (readAfterGather)
+    for (auto [core, id] : lastGatherRead) deps.push_back(id);
+  reachableDependencies(deps);
+  std::sort(deps.begin(), deps.end());
+  deps.erase(std::unique(deps.begin(), deps.end()), deps.end());
+  const pim::CommonShape shape = pim::commonShape(cw->n);
+  const int64_t local = (tile * 32) % (shape.nPad / pim::kPUs);
+  w.gdmaChainGroup = 1 + int((local % 64) / 32);
+  const int chunkRows = std::max(1, in.commonChunkRows);
+  int last = -1, previous = -1, count = 0;
+  for (int64_t row = 0; row < cw->k; row += 4 * chunkRows) {
+    // A chunk stays inside one sweep: the columns of a DRAM row.
+    const int64_t inner = row % pim::kKPerSweep, rows4 = std::min<int64_t>(chunkRows, (pim::kKPerSweep - inner) / 4);
+    const int id = w.appendGdma(ProgramBuilder::Kind::GdmaLoad, count < 2 ? deps : std::vector<int>{}, cw->address(tile, row),
+                                slot + uint64_t(row) * 32, 128, uint32_t(rows4), 1024, 128, true);
+    previous = last;
+    last = id;
+    ++count;
+    if (rows4 != chunkRows) row += 4 * (rows4 - chunkRows);
+  }
+  w.gdmaChainGroup = 0;
+  llvm::erase_if(l2acc, [&](const Acc &a) { return a.s >= slot && a.e <= end; });
+  l2acc.push_back({slot, end, last, curCore, GW});
+  if (previous >= 0) l2acc.push_back({slot, end, previous, curCore, GW});
+  return true;
 }
 
 /// L1 scratch columns for `packets` activation packets at `src`: column p (colBytes() = 4 bank groups x

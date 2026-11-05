@@ -208,7 +208,7 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
   // These resource edges supplement true memory hazards. The predecessor is
   // already appended, so an added edge cannot introduce a command DAG cycle.
   if (gdmaLookahead && admitted) {
-    const auto &history = phaseGdmas[logicalCore];
+    const auto &history = phaseGdmas[logicalCore + 256 * gdmaChainGroup];
     if (history.size() >= gdmaLookahead) {
       c.deps.push_back(history[history.size() - gdmaLookahead]);
       std::sort(c.deps.begin(), c.deps.end());
@@ -216,7 +216,7 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
     }
   }
   int id = push(std::move(c));
-  if (gdmaLookahead && admitted) phaseGdmas[logicalCore].push_back(id);
+  if (gdmaLookahead && admitted) phaseGdmas[logicalCore + 256 * gdmaChainGroup].push_back(id);
   return id;
 }
 
@@ -245,8 +245,54 @@ int ProgramBuilder::gdmaStore(uint64_t lp6, uint64_t l2, uint32_t bytes, uint32_
   return g;
 }
 
+/// Research option --common-layout: tens of thousands of small GDMAs per phase can put a dependency out of the record's 16-bit
+/// distance. Such a dependency travels through barriers placed in range. Programs without one are untouched.
+void ProgramBuilder::relayFarDependencies() {
+  const size_t range = (size_t(1) << 16) - 1024;
+  std::vector<size_t> lastFar(cmds.size(), 0);
+  bool any = false;
+  for (size_t id = 0; id < cmds.size(); ++id)
+    for (int d : cmds[id].deps)
+      if (id - size_t(d) >= range) {
+        lastFar[size_t(d)] = std::max(lastFar[size_t(d)], id);
+        any = true;
+      }
+  if (!any) return;
+  std::vector<Command> out;
+  out.reserve(cmds.size() + 64);
+  std::vector<int> newId(cmds.size(), -1);
+  std::map<int, int> relay;   // original id with a far consumer still to come -> latest barrier that carries it
+  for (size_t id = 0; id < cmds.size(); ++id) {
+    for (auto it = relay.begin(); it != relay.end();) {
+      if (lastFar[size_t(it->first)] < id) {
+        it = relay.erase(it);
+        continue;
+      }
+      if (out.size() - size_t(it->second) >= range / 2) {
+        Command b;
+        b.kind = Kind::Barrier;
+        b.deps = {it->second};
+        b.phase = cmds[id].phase;
+        out.push_back(std::move(b));
+        it->second = int(out.size()) - 1;
+      }
+      ++it;
+    }
+    Command c = cmds[id];
+    for (int &d : c.deps) {
+      const int mapped = newId[size_t(d)];
+      d = out.size() - size_t(mapped) >= range ? relay.at(d) : mapped;
+    }
+    newId[id] = int(out.size());
+    if (lastFar[id]) relay[int(id)] = newId[id];
+    out.push_back(std::move(c));
+  }
+  cmds = std::move(out);
+}
+
 bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
   flushBlock();
+  relayFarDependencies();
   // ISA ver 2.0: every core block is lowered from the builder stream; a command's completion
   // event is its ordinal.
   std::vector<uint32_t> out(isa2::kHeaderWords, 0);
@@ -260,7 +306,13 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
     const Command &c = cmds[id];
     if (traceOperations)
       sourceCommands.push_back(llvm::json::Object{{"command", int64_t(id)}, {"source", c.source}});
-    if (!depsFit(id, c.deps)) return bad("dependencies do not fit the ISA ver 2.0 record", id);
+    if (!depsFit(id, c.deps)) {
+      for (int d : c.deps)
+        if (size_t(d) + (size_t(1) << 16) <= id)
+          llvm::errs() << "  dependency " << d << " kind " << int(cmds[size_t(d)].kind) << " of kind " << int(c.kind)
+                       << ", phase " << phaseNames[size_t(c.phase)] << " commands " << cmds.size() << "\n";
+      return bad("dependencies do not fit the ISA ver 2.0 record", id);
+    }
     const std::vector<uint32_t> deps(c.deps.begin(), c.deps.end());
     if (c.kind == Kind::Barrier) {
       auto record = isa2::barrierRecord(uint32_t(id), deps);

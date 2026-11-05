@@ -333,6 +333,8 @@ private:
 
   // ---- PIM boundary (CodegenPim.cpp) ---------------------------------------------------------
   LogicalResult gatherPimOut(const View &s, const View &d, std::string &err);
+  LogicalResult gatherPimCommon(const View &s, const View &d, std::string &err);
+  bool commonWeightLoad(uint64_t logical, uint64_t slot, uint32_t bytes);
   LogicalResult scatterPimAct(const View &s, const View &d, std::string &err);
   LogicalResult scatterPimActCores(const View &s, const View &d, int feedCores, std::string &err);
   void storeActivationPackets(int64_t actIndex, uint64_t l2, int64_t first, int64_t count);

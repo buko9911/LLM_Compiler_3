@@ -83,6 +83,70 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   return int64_t(projections.size()) - 1;
 }
 
+int64_t Program::addCommonProjection(const std::string &name, const std::vector<std::pair<std::string, int64_t>> &segments, int64_t k,
+                                     const std::vector<int64_t> &inputs, int rank, bool mayCutK) {
+  Projection p;
+  p.name = name;
+  p.common = true;
+  p.segments = segments;
+  for (const auto &seg : segments) p.n += seg.second;
+  p.k = k;
+  const CommonShape c = commonShape(p.n);
+  p.accs = c.accs;
+  p.tailAccs = c.tailAccs;
+  p.tailBlocks = c.tailBlocks;
+  p.nPad = c.nPad;
+  p.splitK = commonLayout == 2 && mayCutK && p.sweeps() % 2 == 0 ? 2 : 1;
+  p.activations = inputs;
+  p.outputBase = nextOutput;
+  if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
+  const int64_t blocks = p.blocks();
+  // Blocks go round the subchannels, so stream i of every subchannel holds the same registers. Piece p stays on rank p.
+  auto partOf = [&](int64_t piece, int64_t b) {
+    const int64_t inSet = b < p.mainBlocks() ? b : b - p.mainBlocks();
+    const int rk = p.splitK > 1 ? int(piece) : rank;
+    return rk * channels + int(inSet % kPUs);
+  };
+  p.streamPart.resize(size_t(blocks * p.splitK));
+  for (int64_t piece = 0; piece < p.splitK; ++piece)
+    for (int64_t b = 0; b < blocks; ++b) p.streamPart[size_t(piece * blocks + b)] = partOf(piece, b);
+  // Emission: round by round over the subchannels, K pieces in turn; on odd rounds the second piece first, so a rank stays busy for
+  // two streams in a row and the rank changes half as often.
+  const int64_t rounds = (blocks + kPUs - 1) / kPUs + (p.tailBlocks % kPUs ? 1 : 0);
+  (void)rounds;
+  std::vector<std::vector<int64_t>> byRound;
+  for (int64_t b = 0; b < blocks; ++b) {
+    const size_t round = size_t(b < p.mainBlocks() ? b / kPUs : p.mainBlocks() / kPUs + (b - p.mainBlocks()) / kPUs);
+    if (byRound.size() <= round) byRound.resize(round + 1);
+    byRound[round].push_back(b);
+  }
+  for (size_t round = 0; round < byRound.size(); ++round)
+    for (int64_t step = 0; step < p.splitK; ++step) {
+      const int64_t piece = (round & 1) ? p.splitK - 1 - step : step;
+      for (int64_t b : byRound[round]) p.streamOrder.push_back(piece * blocks + b);
+    }
+  p.streamWeightBase.assign(p.streamPart.size(), 0);
+  for (int64_t g = 0; g < int64_t(p.streamPart.size()); ++g) {
+    const int part = p.streamPart[size_t(g)];
+    p.streamWeightBase[size_t(g)] = nextWeight[size_t(part)];
+    nextWeight[size_t(part)] += p.streamTiles(g);
+  }
+  // Keep the partitions of the set level: a tail on fewer subchannels would shift the next projection's rows.
+  int64_t most = 0;
+  for (int c2 = 0; c2 < partitions; ++c2) most = std::max(most, nextWeight[size_t(c2)]);
+  for (int c2 = 0; c2 < partitions; ++c2)
+    if (nextWeight[size_t(c2)] != 0) nextWeight[size_t(c2)] = (most + kPacketsPerRow * 2 - 1) / (kPacketsPerRow * 2) * (kPacketsPerRow * 2);
+  p.assignOutputSlots();
+  nextOutput += int64_t(inputs.size()) * p.splitK * p.outputSlots;
+  for (int64_t a : inputs)
+    for (int part : p.streamPart)
+      if (!std::count(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end(), part))
+        activations[size_t(a)].parts.push_back(part);
+  for (int64_t a : inputs) std::sort(activations[size_t(a)].parts.begin(), activations[size_t(a)].parts.end());
+  projections.push_back(p);
+  return int64_t(projections.size()) - 1;
+}
+
 std::vector<std::pair<int64_t, int64_t>> Program::activationPackets(int64_t index, int rank) const {
   std::vector<std::pair<int64_t, int64_t>> ranges;
   for (const Projection &p : projections) {
@@ -193,7 +257,8 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
     return Result<bool>::failure(p.name + ": PIM stream needs an even accumulator count 2..16 and whole-sweep K pieces");
   for (int m = 0; m < p.tokens(); ++m) {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
-    for (int64_t g = 0; g < streams; ++g) {
+    for (int64_t order = 0; order < streams; ++order) {
+      const int64_t g = p.streamOrder.empty() ? order : p.streamOrder[size_t(order)];
       const int64_t block = g % blocks, piece = g / blocks;
       const int accs = p.blockAccs(block);
       auto make = [&](Opcode opcode) {
@@ -208,7 +273,7 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
       }
       for (int64_t sweep = 0; sweep < p.pieceSweeps(); ++sweep) {
         int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * kInTiles;
-        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * accs * kInTiles;
+        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * p.sweepTiles(accs);
         if (firstA + kInTiles > INT32_MAX || firstW + accs * kInTiles > INT32_MAX)
           return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
         // A load fills a whole 32-byte input register (four logical K=8

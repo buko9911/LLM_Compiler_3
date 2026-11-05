@@ -249,7 +249,8 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
       env[iv] = *lb + tile * *step;
       auto src = viewOf(stream.getSource(), err);
       if (failed(src)) return failure();
-      gdmaLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb), 1, 0, 0, true);
+      if (!commonWeightLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb)))
+        gdmaLoad(addr(*src), slotAddress(tile), uint32_t(src->elements()*src->eb), 1, 0, 0, true);
       return success();
     };
     for (int64_t j = 0; j < std::min<int64_t>(n,nslots); ++j)
@@ -313,7 +314,8 @@ LogicalResult Codegen::emitFor(scf::ForOp f, std::string &err) {
         env[iv] = *lb + issued * *step;
         FailureOr<View> v = viewOf(stream.getSource(), err);
         if (failed(v)) return failure();
-        gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0, true);
+        if (!commonWeightLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb)))
+          gdmaLoad(addr(*v), slotAddress(issued), uint32_t(v->elements() * v->eb), 1, 0, 0, true);
       }
       streamSlot[stream] = slotAddress(i);
     }

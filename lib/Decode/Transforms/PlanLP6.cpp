@@ -61,6 +61,11 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                                   : banksetPingPong == 1 ? 12 : banksetPingPong;
     program.channels = specOr->pim.channels;
     program.partitions = specOr->pim.partitions;
+    program.commonLayout = commonLayout;
+    if (commonLayout && (program.channels != pim::kPUs || specOr->pim.concurrentRanks)) {
+      module.emitError("common-layout needs 8 subchannels and pim.concurrent_ranks = false");
+      return signalPassFailure();
+    }
     if (program.channels < 1 || program.partitions < 1 || program.partitions > program.channels * pim::kRanks) {
       module.emitError() << "pim.partitions " << program.partitions << " must be 1 .. pim.channels x " << pim::kRanks;
       return signalPassFailure();
@@ -151,7 +156,34 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       int open = 0;
       for (int c = 0; c < program.partitions; ++c) open += loads.count(c) == 0;
       std::vector<pimcost::Shape> shapes(group.size());
-      if (!group.empty()) {
+      if (commonLayout && !group.empty()) {
+        int rank = 0;
+        for (int c = 0; c < program.partitions; ++c)
+          if (!loads.count(c)) { rank = program.partRank(c); break; }
+        std::vector<std::pair<std::string, int64_t>> segments;
+        std::string label;
+        for (auto [i, q] : llvm::enumerate(group)) {
+          label += (i ? ";" : "") + q.getWeight().str();
+          segments.push_back({q.getWeight().str(), rows[i]});
+        }
+        const int64_t pi = program.addCommonProjection(label, segments, K, acts, rank, allowSplit);
+        pim::Projection &p = program.projections[size_t(pi)];
+        p.computeFirst = records;
+        p.computeCount = p.commands();
+        int64_t base = 0;
+        for (auto [i, q] : llvm::enumerate(group)) {
+          auto out = cast<BlockArgument>(q.getInit());
+          pimBuffers[call.getOperand(out.getArgNumber())] = b.getDictionaryAttr(
+              {b.getNamedAttr("layout", b.getStringAttr("pim_out")), b.getNamedAttr("proj", b.getI64IntegerAttr(pi)),
+               b.getNamedAttr("seg_base", b.getI64IntegerAttr(base))});
+          base += rows[i];
+        }
+        records += p.computeCount;
+        cost::recordDecision(callee, "pim common layout", label,
+                             "A=" + std::to_string(p.accs) + " S=" + std::to_string(p.splitK) + " tail " +
+                                 std::to_string(p.tailBlocks) + "xA=" + std::to_string(p.tailAccs),
+                             {{"rows", double(p.n)}, {"k", double(K)}});
+      } else if (!group.empty()) {
         pimcost::Estimate best, plain = pimcost::estimate(*specOr, M, K, rows, shapes, open);
         shapes = pimcost::choose(*specOr, M, K, rows, open, allowSplit, best);
         std::string label, choice;
@@ -167,7 +199,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                               {"pim_us_512_rows", plain.pimUs}, {"gather_us_512_rows", plain.gatherUs}});
       }
       size_t qi = 0;
-      callee.walk([&](hyb::QMatmulOp q) {
+      if (!commonLayout) callee.walk([&](hyb::QMatmulOp q) {
         auto out = cast<BlockArgument>(q.getInit());
         auto outT = cast<MemRefType>(out.getType());
         const pimcost::Shape shape = shapes[qi++];
@@ -192,7 +224,8 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       // read below the target's bound, cut at K sweeps (the partition with the fewest sets the limit).
       if (!group.empty()) {
         std::map<int, int64_t> sweepsOf;
-        for (int64_t pi = int64_t(program.projections.size()) - int64_t(group.size()); pi < int64_t(program.projections.size()); ++pi) {
+        for (int64_t pi = int64_t(program.projections.size()) - (commonLayout ? 1 : int64_t(group.size()));
+             pi < int64_t(program.projections.size()); ++pi) {
           const pim::Projection &p = program.projections[size_t(pi)];
           for (int part : p.streamPart) sweepsOf[part] += int64_t(p.tokens()) * p.pieceSweeps();
         }
@@ -276,12 +309,45 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     // Room for the NPU code generator's constant pools (one small blob per phase).
     uint64_t extraLimit = (denseEnd + 255) / 256 * 256 + (uint64_t(1) << 20);
     cursor = extraLimit;
+    // Common layout: NPU GEMV blocks keep a logical address for planning (out of the DRAM range); their rows go to DRAM rows below.
+    uint64_t virtualCursor = uint64_t(1) << 40;
     for (W &w : weights)
       if (w.layout != "row_scale") {
+        if (commonLayout) {
+          virtualCursor = (virtualCursor + 4095) / 4096 * 4096;
+          w.addr = virtualCursor;
+          virtualCursor += uint64_t(w.bytes);
+          continue;
+        }
         cursor = (cursor + 4095) / 4096 * 4096;
         w.addr = place(w.bytes);
       }
     uint64_t npuWeightEnd = cursor;
+    if (commonLayout) {
+      llvm::json::Array cw;
+      int64_t row = int64_t((npuWeightEnd + program.rowBytes() - 1) / program.rowBytes()) + 2;
+      row += row & 1;
+      for (W &w : weights) {
+        if (w.layout == "row_scale") continue;
+        pim::CommonWeight c;
+        c.logical = w.addr;
+        c.bytes = uint64_t(w.bytes);
+        c.k = w.shape[1];
+        c.n = w.shape[0] * 32;
+        c.rowBase = row;
+        c.paired = w.segments && w.segments.size() == 2;
+        c.kHalves = commonLayout == 2 && c.sweeps() % 2 == 0;
+        row += c.rowsUsed() + 2;
+        row += row & 1;
+        cw.push_back(llvm::json::Object{{"logical", int64_t(c.logical)}, {"bytes", int64_t(c.bytes)}, {"n", c.n}, {"k", c.k},
+                                        {"row", c.rowBase}, {"paired", c.paired}, {"k_halves", c.kHalves}});
+      }
+      npuWeightEnd = std::max<uint64_t>(npuWeightEnd, uint64_t(row) * uint64_t(program.rowBytes()));
+      std::string cj;
+      llvm::raw_string_ostream cos(cj);
+      cos << llvm::json::Value(std::move(cw));
+      module->setAttr("hyb.common_weights", b.getStringAttr(cj));
+    }
     for (hyb::WeightOp w : weightOps) {
       const W &info = weights[weightIndex[{w.getName().str(), w.getLayout().str()}]];
       w->setAttr(kLP6, b.getDictionaryAttr({b.getNamedAttr("layout", b.getStringAttr("dense")),
