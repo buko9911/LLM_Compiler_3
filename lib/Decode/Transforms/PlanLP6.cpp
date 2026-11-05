@@ -314,7 +314,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     uint64_t virtualCursor = uint64_t(1) << 40;
     for (W &w : weights)
       if (w.layout != "row_scale") {
-        if (commonLayout) {
+        if (commonLayout && (commonOnly.empty() || llvm::StringRef(w.name).contains(commonOnly))) {
           virtualCursor = (virtualCursor + 4095) / 4096 * 4096;
           w.addr = virtualCursor;
           virtualCursor += uint64_t(w.bytes);
@@ -329,7 +329,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       int64_t row = int64_t((npuWeightEnd + program.rowBytes() - 1) / program.rowBytes()) + 2;
       row += row & 1;
       for (W &w : weights) {
-        if (w.layout == "row_scale") continue;
+        if (w.layout == "row_scale" || !(commonOnly.empty() || llvm::StringRef(w.name).contains(commonOnly))) continue;
         pim::CommonWeight c;
         c.logical = w.addr;
         c.bytes = uint64_t(w.bytes);
@@ -341,7 +341,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         row += c.rowsUsed() + 2;
         row += row & 1;
         cw.push_back(llvm::json::Object{{"logical", int64_t(c.logical)}, {"bytes", int64_t(c.bytes)}, {"n", c.n}, {"k", c.k},
-                                        {"row", c.rowBase}, {"paired", c.paired}, {"k_halves", c.kHalves}});
+                                        {"row", c.rowBase}, {"paired", c.paired}, {"k_halves", c.kHalves}, {"name", w.name}, {"rows_used", c.rowsUsed()}});
       }
       npuWeightEnd = std::max<uint64_t>(npuWeightEnd, uint64_t(row) * uint64_t(program.rowBytes()));
       std::string cj;
