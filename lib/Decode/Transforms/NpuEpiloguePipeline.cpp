@@ -206,7 +206,6 @@ struct HybNpuEpiloguePipelinePass
             ++consumers;
           }
       }
-      fn->setAttr("hyb.epilogue_pipelines", b.getI64IntegerAttr(count));
       if (consumers) fn->setAttr("hyb.epilogue_consumers", b.getI64IntegerAttr(consumers));
     }
   }

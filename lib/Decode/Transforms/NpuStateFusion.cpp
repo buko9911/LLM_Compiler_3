@@ -90,7 +90,6 @@ struct HybNpuStateFusionPass : mlir::hybrid::impl::HybNpuStateFusionBase<HybNpuS
         if (ops.empty()) continue;
         fused += fuse(fn, state, ops, *target);
       }
-      if (fused) fn->setAttr("hyb.state_fusions", IntegerAttr::get(IntegerType::get(&getContext(), 64), fused));
     }
   }
 
@@ -191,7 +190,6 @@ struct HybNpuStateFusionPass : mlir::hybrid::impl::HybNpuStateFusionBase<HybNpuS
     }
     for (Operation *op : llvm::reverse(ops)) op->erase();
     forall->setAttr("hyb.cores", b.getI64IntegerAttr(cores));
-    forall->setAttr("hyb.state_fused", b.getUnitAttr());
     return true;
   }
 };

@@ -24,7 +24,6 @@
     "l2_staging_bytes_per_core": 0,
     "l1_reserved_bytes": 262144,
     "gemv_tile_bytes": 131072,
-    "completion_event_slots": 65536,
     "weight_stream_max_slots": 0,
     "input_tile_columns": 128,
     "gdma_lookahead": 2,

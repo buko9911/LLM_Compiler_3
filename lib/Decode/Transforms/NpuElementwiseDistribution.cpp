@@ -273,7 +273,6 @@ LogicalResult distributeRows(func::FuncOp fn, const TargetSpec &target, IRRewrit
     if (!splitDecision(fn, root, "split rows", cycles, cores, target) || !chainFits(root, chain, cores, target))
       continue;
     root->setAttr(marker, rewriter.getUnitAttr());
-    root->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
     for (Operation *op : chain)
       if (!isa<linalg::FillOp>(op)) op->setAttr(marker, rewriter.getUnitAttr());
     SmallVector<OpFoldResult> threads(cast<TilingInterface>(root).getLoopIteratorTypes().size(),
@@ -295,7 +294,6 @@ LogicalResult distributeRows(func::FuncOp fn, const TargetSpec &target, IRRewrit
     loop->setAttr("hyb.cores", rewriter.getI64IntegerAttr(cores));
     loop->setAttr(marker, rewriter.getUnitAttr());
     loop->setAttr("hyb.elementwise_axis", rewriter.getI64IntegerAttr(0));
-    loop->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
     int64_t producers = llvm::count_if(chain, [](Operation *op) { return !isa<linalg::FillOp>(op); });
     loop->setAttr("hyb.row_chain", rewriter.getI64IntegerAttr(producers));
     // Consumers precede their producers in `chain`, so each one is dead when it is reached. Fusion
@@ -349,7 +347,6 @@ struct HybNpuElementwiseDistributePass
         // Cloned scalar code keeps this marker and its local shape in the
         // operation map; no source ordinal is assumed stable across passes.
         generic->setAttr(marker, rewriter.getUnitAttr());
-        generic->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
         rewriter.setInsertionPoint(generic);
         auto result = scf::tileUsingSCF(rewriter, cast<TilingInterface>(generic.getOperation()), options);
         if (failed(result) || result->loops.size() != 1) {
@@ -360,7 +357,6 @@ struct HybNpuElementwiseDistributePass
         loop->setAttr("hyb.cores", rewriter.getI64IntegerAttr(part->cores));
         loop->setAttr(marker, rewriter.getUnitAttr());
         loop->setAttr("hyb.elementwise_axis", rewriter.getI64IntegerAttr(part->axis));
-        loop->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
         rewriter.replaceOp(generic, result->replacements);
         ++count;
       }
@@ -396,7 +392,6 @@ struct HybNpuElementwiseDistributePass
         loop->setAttr("hyb.cores", rewriter.getI64IntegerAttr(cores));
         loop->setAttr(marker, rewriter.getUnitAttr());
         loop->setAttr("hyb.elementwise_axis", rewriter.getI64IntegerAttr(0));
-        loop->setAttr("hyb.elementwise_original_shape", rewriter.getDenseI64ArrayAttr(type.getShape()));
         rewriter.replaceOp(t, result->replacements);
         ++transposes;
       }

@@ -116,7 +116,6 @@ bool transposeOutput(linalg::LinalgOp matrix, Value a, Value b, Value c,
   auto alloc = [&](ArrayRef<int64_t> shape) {
     auto result = memref::AllocOp::create(builder, matrix.getLoc(),
       MemRefType::get(shape, at.getElementType(), MemRefLayoutAttrInterface{}, at.getMemorySpace()));
-    result->setAttr("hyb.matmul_transpose_scratch", builder.getUnitAttr());
     return result;
   };
   auto packedA = alloc(ashape), temporary = alloc(cshape);

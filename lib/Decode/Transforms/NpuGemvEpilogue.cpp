@@ -347,7 +347,6 @@ struct HybNpuGemvEpiloguePass : mlir::hybrid::impl::HybNpuGemvEpilogueBase<HybNp
       builder.setInsertionPoint(op);
       auto loop = scf::ForallOp::create(builder, loc, attrs(builder, {cores}), ValueRange{shared}, std::nullopt);
       loop->setAttr("hyb.cores", builder.getI64IntegerAttr(cores));
-      loop->setAttr("hyb.pim_result_consumer", builder.getUnitAttr());
       builder.setInsertionPointToStart(loop.getBody());
       auto index = [&](int64_t v) -> Value { return arith::ConstantIndexOp::create(builder, loc, v); };
       Value start = arith::AddIOp::create(builder, loc,

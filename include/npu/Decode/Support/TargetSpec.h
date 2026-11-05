@@ -19,7 +19,6 @@ struct TargetSpec {
     double clockMHz = 800;
     int cores = 4, saRows = 32, saCols = 32;
     int64_t l1Bytes = 4 << 20, l2Bytes = 8 << 20;
-    int64_t completionEventSlots = 65536;  // commands per program (simulator completion events)
     // Cost model of hyb-partition: a fixed cost per NPU GEMV.
     double gemvFixedUs = 2.0;
 
@@ -80,7 +79,6 @@ struct TargetSpec {
     bool concurrentRanks = true;
     /// Partitions that compute at the same time, and the ranks one PIM phase uses.
     int parallelPartitions() const { return concurrentRanks ? partitions : std::min(partitions, channels); }
-    int phaseRanks() const { return concurrentRanks ? ranks : 1; }
     // ---- stream layout cost (npu/Decode/Support/PimCost.h), measured on the simulator ----------
     /// DRAM CK per LdMAC in a long stream, row activation and precharge included.
     double ldmacCK = 0;

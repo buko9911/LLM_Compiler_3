@@ -41,7 +41,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       "l1_read_bytes_per_cycle", "l1_write_bytes_per_cycle", "mma_k_per_cycle", "mma_pipeline_cycles",
       "vector_lanes", "vector_exp_per_cycle", "vector_rcp_per_cycle", "vector_sqrt_per_cycle", "gdma_read_gbps", "ldma_gbps_per_core", "command_fetch_words_per_cycle",
       "core_split_us", "core_split_no_stream_us", "l1_reserved_bytes", "l2_staging_bytes_per_core", "weight_stream_max_slots",
-      "gemv_tile_bytes", "completion_event_slots", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
+      "gemv_tile_bytes", "staging_misc_bytes", "gdma_lookahead", "input_tile_columns"};
   static constexpr llvm::StringLiteral kPimKeys[] = {
       "clock_mhz", "pus", "lanes", "accumulators", "k_per_sweep", "channels", "ranks", "partitions",
       "concurrent_ranks", "nlld_ck", "bankset_pingpong_lead", "ldmac_ck", "sweep_ck", "stream_ck", "two_rank_factor",
@@ -134,7 +134,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(l, "capacity_bytes", s.lp6.capacityBytes);
   num(n, "l1_reserved_bytes", s.npu.l1ReservedBytes); num(n, "l2_staging_bytes_per_core", s.npu.l2StagingPerCore);
   num(n, "weight_stream_max_slots", s.npu.weightStreamMaxSlots);
-  num(n, "gemv_tile_bytes", s.npu.gemvTileBytes); num(n, "completion_event_slots", s.npu.completionEventSlots);
+  num(n, "gemv_tile_bytes", s.npu.gemvTileBytes);
   num(n, "staging_misc_bytes", s.npu.stagingMiscBytes);
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");

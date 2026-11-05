@@ -60,7 +60,6 @@ struct LowerNpuGemv : OpRewritePattern<hyb::QMatmulOp> {
           linalg::YieldOp::create(b, l, ValueRange{arith::AddIOp::create(b, l, args[2], p).getResult()});
         });
     g->setAttr("hyb.npu_gemv", op.getWeightAttr());
-    if (auto grp = op.getGroupAttr()) g->setAttr("hyb.group", grp);
     SmallVector<ReassociationIndices> re = {{0}, {1, 2}};
     Value acc = tensor::CollapseShapeOp::create(rewriter, loc, accT, g.getResult(0), re);
     rewriter.replaceOp(op, acc);

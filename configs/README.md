@@ -23,7 +23,6 @@ two disagree.
 | `l1_read_bytes_per_cycle`, `l1_write_bytes_per_cycle` | 128, 128 | hardware | 32 banks x 4 B |
 | `mma_k_per_cycle`, `mma_pipeline_cycles` | 2, 2 | hardware | INT8 matrix timing |
 | `vector_lanes`, `vector_exp_per_cycle`, `vector_rcp_per_cycle`, `vector_sqrt_per_cycle` | 16, 4, 2, 2 | hardware | VPU lanes and shared SFUs |
-| `completion_event_slots` | 65536 | hardware | Commands per program |
 | `gdma_read_gbps` | 101.1 | measured | Sustained LP6 read of one GDMA, link 64 B/cycle (`v2_lp6_bandwidth_micro.py`, 7 MiB, 2026-11-04) |
 | `ldma_gbps_per_core` | 26.9 | measured | Sustained L2 -> L1 local DMA per core (same tool, 4 cores 107.65 GB/s) |
 | `command_fetch_words_per_cycle` | 4 | simulator | System command words read per cycle (`fetch_words_per_cycle` in the NPU settings) |

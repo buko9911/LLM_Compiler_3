@@ -190,7 +190,6 @@ struct Program {
     return packetAddress(baseRows().output, tile, pu, part);
   }
   // Logical output rows of stored tile t of PU pu: 8 rows, in packet word order.
-  int64_t firstRow(const Projection &p, int pu, int64_t t) const { return pu * p.rowsPerPU() + t * 8; }
   // Visits the same packets, in the same order, as forEachWeightPacket, but
   // needs no model bytes. Address analysis and consumers of the stored weight
   // share the packer's logical-to-physical mapping through this callback.

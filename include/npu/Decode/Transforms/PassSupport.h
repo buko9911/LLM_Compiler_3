@@ -35,14 +35,6 @@ inline SmallVector<func::FuncOp> getNpuPhases(ModuleOp module) {
   return phases;
 }
 
-/// Whether the module has a PIM phase. The NPU-only optional passes leave such modules alone.
-inline bool hasPimPhase(ModuleOp module) {
-  return llvm::any_of(module.getOps<func::FuncOp>(), [](func::FuncOp fn) {
-    auto phase = fn->getAttrOfType<StringAttr>(kPhase);
-    return phase && phase.getValue() == "pim";
-  });
-}
-
 /// Ops that only reinterpret a memref (no data movement).
 inline bool isViewOp(Operation *op) {
   return isa<memref::SubViewOp, memref::ExpandShapeOp, memref::CollapseShapeOp, memref::CastOp,

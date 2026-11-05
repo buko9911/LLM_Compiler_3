@@ -369,7 +369,6 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     }
     module->setAttr("hyb.lp6_dense_end", b.getI64IntegerAttr(int64_t(denseEnd)));
     module->setAttr("hyb.lp6_extra_limit", b.getI64IntegerAttr(int64_t(extraLimit)));
-    module->setAttr("hyb.lp6_end", b.getI64IntegerAttr(int64_t(end)));
     module->setAttr("hyb.pim_records", b.getI64IntegerAttr(records));
   }
 };

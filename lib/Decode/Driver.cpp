@@ -88,21 +88,17 @@ bool checkOptions() {
 /// Attributes the compiler itself attaches. A frontend graph must not contain them: they would
 /// bypass the checks of the CLI options that set them or pretend a pass already ran.
 constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
-    // CLI requests (set on the module before the pipeline runs).
-    // PIM packet kernel and 4-core activation feed.
     // hyb-npu-projection-fusion
     "hyb.weight_segments", "hyb.projection_fusions",
     // hyb-npu-flash-attention
-    "hyb.flash_attention", "hyb.flash_tile", "hyb.flash_decoding", "hyb.flash_math", "hyb.flash_merge",
+    "hyb.flash_attention", "hyb.flash_tile", "hyb.flash_decoding", "hyb.flash_math",
     // hyb-npu-attention-fusion
     "hyb.attention_fusion", "hyb.attention_fused",
-    // hyb-npu-state-fusion
-    "hyb.state_fused", "hyb.state_fusions",
     // hyb-npu-gemv-epilogue
     "hyb.gemv_epilogue", "hyb.gemv_epilogue_fusions", "hyb.gemv_pair",
     // hyb-npu-elementwise-distribute
     "hyb.elementwise_distributed", "hyb.elementwise_axis", "hyb.elementwise_distributions",
-    "hyb.elementwise_original_shape", "hyb.elementwise_candidates", "hyb.elementwise_small",
+    "hyb.elementwise_candidates", "hyb.elementwise_small",
     "hyb.elementwise_unsupported", "hyb.elementwise_capacity", "hyb.elementwise_indivisible",
     "hyb.row_chain", "hyb.row_distributions", "hyb.row_fused", "hyb.transposes_distributed",
     // hyb-npu-rope
@@ -115,11 +111,11 @@ constexpr llvm::StringLiteral kDriverOwnedAttributes[] = {
     "hyb.elide_matrix_init", "hyb.matrix_init_elisions",
     // hyb-npu-matmul-layout
     "hyb.matmul_rhs_pack", "hyb.matmul_rhs_packed", "hyb.matmul_rhs_packings", "hyb.matmul_transpose_output",
-    "hyb.matmul_output_transposes", "hyb.matmul_transpose_scratch",
+    "hyb.matmul_output_transposes",
     // hyb-npu-input-pipeline
     "hyb.input_pipeline_copy", "hyb.input_pipeline_tile", "hyb.input_pipeline_groups", "hyb.input_pipeline_tiles",
     // hyb-npu-epilogue-pipeline
-    "hyb.epilogue_pipeline", "hyb.epilogue_pipelines", "hyb.epilogue_consumer", "hyb.epilogue_consumers",
+    "hyb.epilogue_pipeline", "hyb.epilogue_consumer", "hyb.epilogue_consumers",
     // NpuCost.h: choices and their numbers
     "hyb.decisions",
 };

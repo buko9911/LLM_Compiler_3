@@ -278,12 +278,6 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
     }
     if (c.kind == Kind::CoreBlock) {
       std::vector<uint32_t> in(isa.begin() + c.isaStart, isa.begin() + c.isaStart + c.isaCount), body;
-      if (std::getenv("HYBRID_DUMP_BUILDER_STREAM")) {
-        std::ofstream dump(dir + "/builder_stream.bin", std::ios::binary | std::ios::app);
-        uint32_t n = uint32_t(in.size());
-        dump.write(reinterpret_cast<const char *>(&n), 4);
-        dump.write(reinterpret_cast<const char *>(in.data()), std::streamsize(in.size() * 4));
-      }
       std::vector<size_t> sourceWords;
       auto lowered = isa2::lowerCoreBlock(in, traceOperations ? &sourceWords : nullptr);
       if (!lowered) return bad(lowered.error, id);

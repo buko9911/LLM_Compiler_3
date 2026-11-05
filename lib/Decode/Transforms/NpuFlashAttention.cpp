@@ -392,7 +392,6 @@ public:
     }
     b.setInsertionPointAfter(partial);
     auto merge = forall(headCores, {result}, true);
-    merge->setAttr("hyb.flash_merge", b.getUnitAttr());
     {
       OpBuilder::InsertionGuard guard(b);
       b.setInsertionPoint(merge.getBody()->getTerminator());

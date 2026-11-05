@@ -115,7 +115,6 @@ struct Promoter {
     auto l1 = MemRefType::get(t.getShape(), t.getElementType(), MemRefLayoutAttrInterface(),
                               IntegerAttr::get(IntegerType::get(t.getContext(), 64), kL1));
     auto a = memref::AllocOp::create(b, loc, l1);
-    a->setAttr("hyb.promoted", UnitAttr::get(t.getContext()));
     return a;
   }
 
@@ -437,7 +436,6 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
     }
     fn->setAttr("hyb.l2_staging_per_core", bld.getI64IntegerAttr(staging));
     fn->setAttr("hyb.l1_peak", bld.getI64IntegerAttr(peak[kL1]));
-    fn->setAttr("hyb.l2_peak", bld.getI64IntegerAttr(peak[kL2]));
     return success();
   }
 };

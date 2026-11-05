@@ -158,7 +158,6 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
                                          {"pim_boundary_us", x.c.pimBoundaryUs}, {"npu_us", x.c.npuUs},
                                          {"target", x.target}, {"reason", x.why}, {"shapes", std::move(x.dims)}});
     }
-    module->setAttr("hyb.partition", b.getStringAttr(llvm::formatv("{0} groups on PIM, {1} on NPU", pim, npu).str()));
     if (!report.empty()) {
       std::error_code ec;
       llvm::raw_fd_ostream os(report, ec);

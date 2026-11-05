@@ -142,7 +142,6 @@ struct HybOutlinePhasesPass : mlir::hybrid::impl::HybOutlinePhasesBase<HybOutlin
       auto fn = func::FuncOp::create(b, step.getLoc(), name, fnType);
       fn.setPrivate();
       fn->setAttr(kPhase, b.getStringAttr(seg.kind));
-      if (seg.kind == "pim") fn->setAttr("hyb.group", b.getI64IntegerAttr(seg.group));
       Block *entry = fn.addEntryBlock();
       OpBuilder fb = OpBuilder::atBlockBegin(entry);
       IRMapping map;
