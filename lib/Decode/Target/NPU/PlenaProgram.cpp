@@ -251,43 +251,62 @@ void ProgramBuilder::relayFarDependencies() {
   const size_t range = (size_t(1) << 16) - 1024;
   std::vector<size_t> lastFar(cmds.size(), 0);
   bool any = false;
+  // The barriers added below lengthen distances, so a dependency near the limit needs a relay too.
+  const size_t near = range - range / 4;
   for (size_t id = 0; id < cmds.size(); ++id)
-    for (int d : cmds[id].deps)
-      if (id - size_t(d) >= range) {
-        lastFar[size_t(d)] = std::max(lastFar[size_t(d)], id);
-        any = true;
-      }
+    for (int d : cmds[id].deps) {
+      if (id - size_t(d) >= near) lastFar[size_t(d)] = std::max(lastFar[size_t(d)], id);
+      if (id - size_t(d) >= range) any = true;
+    }
   if (!any) return;
-  std::vector<Command> out;
-  out.reserve(cmds.size() + 64);
-  std::vector<int> newId(cmds.size(), -1);
-  std::map<int, int> relay;   // original id with a far consumer still to come -> latest barrier that carries it
-  for (size_t id = 0; id < cmds.size(); ++id) {
-    for (auto it = relay.begin(); it != relay.end();) {
-      if (lastFar[size_t(it->first)] < id) {
-        it = relay.erase(it);
-        continue;
+  // A pass can still put another dependency out of range: it gets a relay too and the pass runs again.
+  for (;;) {
+    std::vector<Command> out;
+    out.reserve(cmds.size() + 64);
+    std::vector<int> newId(cmds.size(), -1);
+    std::map<int, int> relay;   // original id with a far consumer still to come -> latest barrier that carries it
+    bool missed = false;
+    for (size_t id = 0; id < cmds.size(); ++id) {
+      for (auto it = relay.begin(); it != relay.end();) {
+        if (lastFar[size_t(it->first)] < id) {
+          it = relay.erase(it);
+          continue;
+        }
+        if (out.size() - size_t(it->second) >= range / 2) {
+          Command b;
+          b.kind = Kind::Barrier;
+          b.deps = {it->second};
+          b.phase = cmds[id].phase;
+          out.push_back(std::move(b));
+          it->second = int(out.size()) - 1;
+        }
+        ++it;
       }
-      if (out.size() - size_t(it->second) >= range / 2) {
-        Command b;
-        b.kind = Kind::Barrier;
-        b.deps = {it->second};
-        b.phase = cmds[id].phase;
-        out.push_back(std::move(b));
-        it->second = int(out.size()) - 1;
+      Command c = cmds[id];
+      for (int &d : c.deps) {
+        const int mapped = newId[size_t(d)];
+        if (out.size() - size_t(mapped) < range) {
+          d = mapped;
+          continue;
+        }
+        auto r = relay.find(d);
+        if (r != relay.end()) {
+          d = r->second;
+          continue;
+        }
+        lastFar[size_t(d)] = std::max(lastFar[size_t(d)], id);
+        missed = true;
+        d = mapped;
       }
-      ++it;
+      newId[id] = int(out.size());
+      if (lastFar[id]) relay[int(id)] = newId[id];
+      out.push_back(std::move(c));
     }
-    Command c = cmds[id];
-    for (int &d : c.deps) {
-      const int mapped = newId[size_t(d)];
-      d = out.size() - size_t(mapped) >= range ? relay.at(d) : mapped;
+    if (!missed) {
+      cmds = std::move(out);
+      return;
     }
-    newId[id] = int(out.size());
-    if (lastFar[id]) relay[int(id)] = newId[id];
-    out.push_back(std::move(c));
   }
-  cmds = std::move(out);
 }
 
 bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
