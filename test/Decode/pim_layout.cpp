@@ -23,6 +23,63 @@ static std::map<int, int64_t> openRank(const Program &p, int rank) {
   return loads;
 }
 
+// Research option --common-layout: PIM packets cover every (output, K group) once, and the bursts the NPU reads for a tile in a sweep are
+// exactly the PIM packets of that tile and sweep, so one placement serves both engines (the transposer permutes bytes within them).
+static void commonPlacement() {
+  struct Case { std::vector<std::pair<std::string, int64_t>> segments; int64_t k; bool exactTiles; };
+  const std::vector<Case> cases = {{{{"q", 4096}, {"k", 1024}, {"v", 1024}}, 2560, true},
+                                   {{{"gate", 9728}, {"up", 9728}}, 2560, true},
+                                   {{{"o", 2560}}, 4096, true},
+                                   {{{"down", 2560}}, 9728, true},
+                                   {{{"lm", 151936}}, 2560, false}};
+  for (int mode : {1, 2})
+    for (const Case &c : cases) {
+      Program p;
+      p.channels = 8;
+      p.partitions = 16;
+      p.commonLayout = mode;
+      p.banksetPingPongLead = 12;
+      p.kernelRow = 100;
+      std::map<int, int64_t> loads;
+      const int64_t act = p.addActivation(c.k);
+      p.projections.clear();
+      const int64_t pi = p.addCommonProjection("x", c.segments, c.k, {act}, 0, true);
+      const Projection &q = p.projections[size_t(pi)];
+      require(q.nPad % 32 == 0, "common shape: padded rows");
+      CommonWeight w;
+      w.n = q.n;
+      w.k = c.k;
+      w.rowBase = p.kernelRow;
+      w.paired = q.pairedSegments();
+      w.kHalves = q.splitK == 2;
+      std::map<std::pair<int64_t, int64_t>, std::set<uint64_t>> pimBursts;   // (NPU tile, K sweep) -> packets
+      std::set<std::pair<int64_t, int64_t>> seen;
+      p.forEachWeightPacketLocation(q, [&](const WeightPacketLocation &l) {
+        for (int lane = 0; lane < kLanes; ++lane) {
+          const int64_t n = l.outputChannels[size_t(lane)];
+          if (n >= q.n) continue;
+          require(seen.insert({n, l.inputBegin}).second, "common layout: (output, K group) stored twice");
+          pimBursts[{n / 32, l.inputBegin / kKPerSweep}].insert(l.address);
+        }
+      });
+      require(int64_t(seen.size()) == q.n * c.k / kGroup, "common layout: (output, K group) missing");
+      std::set<uint64_t> all;
+      for (int64_t j = 0; j < q.n / 32; ++j)
+        for (int64_t sweep = 0; sweep < c.k / kKPerSweep; ++sweep) {
+          std::set<uint64_t> npu;
+          for (int64_t row = 0; row < kKPerSweep; ++row) {
+            const uint64_t a = w.address(j, sweep * kKPerSweep + row);
+            npu.insert(a);
+            require(all.insert(a).second, "common layout: NPU row stored twice");
+          }
+          if (c.exactTiles) require(npu == pimBursts[{j, sweep}], "common layout: NPU tile and PIM packets differ");
+        }
+      auto copy = ::npu::decode::fromJSON(::npu::decode::toJSON(p));
+      require(copy.commonLayout == mode && copy.projections[size_t(pi)].common && copy.projections[size_t(pi)].streamOrder == q.streamOrder &&
+                  copy.projections[size_t(pi)].segments == q.segments, "JSON lost the common layout");
+    }
+}
+
 // Consumers must be able to recover logical indices without reading weights.
 // Check bijective coverage including N padding, both ranks/channel counts,
 // row-alternating banks, and the byte/order contract with the image writer.
@@ -196,5 +253,6 @@ int main() {
   require(pingCopy.banksetPingPongLead == 12 &&
               pingCopy.weightPacketAddress(64, 7, 15) == ping.weightPacketAddress(64, 7, 15),
           "JSON lost ping-pong weight layout");
+ commonPlacement();
   std::cout << "PIM layout PASS; Llama image " << llama.endAddress() << " bytes, 129 optimal-load phases\n";
 }
