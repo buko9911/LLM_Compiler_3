@@ -62,6 +62,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
     program.channels = specOr->pim.channels;
     program.partitions = specOr->pim.partitions;
     program.commonLayout = commonLayout;
+    program.commonTurnSweeps = commonTurnSweeps;
     if (commonLayout && (program.channels != pim::kPUs || specOr->pim.concurrentRanks)) {
       module.emitError("common-layout needs 8 subchannels and pim.concurrent_ranks = false");
       return signalPassFailure();

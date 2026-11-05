@@ -112,6 +112,16 @@ struct Projection {
   int commonPU(int index) const { return pairedSegments() ? (index < 4 ? 2 * index : 2 * (index - 4) + 1) : index; }
   int commonPUIndex(int pu) const { return pairedSegments() ? (pu % 2 ? 4 + pu / 2 : pu / 2) : pu; }
   int tokens() const { return int(activations.size()); }
+  // Common layout: the blocks of each round; a round is stream i of every subchannel, which hold the same registers.
+  std::vector<std::vector<int64_t>> commonRounds() const {
+    std::vector<std::vector<int64_t>> byRound;
+    for (int64_t b = 0; b < blocks(); ++b) {
+      const size_t round = size_t(b < mainBlocks() ? b / kPUs : mainBlocks() / kPUs + (b - mainBlocks()) / kPUs);
+      if (byRound.size() <= round) byRound.resize(round + 1);
+      byRound[round].push_back(b);
+    }
+    return byRound;
+  }
   // Output tiles. For each token and K piece, every partition numbers the tiles of its streams from
   // the same id: stream g's register r is tile outputTile(m, piece, g, r). One LP6 column (one tile
   // id) then holds that id's tile of every subchannel, so the NPU gathers whole bank-group slices
@@ -141,6 +151,8 @@ struct Program {
   int banksetPingPongLead = 0;
   // Research option --common-layout: 0 off, 1 one rank per phase, 2 K halves on the two ranks, computed in turn (see commonShape).
   int commonLayout = 0;
+  // With commonLayout 2: the two ranks take turns every this many K sweeps inside a stream (0: whole K halves). Placement unchanged.
+  int commonTurnSweeps = 0;
   const char *weightLayout() const {
     return banksetPingPongLead ? "bankset-row-alternating-v1" : "even-v1";
   }

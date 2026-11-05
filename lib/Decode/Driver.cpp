@@ -66,6 +66,8 @@ static cl::opt<int> banksetPingPong("pim-bankset-pingpong",
 static cl::opt<int> commonLayout("common-layout",
     cl::desc("research: one weight placement that PIM computes on and the NPU reads through a byte transposer (PimLayout.h, "
              "commonShape): 0 off (default), 1 one rank per PIM phase, 2 K halves on the two ranks, computed in turn"), cl::init(0));
+static cl::opt<int> commonTurn("common-rank-turn",
+    cl::desc("research, with --common-layout=2: the two ranks take turns every this many K sweeps inside a stream; 0 whole K halves"), cl::init(0));
 static cl::opt<int> commonChunk("common-chunk-rows",
     cl::desc("research, with --common-layout: an NPU weight tile is read in GDMAs of this many 128-byte rows"), cl::init(8));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
@@ -165,6 +167,7 @@ std::string decodePipeline(const std::string &overrideOpt) {
   const std::string memory =
       "hyb-plan-lp6{spec=" + specFile + " bankset-pingpong=" + std::to_string(banksetPingPong) +
       (commonLayout ? " common-layout=" + std::to_string(commonLayout) : std::string()) +
+      (commonTurn ? " common-rank-turn=" + std::to_string(commonTurn) : std::string()) +
       " reuse-pim-buffers=" + (debugCollect ? "false" : "true") + "},"
       "loop-invariant-code-motion,"
       "hyb-npu-place,"                                        // L1 (one core) or L2 (shared)

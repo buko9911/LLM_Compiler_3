@@ -32,6 +32,7 @@ llvm::json::Value toJSON(const Program &program) {
   for (auto [f, c] : program.phases) ph.push_back(llvm::json::Array{f, c});
   llvm::json::Object common;
   if (program.commonLayout) common["common_layout"] = program.commonLayout;
+  if (program.commonTurnSweeps) common["common_turn_sweeps"] = program.commonTurnSweeps;
   llvm::json::Object out{{"channels", program.channels}, {"partitions", program.partitions}, {"kernel_row", program.kernelRow},
                             {"weight_layout", program.weightLayout()}, {"bankset_pingpong_lead", program.banksetPingPongLead},
                             {"next_w", llvm::json::Array(program.nextWeight)},
@@ -51,6 +52,7 @@ Program fromJSON(const llvm::json::Value &v) {
   pr.kernelRow = *o->getInteger("kernel_row");
   pr.banksetPingPongLead = int(o->getInteger("bankset_pingpong_lead").value_or(0));
   pr.commonLayout = int(o->getInteger("common_layout").value_or(0));
+  pr.commonTurnSweeps = int(o->getInteger("common_turn_sweeps").value_or(0));
   if (pr.banksetPingPongLead < 0 || pr.banksetPingPongLead > 63 || pr.banksetPingPongLead == 1 ||
       o->getString("weight_layout").value_or("even-v1") != pr.weightLayout())
     llvm::report_fatal_error("inconsistent PIM weight layout / ping-pong lead");

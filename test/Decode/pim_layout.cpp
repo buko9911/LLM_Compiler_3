@@ -74,6 +74,21 @@ static void commonPlacement() {
           }
           if (c.exactTiles) require(npu == pimBursts[{j, sweep}], "common layout: NPU tile and PIM packets differ");
         }
+      if (mode == 2 && q.splitK == 2) {
+        // Rank turns inside a stream: every partition still receives the same primitives in the same order.
+        auto perPartition = [&](int turn) {
+          Program t = p;
+          t.commonTurnSweeps = turn;
+          std::vector<Primitive> list;
+          require(bool(t.emitCompute(pi, list)), "common layout: emit failed");
+          std::map<uint32_t, std::vector<std::array<int64_t, 5>>> out;
+          for (const Primitive &x : list)
+            out[x.partition].push_back({int64_t(x.opcode), x.weight, x.activation, x.accumulator, x.output});
+          return std::make_pair(list.size(), out);
+        };
+        const auto whole = perPartition(0);
+        for (int turn : {1, 2, 4, 64}) require(perPartition(turn) == whole, "common layout: rank turns changed the primitives of a partition");
+      }
       auto copy = ::npu::decode::fromJSON(::npu::decode::toJSON(p));
       require(copy.commonLayout == mode && copy.projections[size_t(pi)].common && copy.projections[size_t(pi)].streamOrder == q.streamOrder &&
                   copy.projections[size_t(pi)].segments == q.segments, "JSON lost the common layout");

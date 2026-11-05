@@ -112,14 +112,7 @@ int64_t Program::addCommonProjection(const std::string &name, const std::vector<
     for (int64_t b = 0; b < blocks; ++b) p.streamPart[size_t(piece * blocks + b)] = partOf(piece, b);
   // Emission: round by round over the subchannels, K pieces in turn; on odd rounds the second piece first, so a rank stays busy for
   // two streams in a row and the rank changes half as often.
-  const int64_t rounds = (blocks + kPUs - 1) / kPUs + (p.tailBlocks % kPUs ? 1 : 0);
-  (void)rounds;
-  std::vector<std::vector<int64_t>> byRound;
-  for (int64_t b = 0; b < blocks; ++b) {
-    const size_t round = size_t(b < p.mainBlocks() ? b / kPUs : p.mainBlocks() / kPUs + (b - p.mainBlocks()) / kPUs);
-    if (byRound.size() <= round) byRound.resize(round + 1);
-    byRound[round].push_back(b);
-  }
+  const std::vector<std::vector<int64_t>> byRound = p.commonRounds();
   for (size_t round = 0; round < byRound.size(); ++round)
     for (int64_t step = 0; step < p.splitK; ++step) {
       const int64_t piece = (round & 1) ? p.splitK - 1 - step : step;
@@ -257,42 +250,42 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
   auto validAccs = [](int a) { return a >= 2 && a <= kAccs && a % 2 == 0; };
   if (!validAccs(p.accs) || (p.tailBlocks && !validAccs(p.tailAccs)) || p.splitK < 1 || p.sweeps() % p.splitK)
     return Result<bool>::failure(p.name + ": PIM stream needs an even accumulator count 2..16 and whole-sweep K pieces");
-  for (int m = 0; m < p.tokens(); ++m) {
+  // Sweeps [from, to) of stream g for token m; a piece of a stream clears or stores only at the ends of the stream.
+  auto emitStream = [&](int m, int64_t g, int64_t from, int64_t to) -> Result<bool> {
     const Activation &a = activations[size_t(p.activations[size_t(m)])];
-    for (int64_t order = 0; order < streams; ++order) {
-      const int64_t g = p.streamOrder.empty() ? order : p.streamOrder[size_t(order)];
-      const int64_t block = g % blocks, piece = g / blocks;
-      const int accs = p.blockAccs(block);
-      auto make = [&](Opcode opcode) {
-        Primitive q;
-        q.opcode = opcode;
-        q.partition = uint32_t(p.streamPart[size_t(g)]);
-        return q;
-      };
+    const int64_t block = g % blocks, piece = g / blocks;
+    const int accs = p.blockAccs(block);
+    auto make = [&](Opcode opcode) {
+      Primitive q;
+      q.opcode = opcode;
+      q.partition = uint32_t(p.streamPart[size_t(g)]);
+      return q;
+    };
+    if (from == 0)
       for (int acc = 0; acc < accs; ++acc) {
         auto q = make(Opcode::ClearOutput); q.accumulator = acc;
         commands.push_back(q);
       }
-      for (int64_t sweep = 0; sweep < p.pieceSweeps(); ++sweep) {
-        int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * kInTiles;
-        int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * p.sweepTiles(accs);
-        if (firstA + kInTiles > INT32_MAX || firstW + accs * kInTiles > INT32_MAX)
-          return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
-        // A load fills a whole 32-byte input register (four logical K=8
-        // slices). Emit it once per packet; all slices remain addressable.
-        for (int i = 0; i < kInTiles; i += kSlices) {
-          auto q = make(Opcode::LoadActivation); q.activation = int32_t(firstA + i);
-          commands.push_back(q);
-        }
-        auto q = make(Opcode::GemvStream);
-        q.weight = int32_t(firstW); q.activation = int32_t(firstA); q.accumulator = 0;
-        q.inputs = kInTiles; q.outputs = accs;
-        q.weightInputStride = 1; q.weightOutputStride = kInTiles;
-        q.activationInputStride = 1; q.accumulatorOutputStride = 1;
+    for (int64_t sweep = from; sweep < to; ++sweep) {
+      int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * kInTiles;
+      int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * p.sweepTiles(accs);
+      if (firstA + kInTiles > INT32_MAX || firstW + accs * kInTiles > INT32_MAX)
+        return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
+      // A load fills a whole 32-byte input register (four logical K=8
+      // slices). Emit it once per packet; all slices remain addressable.
+      for (int i = 0; i < kInTiles; i += kSlices) {
+        auto q = make(Opcode::LoadActivation); q.activation = int32_t(firstA + i);
         commands.push_back(q);
       }
+      auto q = make(Opcode::GemvStream);
+      q.weight = int32_t(firstW); q.activation = int32_t(firstA); q.accumulator = 0;
+      q.inputs = kInTiles; q.outputs = accs;
+      q.weightInputStride = 1; q.weightOutputStride = kInTiles;
+      q.activationInputStride = 1; q.accumulatorOutputStride = 1;
+      commands.push_back(q);
+    }
+    if (to == p.pieceSweeps()) {
       int64_t firstO = p.outputTile(m, int(piece), g, 0);
-
       if (firstO + accs / 2 > INT32_MAX)
         return Result<bool>::failure(p.name + ": PIM output tile ID exceeds INT32_MAX");
       for (int reg = 0; reg < accs / 2; ++reg) {
@@ -300,6 +293,25 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
         q.accumulator = 2 * reg; q.output = int32_t(firstO + reg);
         commands.push_back(q);
       }
+    }
+    return Result<bool>::success(true);
+  };
+  for (int m = 0; m < p.tokens(); ++m) {
+    if (p.common && p.splitK == 2 && commonTurnSweeps > 0) {
+      // The registers of a rank keep the partial sum between its turns.
+      for (const std::vector<int64_t> &round : p.commonRounds())
+        for (int64_t from = 0; from < p.pieceSweeps(); from += commonTurnSweeps)
+          for (int64_t piece = 0; piece < p.splitK; ++piece)
+            for (int64_t b : round) {
+              auto done = emitStream(m, piece * blocks + b, from, std::min<int64_t>(from + commonTurnSweeps, p.pieceSweeps()));
+              if (!done) return done;
+            }
+      continue;
+    }
+    for (int64_t order = 0; order < streams; ++order) {
+      const int64_t g = p.streamOrder.empty() ? order : p.streamOrder[size_t(order)];
+      auto done = emitStream(m, g, 0, p.pieceSweeps());
+      if (!done) return done;
     }
   }
   p.computeCount = int64_t(commands.size()) - p.computeFirst;
