@@ -70,6 +70,8 @@ static cl::opt<int> commonTurn("common-rank-turn",
     cl::desc("research, with --common-layout=2: the two ranks take strict turns of at most this many K sweeps, cutting longer K halves; 0 whole K halves in merged turns"), cl::init(0));
 static cl::opt<int> commonChunk("common-chunk-rows",
     cl::desc("research, with --common-layout: an NPU weight tile is read in GDMAs of this many 128-byte rows"), cl::init(8));
+static cl::opt<int> collectLogitRows("collect-logit-rows",
+    cl::desc("research: collect only this many logits rows when all of them fit no SRAM dump (0: all)"), cl::init(0));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
                                   cl::init(false));
 static cl::opt<bool> noOutputCollect("no-output-collect",
@@ -297,7 +299,8 @@ int compileDecode(int argc, char **argv) {
   json::Array outputs;
   std::vector<std::string> uncollected;
   if (!driver::emitCollect(step, prog, program, exit, noOutputCollect, debugCollect, debugPhases, outputs,
-                           spec->npu.l2Bytes, uncollected))
+                           spec->npu.l2Bytes, uncollected, uint64_t(spec->npu.l1BaseBytes), uint64_t(spec->npu.l2BaseBytes),
+                           uint64_t(spec->npu.l1Bytes), collectLogitRows))
     return 1;
   for (const std::string &name : uncollected)
     llvm::errs() << "output " << name << " does not fit the collected SRAM; it stays in LP6 (io.json uncollected)\n";

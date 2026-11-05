@@ -371,7 +371,7 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
       }
       bufs.push_back(b);
     });
-    int64_t l1Base = 4096 + t.npu.l1ReservedBytes, l1Limit = t.npu.l1Bytes;
+    int64_t l1Base = t.npu.l1BaseBytes + 4096 + t.npu.l1ReservedBytes, l1Limit = t.npu.l1BaseBytes + t.npu.l1Bytes;
     int64_t l2Base = t.npu.cores * t.npu.l2StagingPerCore, l2Limit = t.npu.l2Bytes;
     int64_t peak[3] = {0, 0, 0};
     std::vector<size_t> order(bufs.size());
@@ -434,6 +434,12 @@ struct HybNpuMemPlanPass : mlir::hybrid::impl::HybNpuMemPlanBase<HybNpuMemPlanPa
         }
       if (peak[kL2]) peak[kL2] += l2Base;
     }
+    if (t.npu.l2BaseBytes)
+      for (Buf &b : bufs)
+        if (b.space == kL2) {
+          b.offset += t.npu.l2BaseBytes;
+          b.alloc->setAttr("hyb.offset", bld.getI64IntegerAttr(b.offset));
+        }
     fn->setAttr("hyb.l2_staging_per_core", bld.getI64IntegerAttr(staging));
     fn->setAttr("hyb.l1_peak", bld.getI64IntegerAttr(peak[kL1]));
     return success();

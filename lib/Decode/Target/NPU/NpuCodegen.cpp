@@ -202,7 +202,8 @@ LogicalResult Codegen::run(NpuPhaseStats &stats, std::string &err) {
     for (const auto &a : in.carried->l2) l2acc.push_back({a.s, a.e, a.id, a.core, AccKind(a.kind)});
     for (const auto &a : in.carried->lp6) lp6acc.push_back({a.s, a.e, a.id, a.store});
   }
-  scratchBase = uint64_t(kL1Base + kPoolMax);
+  poolL1 = kL1Base + in.spec->npu.l1BaseBytes;
+  scratchBase = uint64_t(poolL1 + kPoolMax);
   collectConstants(fn);
   planMiscStaging(fn);
   if (poolBytes > kPoolMax || kPoolMax >= in.spec->npu.l1ReservedBytes) {

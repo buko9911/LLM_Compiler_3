@@ -19,6 +19,9 @@ struct TargetSpec {
     double clockMHz = 800;
     int cores = 4, saRows = 32, saCols = 32;
     int64_t l1Bytes = 4 << 20, l2Bytes = 8 << 20;
+    // Research: the program uses L1 [l1BaseBytes, l1BaseBytes + l1Bytes) and L2 [l2BaseBytes, l2BaseBytes + l2Bytes), so that two programs merged
+    // into one file (research/race_decoding/drafter_race) do not share memory. Optional keys, 0 when absent.
+    int64_t l1BaseBytes = 0, l2BaseBytes = 0;
     // Cost model of hyb-partition: a fixed cost per NPU GEMV.
     double gemvFixedUs = 2.0;
 

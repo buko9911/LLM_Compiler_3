@@ -79,7 +79,9 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
       // Tokens of this group: the rows of its input (the LM head of a prefill reads one row).
       x.rows = cast<ShapedType>(ops.front().getInput().getType()).getDimSize(0);
       if (x.rows <= 0) x.rows = M;
-      x.c = estimateGemvGroup(*specOr, x.rows, shapes);
+      // A forced group of many GEMVs (a drafter's K and V of every layer on one input): the PIM estimate enumerates stream shapes per member, and
+      // nothing reads it when the target is forced.
+      if (force.empty() || shapes.size() <= 6) x.c = estimateGemvGroup(*specOr, x.rows, shapes);
       // Precedence: --force, then the longest matching override, then the policy; "cost"
       // compares the two estimates.
       x.target = x.c.pimUs + x.c.pimBoundaryUs <= x.c.npuUs ? "pim" : "npu";

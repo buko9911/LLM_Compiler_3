@@ -119,7 +119,7 @@ private:
     if (auto a = in.phase->getAttrOfType<IntegerAttr>("hyb.l2_staging_per_core")) return a.getInt();
     return in.spec->npu.l2StagingPerCore;
   }
-  uint64_t windowBase(int c) const { return uint64_t(c) * uint64_t(window()); }
+  uint64_t windowBase(int c) const { return uint64_t(in.spec->npu.l2BaseBytes) + uint64_t(c) * uint64_t(window()); }
   /// The small-transfer ring at the end of each window (npu.staging_misc_bytes; zero when the
   /// window is too small to give up that much) and the part of the window left to weight rings.
   int64_t miscBytes() const { return stagingMisc; }

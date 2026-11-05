@@ -35,7 +35,8 @@ bool emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &prog,
 bool emitCollect(func::FuncOp step, const pim::Program &prog, plena::ProgramBuilder &program,
                  const std::vector<int> &exit, bool noOutputCollect, bool debugCollect,
                  const std::string &debugPhases, llvm::json::Array &outputs, int64_t l2Bytes,
-                 std::vector<std::string> &uncollected);
+                 std::vector<std::string> &uncollected, uint64_t l1Base = 0, uint64_t l2Base = 0, uint64_t l1Bytes = 4u << 20,
+                 int64_t collectLogitRows = 0);
 
 } // namespace mlir::hybrid::driver
 

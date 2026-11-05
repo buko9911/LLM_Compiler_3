@@ -52,7 +52,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     if (o)
       for (auto &kv : *o) {
         llvm::StringRef key = kv.first;
-        if (!key.starts_with("_") && !llvm::is_contained(keys, key)) {
+        if (!key.starts_with("_") && !llvm::is_contained(keys, key) && !(name == "npu" && (key == "l1_base_bytes" || key == "l2_base_bytes"))) {
           error = (name + "." + key + " is not a target parameter (optimizations have no switches)").str();
           return true;
         }
@@ -72,6 +72,8 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     return failure();
   num(n, "clock_mhz", s.npu.clockMHz); num(n, "cores", s.npu.cores); num(n, "sa_rows", s.npu.saRows);
   num(n, "sa_cols", s.npu.saCols); num(n, "l1_bytes", s.npu.l1Bytes); num(n, "l2_bytes", s.npu.l2Bytes);
+  if (n->get("l1_base_bytes")) num(n, "l1_base_bytes", s.npu.l1BaseBytes);
+  if (n->get("l2_base_bytes")) num(n, "l2_base_bytes", s.npu.l2BaseBytes);
   num(n, "gemv_fixed_us", s.npu.gemvFixedUs);
   num(n, "l1_read_bytes_per_cycle", s.npu.l1ReadBytesPerCycle);
   num(n, "l1_write_bytes_per_cycle", s.npu.l1WriteBytesPerCycle);

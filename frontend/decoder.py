@@ -125,10 +125,11 @@ class DecodeStep(torch.nn.Module):
     """act_quant: quantize the input of every linear token-wise to INT8 (reference for W8A8;
     pass dequantized per-row INT8 weights). Off for export."""
     def __init__(self, d: DecoderDims, tokens: int, capacity: int, act_quant: bool = False,
-                 last_logits: bool = False):
+                 last_logits: bool = False, taps=()):
         super().__init__()
         self.d, self.M, self.P, self.act_quant = d, tokens, capacity, act_quant
         self.last_logits = last_logits         # prefill: the LM head only for the last position
+        self.taps = tuple(taps)                # layers whose output hidden is also returned (drafters read them)
 
     def lin(self, x, w):
         if isinstance(w, tuple):            # (INT8 weight, per-row scale): dequantize on use
@@ -143,7 +144,7 @@ class DecodeStep(torch.nn.Module):
         G = QH // KVH
         w = iter(weights)
         c = cos[:, None, :]; s = sin[:, None, :]          # [M, 1, D]
-        new_k, new_v = [], []
+        new_k, new_v, tapped = [], [], []
         for i in range(d.layers):
             ln1, wq, wk, wv = (next(w) for _ in range(4))
             if d.qk_norm:
@@ -175,10 +176,14 @@ class DecodeStep(torch.nn.Module):
             x = x + self.lin(o, wo)
             h = rmsnorm(x, ln2, d.eps)
             x = x + self.lin(torch.nn.functional.silu(self.lin(h, wg)) * self.lin(h, wu), wd)
+            if i in self.taps:
+                tapped.append(x)
         fn, lm = next(w), next(w)
         if self.last_logits:
             x = x[-1:]
         logits = self.lin(rmsnorm(x, fn, d.eps), lm)
+        if self.taps:
+            return logits, new_k, new_v, tapped
         return logits, new_k, new_v
 
 

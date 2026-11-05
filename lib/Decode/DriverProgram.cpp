@@ -184,7 +184,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
                         plena::ProgramBuilder &program, LP6Extra &extra,
                         std::vector<int> &exit, int &logicalCores, json::Array &report, std::string &err) {
   program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
-  program.l1Bytes = uint64_t(spec.npu.l1Bytes);
+  program.l1Bytes = uint64_t(spec.npu.l1BaseBytes + spec.npu.l1Bytes);
   program.commandSchedule = true;
   CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)
   struct { std::vector<int> records, ranks, before; } pimBefore;   // the PIM phase just before
@@ -298,7 +298,8 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
 bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::ProgramBuilder &program,
                          const std::vector<int> &exit, bool noOutputCollect, bool debugCollect,
                          const std::string &debugPhases, json::Array &outputs, int64_t l2Bytes,
-                         std::vector<std::string> &uncollected) {
+                         std::vector<std::string> &uncollected, uint64_t l1Base, uint64_t l2Base, uint64_t l1Bytes, int64_t collectLogitRows) {
+  const uint64_t l1End = std::min<uint64_t>(4u << 20, l1Base + l1Bytes);
   program.beginPhase("collect", exit);
   plena::ProgramBuilder &w = program;
   std::map<int, uint32_t> cfg;
@@ -313,13 +314,13 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
       cfg[7] = bytes;
     }
     load(1, uint32_t(l1));
-    load(2, uint32_t(l1));
+    load(2, uint32_t(l1 - l1Base + l2Base));
     w.append(plena::rform(plena::OP_LDMA, 1, 2, 0, 0, 0));
   };
-  uint64_t l1 = 4096;
+  uint64_t l1 = l1Base + 4096;
   bool overflow = false;
   auto item = [&](const std::string &name, Value v, int64_t bytes, json::Array shape, StringRef layout) {
-    if (l1 + uint64_t(bytes) > (4u << 20)) {
+    if (l1 + uint64_t(bytes) > l1End) {
       overflow = true;
       return uint64_t(0);
     }
@@ -333,12 +334,19 @@ bool driver::emitCollect(func::FuncOp step, const pim::Program &prog, plena::Pro
   auto collectDense = [&](const std::string &name, Value v, DictionaryAttr a) {
     uint64_t addr = uint64_t(a.getAs<IntegerAttr>("addr").getInt());
     uint64_t bytes = uint64_t(a.getAs<IntegerAttr>("bytes").getInt());
-    uint64_t at = item(name, v, int64_t(bytes), shapeOf(v.getType()), "dense");
+    json::Array shape = shapeOf(v.getType());
+    // Research option --collect-logit-rows: only the first rows of the logits, when all of them fit no dump.
+    auto ty = cast<ShapedType>(v.getType());
+    if (collectLogitRows > 0 && name == "logits" && ty.getDimSize(0) > collectLogitRows) {
+      bytes = bytes / uint64_t(ty.getDimSize(0)) * uint64_t(collectLogitRows);
+      shape = json::Array{int64_t(collectLogitRows), ty.getDimSize(1)};
+    }
+    uint64_t at = item(name, v, int64_t(bytes), std::move(shape), "dense");
     if (overflow) return;
     constexpr uint64_t chunk = (1 << 20) - 64;
     for (uint64_t o = 0; o < bytes; o += chunk) {
       uint32_t n = uint32_t(std::min(chunk, bytes - o));
-      w.gdmaLoad(addr + o, at + o, n);
+      w.gdmaLoad(addr + o, at - l1Base + l2Base + o, n);
       ldma(at + o, n);
     }
   };

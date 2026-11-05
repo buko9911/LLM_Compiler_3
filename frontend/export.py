@@ -21,6 +21,7 @@ ap.add_argument("--capacity", type=int, default=256,
 ap.add_argument("--layers", type=int, default=0, help="truncate to N layers (0 = all)")
 ap.add_argument("--logits", choices=["all", "last"], default=None,
                 help="LM head rows: all positions (default for decode/verify) or the last (default for prefill)")
+ap.add_argument("--tap-layers", default="", help="also return the output hidden of these layers (comma list; verify for drafters)")
 ap.add_argument("--out", type=Path, required=True)
 ap.add_argument("--debug-outputs", action="store_true",
                 help="Qwen3.5: also return the first GDN layer's readout, gated norm and out_proj (debugging)")
@@ -50,7 +51,8 @@ if hybrid:
     module = fx.export_and_import(qwen35.HybridStep(d, M, P, last_logits=last, debug=a.debug_outputs), x, cos, sin, mask, pk, pv, conv, state, W,
                                   output_type="linalg-on-tensors", func_name="decode_step")
 else:
-    module = fx.export_and_import(DecodeStep(d, M, P, last_logits=last), x, cos, sin, mask, pk, pv, W,
+    taps = [int(t) for t in a.tap_layers.split(",") if t]
+    module = fx.export_and_import(DecodeStep(d, M, P, last_logits=last, taps=taps), x, cos, sin, mask, pk, pv, W,
                                   output_type="linalg-on-tensors", func_name="decode_step")
 t1 = time.time()
 a.out.mkdir(parents=True, exist_ok=True)
@@ -72,6 +74,8 @@ results += [dict(kind="output", name=f"new_v.{i}", layer=i, shape=[KVH, M, D]) f
 results += [dict(kind="output", name=f"new_conv.{i}", layer=i, shape=[d.conv_kernel - 1, d.conv_dim]) for i in gdn_layers]
 results += [dict(kind="output", name=f"new_state.{i}", layer=i, shape=[d.v_heads, d.v_dim, d.k_dim], dtype="f32")
             for i in gdn_layers]
+if not hybrid:
+    results += [dict(kind="output", name=f"hidden.{t}", layer=t, shape=[M, d.hidden]) for t in taps]
 if hybrid and a.debug_outputs:
     results += [dict(kind="output", name="debug.readout", shape=[M, d.v_heads, d.v_dim]),
                 dict(kind="output", name="debug.gated_norm", shape=[M, d.v_heads, d.v_dim]),
