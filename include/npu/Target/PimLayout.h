@@ -151,7 +151,7 @@ struct Program {
   int banksetPingPongLead = 0;
   // Research option --common-layout: 0 off, 1 one rank per phase, 2 K halves on the two ranks, computed in turn (see commonShape).
   int commonLayout = 0;
-  // With commonLayout 2: a K half longer than this many K sweeps is computed in turns of that length, the ranks alternating (0: whole K halves). Placement unchanged.
+  // With commonLayout 2: the two ranks take strict turns of at most this many K sweeps, cutting longer K halves (0: whole K halves in merged turns). Placement unchanged.
   int commonTurnSweeps = 0;
   const char *weightLayout() const {
     return banksetPingPongLead ? "bankset-row-alternating-v1" : "even-v1";

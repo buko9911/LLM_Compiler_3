@@ -285,7 +285,7 @@ def HybPlanLP6 : Pass<"hyb-plan-lp6", "ModuleOp"> {
                         "research: one weight placement for NPU and PIM (npu/Target/PimLayout.h, commonShape): "
                         "0 off, 1 one rank per phase, 2 K halves on the two ranks">,
                  Option<"commonTurnSweeps", "common-rank-turn", "int", "0",
-                        "research, with common-layout=2: a K half longer than this many sweeps is computed in turns of that length; 0 whole K halves">];
+                        "research, with common-layout=2: the two ranks take strict turns of at most this many K sweeps; 0 whole K halves in merged turns">];
 }
 
 def HybNpuPlace : Pass<"hyb-npu-place", "ModuleOp"> {
