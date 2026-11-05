@@ -203,8 +203,9 @@ bool Codegen::commonWeightLoad(uint64_t logical, uint64_t slot, uint32_t bytes) 
   for (const pim::CommonWeight &c : *in.commonWeights)
     if (logical >= c.logical && logical < c.logical + c.bytes) { cw = &c; break; }
   if (!cw) return false;
-  const int64_t tile = int64_t(logical - cw->logical) / (cw->k * 32);
-  assert(int64_t(bytes) == cw->k * 32);
+  const int64_t tile = int64_t(logical - cw->logical) / (cw->k * 32), firstRow = (int64_t(logical - cw->logical) % (cw->k * 32)) / 32;
+  const int64_t rowEnd = firstRow + int64_t(bytes) / 32;
+  if (firstRow % 4 || rowEnd % 4 || rowEnd > cw->k) llvm::report_fatal_error("common layout: a weight read must cover whole groups of 4 K rows of one tile");
   const uint64_t end = slot + bytes;
   for (const Acc &a : l2acc)
     if (a.id < 0 && a.core == curCore && overlaps(a.s, a.e, slot, end)) {
@@ -224,11 +225,11 @@ bool Codegen::commonWeightLoad(uint64_t logical, uint64_t slot, uint32_t bytes) 
   w.gdmaChainGroup = 1 + int((local % 64) / 32);
   const int chunkRows = std::max(1, in.commonChunkRows);
   int last = -1, previous = -1, count = 0;
-  for (int64_t row = 0; row < cw->k; row += 4 * chunkRows) {
+  for (int64_t row = firstRow; row < rowEnd; row += 4 * chunkRows) {
     // A chunk stays inside one sweep: the columns of a DRAM row.
-    const int64_t inner = row % pim::kKPerSweep, rows4 = std::min<int64_t>(chunkRows, (pim::kKPerSweep - inner) / 4);
+    const int64_t inner = row % pim::kKPerSweep, rows4 = std::min({int64_t(chunkRows), (pim::kKPerSweep - inner) / 4, (rowEnd - row) / 4});
     const int id = w.appendGdma(ProgramBuilder::Kind::GdmaLoad, count < 2 ? deps : std::vector<int>{}, cw->address(tile, row),
-                                slot + uint64_t(row) * 32, 128, uint32_t(rows4), 1024, 128, true);
+                                slot + uint64_t(row - firstRow) * 32, 128, uint32_t(rows4), 1024, 128, true);
     previous = last;
     last = id;
     ++count;

@@ -297,8 +297,8 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
     return Result<bool>::success(true);
   };
   for (int m = 0; m < p.tokens(); ++m) {
-    if (p.common && p.splitK == 2 && commonTurnSweeps > 0) {
-      // The registers of a rank keep the partial sum between its turns.
+    if (p.common && p.splitK == 2 && commonTurnSweeps > 0 && p.pieceSweeps() > commonTurnSweeps) {
+      // A K half longer than a turn: the registers of a rank keep the partial sum between its turns. Shorter halves keep streamOrder.
       for (const std::vector<int64_t> &round : p.commonRounds())
         for (int64_t from = 0; from < p.pieceSweeps(); from += commonTurnSweeps)
           for (int64_t piece = 0; piece < p.splitK; ++piece)

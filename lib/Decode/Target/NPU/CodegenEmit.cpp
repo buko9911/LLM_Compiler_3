@@ -382,6 +382,19 @@ uint64_t Codegen::stagingFor(uint64_t bytes) {
 void Codegen::copyLP6ToL1(uint64_t lp6, uint64_t l1, uint32_t rowBytes, uint32_t rows, uint32_t lp6Stride,
                           uint32_t l1Stride) {
   uint64_t win = windowBase(curCore);
+  // Research option --common-layout: a weight tile goes through its layout, in pieces of the window.
+  if (rows == 1) {
+    const uint32_t first = uint32_t(std::min<uint64_t>(rowBytes, uint64_t(window())));
+    if (commonWeightLoad(lp6, win, first)) {
+      ldma(l1, win, first, 1, first, first, true);
+      for (uint64_t o = first; o < rowBytes; o += uint64_t(window())) {
+        const uint32_t n = uint32_t(std::min<uint64_t>(uint64_t(window()), rowBytes - o));
+        commonWeightLoad(lp6 + o, win, n);
+        ldma(l1 + o, win, n, 1, n, n, true);
+      }
+      return;
+    }
+  }
   if (uint64_t(rowBytes) * rows <= uint64_t(miscBytes())) {
     uint64_t at = stagingFor(uint64_t(rowBytes) * rows);
     gdmaLoad(lp6, at, rowBytes, rows, lp6Stride, rowBytes);

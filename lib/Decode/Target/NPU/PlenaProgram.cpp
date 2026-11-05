@@ -355,7 +355,8 @@ bool ProgramBuilder::finish(const std::string &dir, int logicalCores) {
     }
     if (!fits(c.rowBytes, 20) || !fits(c.lp6, 36) || !fits(c.l2, 24) || c.rows == 0 || !fits(c.rows - 1, 16) ||
         !fits(c.lp6Stride, 24) || !fits(c.l2Stride, 24))
-      return bad("GDMA fields do not fit the ISA ver 2.0 record", id);
+      return bad("GDMA fields do not fit the ISA ver 2.0 record (row bytes " + std::to_string(c.rowBytes) + ", rows " + std::to_string(c.rows) + ", lp6 " +
+                     std::to_string(c.lp6) + ", l2 " + std::to_string(c.l2) + ", strides " + std::to_string(c.lp6Stride) + " " + std::to_string(c.l2Stride) + ")", id);
     auto record = isa2::gdmaRecord(c.kind == Kind::GdmaLoad, uint32_t(id), deps, c.lp6, c.l2, c.rowBytes, c.rows,
                                    c.lp6Stride, c.l2Stride);
     if (!record) return bad(record.error, id);

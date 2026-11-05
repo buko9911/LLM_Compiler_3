@@ -67,7 +67,7 @@ static cl::opt<int> commonLayout("common-layout",
     cl::desc("research: one weight placement that PIM computes on and the NPU reads through a byte transposer (PimLayout.h, "
              "commonShape): 0 off (default), 1 one rank per PIM phase, 2 K halves on the two ranks, computed in turn"), cl::init(0));
 static cl::opt<int> commonTurn("common-rank-turn",
-    cl::desc("research, with --common-layout=2: the two ranks take turns every this many K sweeps inside a stream; 0 whole K halves"), cl::init(0));
+    cl::desc("research, with --common-layout=2: a K half longer than this many sweeps is computed in turns of that length, the two ranks alternating; 0 whole K halves"), cl::init(0));
 static cl::opt<int> commonChunk("common-chunk-rows",
     cl::desc("research, with --common-layout: an NPU weight tile is read in GDMAs of this many 128-byte rows"), cl::init(8));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
