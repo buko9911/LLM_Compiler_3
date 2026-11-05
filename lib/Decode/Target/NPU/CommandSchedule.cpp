@@ -67,7 +67,7 @@ void ProgramBuilder::schedulePhase() {
   for (size_t i = 0; i < count; ++i)
     for (int d : cmds[phaseStart + order[i]].deps) {
       size_t mapped = size_t(d) < phaseStart ? size_t(d) : size_t(remap[size_t(d) - phaseStart]);
-      if (phaseStart + i - mapped >= (size_t(1) << 16)) {
+      if (phaseStart + i - mapped >= (size_t(1) << 16) && !relayFarEdges) {
         lastSchedule.encodingFallback = true;
         return;
       }

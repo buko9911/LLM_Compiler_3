@@ -282,6 +282,7 @@ int compileDecode(int argc, char **argv) {
   plena::ProgramBuilder program;
   program.traceOperations = std::getenv("HYBRID_PROFILE_OPERATIONS") != nullptr;
   driver::setPimKernel(program, prog);
+  program.relayFarEdges = !extra.commonWeights.empty();
   std::vector<int> exit;           // records the next phase follows
   int logicalCores = 1;
   json::Array report;

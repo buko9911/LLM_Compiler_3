@@ -53,6 +53,9 @@ public:
   /// histories are separate because core streams are emitted sequentially.
   uint32_t gdmaLookahead = 0;
   int gdmaChainGroup = 0;   // weight reads of one core in several independent chains (research: common layout)
+  // Research option --common-layout: keep the schedule of a phase with far dependencies; they go through barriers at finish(). The
+  // simulator's completion events are a ring of 65536 slots, so commands that should run together must stay within that distance.
+  bool relayFarEdges = false;
   uint64_t l1Bytes = 4 * 1024 * 1024;  // one core's L1 (target spec npu.l1_bytes; the driver sets it)
   bool commandSchedule = false;  // reorder system commands by their first consumer (the driver sets it)
   struct ScheduleStats {

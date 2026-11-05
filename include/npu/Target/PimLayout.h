@@ -260,7 +260,7 @@ inline CommonShape commonShape(int64_t n) {
 }
 
 // The same placement seen from the NPU: where the 32 B row k of tile j of an NPU weight goes. The NPU reads a row as one burst; the
-// bursts of a K group are the 8 packets PIM uses for it (research/race_decoding/common_layout/check_layout). Fetch order per sweep:
+// bursts of a tile in a sweep are the PIM packets of that tile and sweep (test/Decode/pim_layout.cpp). Fetch order per sweep:
 // 64 columns x 4 subchannels. rowBase: first row in every PU, the same on both ranks.
 struct CommonWeight {
   uint64_t logical = 0, bytes = 0;     // the weight's logical address range, which the compiler plans with; never reaches DRAM
