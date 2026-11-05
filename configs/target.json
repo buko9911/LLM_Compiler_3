@@ -49,7 +49,7 @@
     "act_write_gbps": 96,
     "readback_ns_per_output": 0.33,
     "npu_run_split_us": 45,
-    "pim_layer_exposed_us": 35,
+    "pim_layer_exposed_us": 45,
     "two_rank_factor": 1.02,
     "record_fetch_us": 0.25,
     "max_records": 32,
