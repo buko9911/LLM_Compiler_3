@@ -52,7 +52,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     if (o)
       for (auto &kv : *o) {
         llvm::StringRef key = kv.first;
-        if (!key.starts_with("_") && !llvm::is_contained(keys, key) && !(name == "npu" && (key == "gdma_chain_per_rank" || key == "l1_base_bytes" || key == "l2_base_bytes"))) {
+        if (!key.starts_with("_") && !llvm::is_contained(keys, key) && !(name == "lp6" && key == "state_base_bytes") && !(name == "npu" && (key == "gdma_chain_per_rank" || key == "l1_base_bytes" || key == "l2_base_bytes"))) {
           error = (name + "." + key + " is not a target parameter (optimizations have no switches)").str();
           return true;
         }
@@ -134,6 +134,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
       return failure();
     }
   num(l, "capacity_bytes", s.lp6.capacityBytes);
+  if (l && l->get("state_base_bytes")) num(l, "state_base_bytes", s.lp6.stateBaseBytes);
   num(n, "l1_reserved_bytes", s.npu.l1ReservedBytes); num(n, "l2_staging_bytes_per_core", s.npu.l2StagingPerCore);
   num(n, "weight_stream_max_slots", s.npu.weightStreamMaxSlots);
   num(n, "gemv_tile_bytes", s.npu.gemvTileBytes);

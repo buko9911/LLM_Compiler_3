@@ -274,11 +274,20 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       if (!name.empty()) attrs.push_back(b.getNamedAttr("name", b.getStringAttr(name)));
       return b.getDictionaryAttr(attrs);
     };
+    uint64_t stateCursor = 0;
     for (BlockArgument a : step.getArguments()) {
       auto kind = step.getArgAttrOfType<StringAttr>(a.getArgNumber(), kKind);
       auto name = step.getArgAttrOfType<StringAttr>(a.getArgNumber(), kName);
+      // Research key lp6.state_base_bytes: the K/V cache elsewhere (a long cache with all PIM rows on one rank leaves no room below them).
+      const bool moved = specOr->lp6.stateBaseBytes && kind && kind.getValue() == "state";
+      const uint64_t keep = cursor;
+      if (moved) cursor = stateCursor ? stateCursor : uint64_t(specOr->lp6.stateBaseBytes);
       step.setArgAttr(a.getArgNumber(), kLP6, denseAttr(bytesOf(a.getType()), kind ? kind.getValue() : "input",
                                                         name ? name.getValue() : ""));
+      if (moved) {
+        stateCursor = cursor;
+        cursor = keep;
+      }
     }
     // Returned buffers are outputs.
     auto ret = cast<func::ReturnOp>(step.getBody().front().getTerminator());

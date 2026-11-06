@@ -113,6 +113,7 @@ struct TargetSpec {
   } pim;
   struct Lp6 {
     int64_t capacityBytes = int64_t(16) << 30;
+    int64_t stateBaseBytes = 0;  // research: K/V cache address, 0 = in the dense region
   } lp6;
   /// GEMV mapping: "cost" (cost model per group), "npu" or "pim" (every group); overrides map a
   /// substring of a weight name to a target and win over the policy (first match).
