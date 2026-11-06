@@ -843,14 +843,14 @@ struct HybNpuFlashAttentionPass
       getOperation().emitError("flash attention mode must be auto, on or off, not '" + mode + "'");
       return signalPassFailure();
     }
-    // NPU-only, like hyb-npu-attention-fusion (mixed programs keep the full-row path).
+    // Mixed programs keep the full-row path where it fits; where it does not (a long cache) the NPU phase with the attention uses online softmax.
     for (auto fn : getOperation().getOps<func::FuncOp>())
       if (auto phase = fn->getAttrOfType<StringAttr>(kPhase); phase && phase.getValue() != "npu") {
         if (mode == "on") {
           getOperation().emitError("--flash-attention=on needs an NPU-only program (this one has PIM phases)");
           return signalPassFailure();
         }
-        return;
+        break;
       }
     for (auto fn : getOperation().getOps<func::FuncOp>()) {
       auto phase = fn->getAttrOfType<StringAttr>(kPhase);

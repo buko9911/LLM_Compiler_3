@@ -131,7 +131,8 @@ def main():
         ("shared_score_result", {"shared": True}, small, False),
         ("index_dependent_softmax", {"indexed": True}, small, False),
         ("pim_phase", {"phase": "pim"}, small, False),
-        ("mixed_module", {}, small, False),
+        ("mixed_module", {}, small, True),       # the full row does not fit: the NPU phase of a mixed module goes online
+        ("mixed_module_fits", {}, {}, False),    # it fits: a mixed module keeps the full row
         ("wrong_softmax_math", {}, small, False),
         ("fixed_nonzero_mask_row", {}, small, False),
         ("nonzero_qk_init", {}, small, False),
@@ -143,7 +144,7 @@ def main():
     for name, graph_options, config_options, transformed in cases:
         graph = base | graph_options
         text = flash_source(**graph)
-        if name == "mixed_module":
+        if name.startswith("mixed_module"):
             text = text.removesuffix("}\n") + '  func.func private @pim() attributes {hyb.phase = "pim"}\n}\n'
         if name == "wrong_softmax_math":
             text = text.replace("math.exp %sub", "math.log %sub")
