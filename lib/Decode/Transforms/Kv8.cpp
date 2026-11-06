@@ -265,14 +265,42 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
     return r;
   };
   auto i32 = b.getI32Type();
+  auto i8 = b.getI8Type();
+  OpFoldResult zero0 = b.getIndexAttr(0);
   b.setInsertionPoint(qk);
-  // Q and the own row's score on the first core, the input of the PIM phase in [G, H D].
-  Value sq = rowScale(b, loc, q), q8 = quantRows(b, loc, q, sq);
-  auto own = linalg::BatchMatmulOp::create(b, loc, TypeRange{RankedTensorType::get({H, G, int64_t(1)}, i32)}, ValueRange{q8, k8T},
-                                           ValueRange{i32Zeros(b, loc, {H, G, 1})});
-  own->setAttr("hyb.kv_own", b.getUnitAttr());
-  Value qp = transposed(b, loc, q8, {1, 0, 2});
-  Value qAct = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({G, H * D}, b.getI8Type()), qp, SmallVector<ReassociationIndices>{{0}, {1, 2}});
+  // The rows of a head's vectors go to the PIM input [G, H x columns] from the core that has them (each is a slice of one PU's bank group).
+  auto insertRows = [&](Value rowsC, Value dest, Value first, int64_t columns) {
+    auto row = RankedTensorType::get({int64_t(1), columns}, i8);
+    for (int64_t h = 0; h < part; ++h)
+      for (int64_t j = 0; j < G; ++j) {
+        Value head = arith::AddIOp::create(b, loc, first, arith::ConstantIndexOp::create(b, loc, h));
+        Value at = arith::MulIOp::create(b, loc, head, arith::ConstantIndexOp::create(b, loc, columns));
+        Value slice = tensor::ExtractSliceOp::create(b, loc, row, rowsC, attrs({h, j, 0}), attrs({1, 1, columns}), attrs({1, 1, 1}));
+        OpBuilder::InsertionGuard guard(b);
+        b.setInsertionPointToEnd(&cast<scf::ForallOp>(first.getParentBlock()->getParentOp()).getTerminator().getRegion().front());
+        tensor::ParallelInsertSliceOp::create(b, loc, slice, dest, SmallVector<OpFoldResult>{b.getIndexAttr(j), at}, attrs({1, columns}), attrs({1, 1}));
+      }
+  };
+  // Q, the own row's score and the input of the PIM phase, per core.
+  auto loop0 = scf::ForallOp::create(b, loc, attrs({cores}),
+                                     ValueRange{emptyOf(b, loc, {H, G}, b.getF32Type()), emptyOf(b, loc, {H, G, 1}, i32), emptyOf(b, loc, {G, H * D}, i8)}, std::nullopt);
+  loop0->setAttr("hyb.cores", b.getI64IntegerAttr(cores));
+  loop0->setAttr("hyb.attention_fused", b.getUnitAttr());
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(loop0.getBody());
+    Value first = arith::MulIOp::create(b, loc, loop0.getInductionVar(0), arith::ConstantIndexOp::create(b, loc, part));
+    Value qC = tensor::ExtractSliceOp::create(b, loc, q, SmallVector<OpFoldResult>{first, zero0, zero0}, attrs({part, G, D}), attrs({1, 1, 1}));
+    Value kC = tensor::ExtractSliceOp::create(b, loc, k8T, SmallVector<OpFoldResult>{first, zero0, zero0}, attrs({part, D, 1}), attrs({1, 1, 1}));
+    Value sqC = rowScale(b, loc, qC), q8C = quantRows(b, loc, qC, sqC);
+    auto ownC = linalg::BatchMatmulOp::create(b, loc, TypeRange{RankedTensorType::get({part, G, int64_t(1)}, i32)}, ValueRange{q8C, kC},
+                                              ValueRange{i32Zeros(b, loc, {part, G, 1})});
+    insertRows(q8C, loop0.getRegionOutArgs()[2], first, D);
+    b.setInsertionPointToEnd(&loop0.getTerminator().getRegion().front());
+    tensor::ParallelInsertSliceOp::create(b, loc, sqC, loop0.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero0}, attrs({part, G}), attrs({1, 1}));
+    tensor::ParallelInsertSliceOp::create(b, loc, ownC.getResult(0), loop0.getRegionOutArgs()[1], SmallVector<OpFoldResult>{first, zero0, zero0}, attrs({part, G, 1}), attrs({1, 1, 1}));
+  }
+  Value sq = loop0.getResult(0), ownScore = loop0.getResult(1), qAct = loop0.getResult(2);
   Value accInit = emptyOf(b, loc, {G, H * P}, i32);
   Value acc = hyb::QMatmulOp::create(b, loc, TypeRange{accInit.getType()}, qAct, accInit, b.getStringAttr("kv8.k." + std::to_string(layer)), IntegerAttr(), StringAttr()).getResult(0);
   // Scores to P, per core. The chain of generics between QK^T and PV is cloned on the core's heads.
@@ -297,8 +325,8 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
   auto f32Rows = RankedTensorType::get({H, N}, b.getF32Type());
   Value sk = headScale ? skArg : Value(tensor::ConcatOp::create(b, loc, f32Rows, 1, ValueRange{skArg, skNew}));
   Value sv = headScale ? svArg : Value(tensor::ConcatOp::create(b, loc, f32Rows, 1, ValueRange{svArg, svNew}));
-  Value pOutInit = emptyOf(b, loc, {H, G, N}, b.getI8Type()), spOutInit = emptyOf(b, loc, {H, G}, b.getF32Type());
-  auto loop = scf::ForallOp::create(b, loc, attrs({cores}), ValueRange{pOutInit, spOutInit}, std::nullopt);
+  auto loop = scf::ForallOp::create(b, loc, attrs({cores}),
+                                    ValueRange{emptyOf(b, loc, {H, G, 1}, i8), emptyOf(b, loc, {H, G}, b.getF32Type()), emptyOf(b, loc, {G, H * P}, i8)}, std::nullopt);
   loop->setAttr("hyb.cores", b.getI64IntegerAttr(cores));
   loop->setAttr("hyb.attention_fused", b.getUnitAttr());
   {
@@ -312,7 +340,7 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
       Value slice = tensor::ExtractSliceOp::create(b, loc, acc, SmallVector<OpFoldResult>{zero, at}, attrs({G, P}), attrs({1, 1}));
       accC = tensor::InsertSliceOp::create(b, loc, slice, accC, attrs({h, 0, 0}), attrs({1, G, P}), attrs({1, 1, 1}));
     }
-    Value ownC = tensor::ExtractSliceOp::create(b, loc, own.getResult(0), SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, G, 1}), attrs({1, 1, 1}));
+    Value ownC = tensor::ExtractSliceOp::create(b, loc, ownScore, SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, G, 1}), attrs({1, 1, 1}));
     accC = tensor::InsertSliceOp::create(b, loc, ownC, accC, attrs({0, 0, P}), attrs({part, G, 1}), attrs({1, 1, 1}));
     Value sqC = tensor::ExtractSliceOp::create(b, loc, sq, SmallVector<OpFoldResult>{first, zero}, attrs({part, G}), attrs({1, 1}));
     Value skC = headScale ? Value(tensor::ExtractSliceOp::create(b, loc, sk, SmallVector<OpFoldResult>{first}, attrs({part}), attrs({1})))
@@ -348,16 +376,15 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
     Value pC = map.lookup(p);
     Value ps = headScale ? pC : scaleColumns(b, loc, pC, tensor::ExtractSliceOp::create(b, loc, sv, SmallVector<OpFoldResult>{first, zero}, attrs({part, N}), attrs({1, 1})));
     Value spC = rowScale(b, loc, ps), p8C = quantRows(b, loc, ps, spC);
+    // The past columns of P as the PIM input [G, H P]; the own column stays on the NPU.
+    Value p8Past = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({0, 0, 0}), attrs({part, G, P}), attrs({1, 1, 1}));
+    Value p8OwnC = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({0, 0, P}), attrs({part, G, 1}), attrs({1, 1, 1}));
+    insertRows(p8Past, loop.getRegionOutArgs()[2], first, P);
     b.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
-    tensor::ParallelInsertSliceOp::create(b, loc, p8C, loop.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, G, N}), attrs({1, 1, 1}));
+    tensor::ParallelInsertSliceOp::create(b, loc, p8OwnC, loop.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, G, 1}), attrs({1, 1, 1}));
     tensor::ParallelInsertSliceOp::create(b, loc, spC, loop.getRegionOutArgs()[1], SmallVector<OpFoldResult>{first, zero}, attrs({part, G}), attrs({1, 1}));
   }
-  Value p8 = loop.getResult(0), sp = loop.getResult(1);
-  // The past columns of P as the PIM input [G, H P]; the own column stays on the NPU.
-  Value p8Past = tensor::ExtractSliceOp::create(b, loc, p8, attrs({0, 0, 0}), attrs({H, G, P}), attrs({1, 1, 1}));
-  Value p8Own = tensor::ExtractSliceOp::create(b, loc, p8, attrs({0, 0, P}), attrs({H, G, 1}), attrs({1, 1, 1}));
-  Value ppT = transposed(b, loc, p8Past, {1, 0, 2});
-  Value pAct = tensor::CollapseShapeOp::create(b, loc, RankedTensorType::get({G, H * P}, b.getI8Type()), ppT, SmallVector<ReassociationIndices>{{0}, {1, 2}});
+  Value p8Own = loop.getResult(0), sp = loop.getResult(1), pAct = loop.getResult(2);
   Value acc2Init = emptyOf(b, loc, {G, H * D}, i32);
   Value acc2 = hyb::QMatmulOp::create(b, loc, TypeRange{acc2Init.getType()}, pAct, acc2Init, b.getStringAttr("kv8.v." + std::to_string(layer)), IntegerAttr(), StringAttr()).getResult(0);
   auto own2 = linalg::BatchMatmulOp::create(b, loc, TypeRange{RankedTensorType::get({H, G, D}, i32)}, ValueRange{p8Own, v8}, ValueRange{i32Zeros(b, loc, {H, G, D})});
