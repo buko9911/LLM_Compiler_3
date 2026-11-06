@@ -94,6 +94,7 @@ void driver::writeIO(const std::string &outDir, const std::string &manifestFile,
   if (!uncollected.empty()) io["uncollected"] = std::move(uncollected);
   if (auto kv8 = mod->getAttrOfType<StringAttr>("hyb.kv8")) io["kv8"] = kv8.getValue().str();
   if (auto scale = mod->getAttrOfType<StringAttr>("hyb.kv8_scale")) io["kv8_scale"] = scale.getValue().str();
+  if (auto direct = mod->getAttrOfType<IntegerAttr>("hyb.kv8_direct_layers")) io["kv8_direct_layers"] = direct.getInt();
   // --kv8=pim: the host writes the K and V matrices. kv_packets.bin: per packet, address (u64), first input (i32), the four lanes' rows (i32).
   json::Array kvMatrices;
   std::error_code kvError;

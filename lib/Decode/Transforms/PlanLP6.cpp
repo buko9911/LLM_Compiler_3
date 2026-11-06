@@ -191,8 +191,11 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                                  std::to_string(p.tailBlocks) + "xA=" + std::to_string(p.tailAccs),
                              {{"rows", double(p.n)}, {"k", double(K)}});
       } else if (kvGemv) {
-        // One stream per subchannel: all of the rows of a PU in the fewest accumulators that hold them.
-        shapes[0].accs = int(rows[0] / (int64_t(pim::kPUs) * pim::kLanes * program.channels));
+        // One KV head per PU: the rows in whole registers over the subchannels, the last round of streams with fewer accumulators.
+        const pim::CommonShape kvShape = pim::commonShape(rows[0]);
+        shapes[0].accs = kvShape.accs;
+        shapes[0].tailAccs = kvShape.tailAccs;
+        shapes[0].tailBlocks = kvShape.tailBlocks;
         cost::recordDecision(callee, "pim stream layout", group[0].getWeight().str(), "A=" + std::to_string(shapes[0].accs) + ", one KV head per PU",
                              {{"tokens", double(M)}, {"k", double(K)}, {"partitions", double(open)}});
       } else if (!group.empty()) {

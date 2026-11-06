@@ -245,6 +245,163 @@ Value addInt32(OpBuilder &b, Location loc, Value x, Value y) {
   return g.getResult(0);
 }
 
+/// The ops between QK^T and PV: generics, and the reshapes of the token rows when there are several tokens.
+FailureOr<SmallVector<Operation *>> attentionChain(Value qkResult, Operation *pv) {
+  DenseSet<Operation *> fwd;
+  SmallVector<Value> work{qkResult};
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (Operation *u : v.getUsers())
+      if (u != pv && fwd.insert(u).second)
+        for (Value r : u->getResults()) work.push_back(r);
+  }
+  SmallVector<Operation *> chain;
+  for (Operation &op : *pv->getBlock())
+    if (fwd.contains(&op)) chain.push_back(&op);
+  for (Operation *op : chain)
+    if (!isa<linalg::GenericOp, tensor::ExpandShapeOp, tensor::CollapseShapeOp>(op)) {
+      op->emitError("--kv8: an op between QK^T and PV that is neither a generic nor a reshape");
+      return failure();
+    }
+  return chain;
+}
+
+/// Clones the chain on heads [first, first + part) of H. `map` holds the replacement of QK^T's result. An operand read by the head loop that is not in the chain is sliced,
+/// an init is made fresh; an operand read without the head (the token mask) stays as it is.
+void cloneChainOnHeads(OpBuilder &b, Location loc, ArrayRef<Operation *> chain, IRMapping &map, int64_t H, int64_t part, Value first) {
+  OpFoldResult zero = b.getIndexAttr(0), one = b.getIndexAttr(1);
+  auto onHeads = [&](RankedTensorType t) {
+    SmallVector<int64_t> shape(t.getShape());
+    shape[0] = part;
+    return RankedTensorType::get(shape, t.getElementType());
+  };
+  std::function<Value(Value)> init = [&](Value v) -> Value {
+    auto t = tensorOf(v);
+    Operation *def = v.getDefiningOp();
+    if (auto fill = dyn_cast_or_null<linalg::FillOp>(def)) return linalg::FillOp::create(b, loc, fill.getInputs()[0], init(fill.getOutputs()[0])).getResult(0);
+    return emptyOf(b, loc, onHeads(t).getShape(), t.getElementType());
+  };
+  for (Operation *op : chain) {
+    if (auto e = dyn_cast<tensor::ExpandShapeOp>(op)) {
+      Value r = tensor::ExpandShapeOp::create(b, loc, onHeads(e.getResultType()), map.lookup(e.getSrc()), e.getReassociationIndices());
+      map.map(e.getResult(), r);
+      continue;
+    }
+    if (auto c = dyn_cast<tensor::CollapseShapeOp>(op)) {
+      Value r = tensor::CollapseShapeOp::create(b, loc, onHeads(c.getResultType()), map.lookup(c.getSrc()), c.getReassociationIndices());
+      map.map(c.getResult(), r);
+      continue;
+    }
+    auto g = cast<linalg::GenericOp>(op);
+    IRMapping m2 = map;
+    AffineExpr head = getAffineDimExpr(0, b.getContext());
+    for (OpOperand &o : g->getOpOperands()) {
+      Value v = o.get();
+      if (map.contains(v)) continue;
+      auto t = dyn_cast<RankedTensorType>(v.getType());
+      AffineMap im = g.getMatchingIndexingMap(&o);
+      if (!t || !t.getRank() || !im.getNumResults() || im.getResult(0) != head) continue;
+      if (g.isDpsInit(&o)) {
+        m2.map(v, init(v));
+      } else {
+        SmallVector<OpFoldResult> offs(t.getRank(), zero), sizes, ones(t.getRank(), one);
+        offs[0] = first;
+        for (int64_t d : onHeads(t).getShape()) sizes.push_back(b.getIndexAttr(d));
+        m2.map(v, tensor::ExtractSliceOp::create(b, loc, v, offs, sizes, ones));
+      }
+    }
+    Operation *c = b.clone(*op, m2);
+    for (auto [r, nr] : llvm::zip(op->getResults(), c->getResults())) {
+      nr.setType(onHeads(tensorOf(r)));
+      map.map(r, nr);
+    }
+  }
+}
+
+/// mode=int8 where K and V are too big to copy whole to L2 (the rule in runOnOperation). A core reads K and V of one head at a time from LP6 into L1, through its staging window; a whole-head
+/// read is one GDMA or a few and one local copy, so it adds few core blocks. The past and the new rows are separate products, written side by side (QK^T) or added (PV). Scores and probabilities
+/// stay whole rows in L1, so no online softmax: same bytes as the path with the L2 copy.
+LogicalResult lowerDirectAttention(OpBuilder &b, Location loc, linalg::BatchMatmulOp qk, linalg::BatchMatmulOp pv, Value pastK, Value pastV, Value k8T, Value v8, Value sk, Value sv, int64_t cores,
+                                   bool headScale) {
+  Value q = qk.getDpsInputs()[0], qkResult = qk.getResult(0), p = pv.getDpsInputs()[0];
+  auto qT = tensorOf(q);
+  const int64_t H = qT.getDimSize(0), R = qT.getDimSize(1), D = qT.getDimSize(2), N = tensorOf(qkResult).getDimSize(2), P = tensorOf(pastV).getDimSize(1), M = N - P;
+  if (H % cores) return qk.emitError("--kv8: the core count must divide the KV heads");
+  const int64_t part = H / cores;
+  auto attrs = [&](ArrayRef<int64_t> v) {
+    SmallVector<OpFoldResult> r;
+    for (int64_t x : v) r.push_back(b.getIndexAttr(x));
+    return r;
+  };
+  auto chain = attentionChain(qkResult, pv);
+  if (failed(chain)) return failure();
+  auto i32 = b.getI32Type();
+  OpFoldResult zero = b.getIndexAttr(0);
+  b.setInsertionPoint(pv);
+  auto loop = scf::ForallOp::create(b, loc, attrs({cores}), ValueRange{emptyOf(b, loc, {H, R, D}, b.getF16Type())}, std::nullopt);
+  loop->setAttr("hyb.cores", b.getI64IntegerAttr(cores));
+  loop->setAttr("hyb.attention_fused", b.getUnitAttr());
+  {
+    OpBuilder::InsertionGuard guard(b);
+    b.setInsertionPointToStart(loop.getBody());
+    Value first = arith::MulIOp::create(b, loc, loop.getInductionVar(0), arith::ConstantIndexOp::create(b, loc, part));
+    auto ofHeads = [&](Value v, ArrayRef<int64_t> sizes) -> Value {
+      SmallVector<OpFoldResult> offs(sizes.size(), zero);
+      offs[0] = first;
+      return tensor::ExtractSliceOp::create(b, loc, v, offs, attrs(sizes), SmallVector<OpFoldResult>(sizes.size(), b.getIndexAttr(1)));
+    };
+    auto ofHead = [&](Value v, int64_t h, int64_t size1, int64_t size2) -> Value {
+      Value head = arith::AddIOp::create(b, loc, first, arith::ConstantIndexOp::create(b, loc, h));
+      return tensor::ExtractSliceOp::create(b, loc, v, SmallVector<OpFoldResult>{head, zero, zero}, attrs({1, size1, size2}), attrs({1, 1, 1}));
+    };
+    Value qC = ofHeads(q, {part, R, D});
+    Value sqC = rowScale(b, loc, qC), q8C = quantRows(b, loc, qC, sqC);
+    Value zero32 = arith::ConstantOp::create(b, loc, b.getI32IntegerAttr(0));
+    // A product of rows [h, r, column .. column + columns) into the core's matrix.
+    auto product = [&](Value into, Value a, Value w, int64_t h, int64_t column, int64_t columns) -> Value {
+      Value dest = tensor::ExtractSliceOp::create(b, loc, into, attrs({h, 0, column}), attrs({1, R, columns}), attrs({1, 1, 1}));
+      Value filled = linalg::FillOp::create(b, loc, zero32, dest).getResult(0);
+      Value r = linalg::BatchMatmulOp::create(b, loc, TypeRange{filled.getType()}, ValueRange{a, w}, ValueRange{filled}).getResult(0);
+      return tensor::InsertSliceOp::create(b, loc, r, into, attrs({h, 0, column}), attrs({1, R, columns}), attrs({1, 1, 1}));
+    };
+    Value accC = emptyOf(b, loc, {part, R, N}, i32);
+    for (int64_t h = 0; h < part; ++h) {
+      Value q8h = tensor::ExtractSliceOp::create(b, loc, q8C, attrs({h, 0, 0}), attrs({1, R, D}), attrs({1, 1, 1}));
+      accC = product(accC, q8h, ofHead(pastK, h, D, P), h, 0, P);
+      accC = product(accC, q8h, ofHead(k8T, h, D, M), h, P, M);
+    }
+    Value scC = headScale ? dequantOf(b, loc, accC, sqC, Value(), "dequant", ofHeads(sk, {part})) : dequantOf(b, loc, accC, sqC, ofHeads(sk, {part, N}), "dequant");
+    IRMapping map;
+    map.map(qkResult, scC);
+    cloneChainOnHeads(b, loc, *chain, map, H, part, first);
+    Value pC = map.lookup(p);
+    Value ps = headScale ? pC : scaleColumns(b, loc, pC, ofHeads(sv, {part, N}));
+    Value spC = rowScale(b, loc, ps), p8C = quantRows(b, loc, ps, spC);
+    Value pastAcc = emptyOf(b, loc, {part, R, D}, i32), newAcc = emptyOf(b, loc, {part, R, D}, i32);
+    auto rows = [&](Value into, Value a, Value w, int64_t h) -> Value {
+      Value dest = tensor::ExtractSliceOp::create(b, loc, into, attrs({h, 0, 0}), attrs({1, R, D}), attrs({1, 1, 1}));
+      Value filled = linalg::FillOp::create(b, loc, zero32, dest).getResult(0);
+      Value r = linalg::BatchMatmulOp::create(b, loc, TypeRange{filled.getType()}, ValueRange{a, w}, ValueRange{filled}).getResult(0);
+      return tensor::InsertSliceOp::create(b, loc, r, into, attrs({h, 0, 0}), attrs({1, R, D}), attrs({1, 1, 1}));
+    };
+    for (int64_t h = 0; h < part; ++h) {
+      Value pPast = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({h, 0, 0}), attrs({1, R, P}), attrs({1, 1, 1}));
+      Value pNew = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({h, 0, P}), attrs({1, R, M}), attrs({1, 1, 1}));
+      pastAcc = rows(pastAcc, pPast, ofHead(pastV, h, P, D), h);
+      newAcc = rows(newAcc, pNew, ofHead(v8, h, M, D), h);
+    }
+    Value sum = addInt32(b, loc, pastAcc, newAcc);
+    Value oC = dequantOf(b, loc, sum, spC, Value(), "dequant", headScale ? ofHeads(sv, {part}) : Value());
+    b.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
+    tensor::ParallelInsertSliceOp::create(b, loc, oC, loop.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, R, D}), attrs({1, 1, 1}));
+  }
+  pv.getResult(0).replaceAllUsesWith(loop.getResult(0));
+  pv.erase();
+  for (Operation *op : llvm::reverse(*chain)) op->erase();
+  qk.erase();
+  return success();
+}
+
 /// mode=pim, one token. QK^T and PV of the past rows run on PIM: the K (V) matrix of a layer is a stored matrix with one KV head per PU, so a stream
 /// of a subchannel works on all KV heads at once, each PU on its own query head's input. The own row goes through the SA in INT8, softmax stays on
 /// the NPU. Phases of the attention:
@@ -259,6 +416,8 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
   if (H % cores || H != ::npu::pim::kPUs) return qk.emitError("--kv8=pim needs 8 KV heads and a core count that divides them");
   if (tensorOf(k8T).getDimSize(2) != 1) return qk.emitError("--kv8=pim works on one token");
   const int64_t part = H / cores;
+  // The stored matrices have whole blocks of rows and whole sweeps of inputs: K's rows per head (one PU) round up to 64, V's inputs to 256. Padding is zero, so it adds nothing to the sums.
+  const int64_t storedP = (P + 63) / 64 * 64, inputP = (P + ::npu::pim::kKPerSweep - 1) / ::npu::pim::kKPerSweep * ::npu::pim::kKPerSweep;
   auto attrs = [&](ArrayRef<int64_t> v) {
     SmallVector<OpFoldResult> r;
     for (int64_t x : v) r.push_back(b.getIndexAttr(x));
@@ -269,12 +428,12 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
   OpFoldResult zero0 = b.getIndexAttr(0);
   b.setInsertionPoint(qk);
   // The rows of a head's vectors go to the PIM input [G, H x columns] from the core that has them (each is a slice of one PU's bank group).
-  auto insertRows = [&](Value rowsC, Value dest, Value first, int64_t columns) {
+  auto insertRows = [&](Value rowsC, Value dest, Value first, int64_t columns, int64_t stride) {
     auto row = RankedTensorType::get({int64_t(1), columns}, i8);
     for (int64_t h = 0; h < part; ++h)
       for (int64_t j = 0; j < G; ++j) {
         Value head = arith::AddIOp::create(b, loc, first, arith::ConstantIndexOp::create(b, loc, h));
-        Value at = arith::MulIOp::create(b, loc, head, arith::ConstantIndexOp::create(b, loc, columns));
+        Value at = arith::MulIOp::create(b, loc, head, arith::ConstantIndexOp::create(b, loc, stride));
         Value slice = tensor::ExtractSliceOp::create(b, loc, row, rowsC, attrs({h, j, 0}), attrs({1, 1, columns}), attrs({1, 1, 1}));
         OpBuilder::InsertionGuard guard(b);
         b.setInsertionPointToEnd(&cast<scf::ForallOp>(first.getParentBlock()->getParentOp()).getTerminator().getRegion().front());
@@ -295,30 +454,18 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
     Value sqC = rowScale(b, loc, qC), q8C = quantRows(b, loc, qC, sqC);
     auto ownC = linalg::BatchMatmulOp::create(b, loc, TypeRange{RankedTensorType::get({part, G, int64_t(1)}, i32)}, ValueRange{q8C, kC},
                                               ValueRange{i32Zeros(b, loc, {part, G, 1})});
-    insertRows(q8C, loop0.getRegionOutArgs()[2], first, D);
+    insertRows(q8C, loop0.getRegionOutArgs()[2], first, D, D);
     b.setInsertionPointToEnd(&loop0.getTerminator().getRegion().front());
     tensor::ParallelInsertSliceOp::create(b, loc, sqC, loop0.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero0}, attrs({part, G}), attrs({1, 1}));
     tensor::ParallelInsertSliceOp::create(b, loc, ownC.getResult(0), loop0.getRegionOutArgs()[1], SmallVector<OpFoldResult>{first, zero0, zero0}, attrs({part, G, 1}), attrs({1, 1, 1}));
   }
   Value sq = loop0.getResult(0), ownScore = loop0.getResult(1), qAct = loop0.getResult(2);
-  Value accInit = emptyOf(b, loc, {G, H * P}, i32);
+  Value accInit = emptyOf(b, loc, {G, H * storedP}, i32);
   Value acc = hyb::QMatmulOp::create(b, loc, TypeRange{accInit.getType()}, qAct, accInit, b.getStringAttr("kv8.k." + std::to_string(layer)), IntegerAttr(), StringAttr()).getResult(0);
   // Scores to P, per core. The chain of generics between QK^T and PV is cloned on the core's heads.
-  SmallVector<Operation *> chain;
-  {
-    DenseSet<Operation *> fwd;
-    SmallVector<Value> work{qkResult};
-    while (!work.empty()) {
-      Value v = work.pop_back_val();
-      for (Operation *u : v.getUsers())
-        if (u != pv.getOperation() && fwd.insert(u).second)
-          for (Value r : u->getResults()) work.push_back(r);
-    }
-    for (Operation &op : *qk->getBlock())
-      if (fwd.contains(&op)) chain.push_back(&op);
-    for (Operation *op : chain)
-      if (!isa<linalg::GenericOp>(op)) return op->emitError("--kv8=pim: the softmax chain has an op that is not a generic");
-  }
+  auto chainOr = attentionChain(qkResult, pv);
+  if (failed(chainOr)) return failure();
+  SmallVector<Operation *> chain = *chainOr;
   OpFoldResult zero = b.getIndexAttr(0);
   b.setInsertionPoint(pv);    // after what the chain reads (the mask)
   // In the phase that reads them: a concat of LP6 buffers cannot cross a phase.
@@ -326,7 +473,7 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
   Value sk = headScale ? skArg : Value(tensor::ConcatOp::create(b, loc, f32Rows, 1, ValueRange{skArg, skNew}));
   Value sv = headScale ? svArg : Value(tensor::ConcatOp::create(b, loc, f32Rows, 1, ValueRange{svArg, svNew}));
   auto loop = scf::ForallOp::create(b, loc, attrs({cores}),
-                                    ValueRange{emptyOf(b, loc, {H, G, 1}, i8), emptyOf(b, loc, {H, G}, b.getF32Type()), emptyOf(b, loc, {G, H * P}, i8)}, std::nullopt);
+                                    ValueRange{emptyOf(b, loc, {H, G, 1}, i8), emptyOf(b, loc, {H, G}, b.getF32Type()), emptyOf(b, loc, {G, H * inputP}, i8)}, std::nullopt);
   loop->setAttr("hyb.cores", b.getI64IntegerAttr(cores));
   loop->setAttr("hyb.attention_fused", b.getUnitAttr());
   {
@@ -336,7 +483,7 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
     Value accC = emptyOf(b, loc, {part, G, N}, i32);
     for (int64_t h = 0; h < part; ++h) {
       Value head = arith::AddIOp::create(b, loc, first, arith::ConstantIndexOp::create(b, loc, h));
-      Value at = arith::MulIOp::create(b, loc, head, arith::ConstantIndexOp::create(b, loc, P));
+      Value at = arith::MulIOp::create(b, loc, head, arith::ConstantIndexOp::create(b, loc, storedP));
       Value slice = tensor::ExtractSliceOp::create(b, loc, acc, SmallVector<OpFoldResult>{zero, at}, attrs({G, P}), attrs({1, 1}));
       accC = tensor::InsertSliceOp::create(b, loc, slice, accC, attrs({h, 0, 0}), attrs({1, G, P}), attrs({1, 1, 1}));
     }
@@ -348,38 +495,14 @@ LogicalResult lowerPimAttention(OpBuilder &b, Location loc, int layer, linalg::B
     Value scC = headScale ? dequantOf(b, loc, accC, sqC, Value(), "dequant", skC) : dequantOf(b, loc, accC, sqC, skC, "dequant");
     IRMapping map;
     map.map(qkResult, scC);
-    // A fresh init on the core's heads: tensor.empty, its reshapes, and fills of them.
-    std::function<Value(Value)> sliced = [&](Value v) -> Value {
-      if (Value m = map.lookupOrNull(v)) return m;
-      auto t = dyn_cast<RankedTensorType>(v.getType());
-      Operation *def = v.getDefiningOp();
-      if (!t || !t.getRank() || t.getDimSize(0) != H) return v;
-      SmallVector<int64_t> shape(t.getShape());
-      shape[0] = part;
-      if (isa_and_nonnull<tensor::EmptyOp, tensor::CollapseShapeOp, tensor::ExpandShapeOp>(def)) return emptyOf(b, loc, shape, t.getElementType());
-      if (auto fill = dyn_cast_or_null<linalg::FillOp>(def)) return linalg::FillOp::create(b, loc, fill.getInputs()[0], sliced(fill.getOutputs()[0])).getResult(0);
-      SmallVector<OpFoldResult> offs(t.getRank(), zero), sizes = attrs(shape);
-      offs[0] = first;
-      return tensor::ExtractSliceOp::create(b, loc, v, offs, sizes, SmallVector<OpFoldResult>(t.getRank(), b.getIndexAttr(1)));
-    };
-    for (Operation *op : chain) {
-      IRMapping m2 = map;
-      for (Value o : op->getOperands()) m2.map(o, sliced(o));
-      Operation *c = b.clone(*op, m2);
-      for (auto [r, nr] : llvm::zip(op->getResults(), c->getResults())) {
-        SmallVector<int64_t> shape(tensorOf(r).getShape());
-        shape[0] = part;
-        nr.setType(RankedTensorType::get(shape, tensorOf(r).getElementType()));
-        map.map(r, nr);
-      }
-    }
+    cloneChainOnHeads(b, loc, chain, map, H, part, first);
     Value pC = map.lookup(p);
     Value ps = headScale ? pC : scaleColumns(b, loc, pC, tensor::ExtractSliceOp::create(b, loc, sv, SmallVector<OpFoldResult>{first, zero}, attrs({part, N}), attrs({1, 1})));
     Value spC = rowScale(b, loc, ps), p8C = quantRows(b, loc, ps, spC);
     // The past columns of P as the PIM input [G, H P]; the own column stays on the NPU.
     Value p8Past = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({0, 0, 0}), attrs({part, G, P}), attrs({1, 1, 1}));
     Value p8OwnC = tensor::ExtractSliceOp::create(b, loc, p8C, attrs({0, 0, P}), attrs({part, G, 1}), attrs({1, 1, 1}));
-    insertRows(p8Past, loop.getRegionOutArgs()[2], first, P);
+    insertRows(p8Past, loop.getRegionOutArgs()[2], first, P, inputP);
     b.setInsertionPointToEnd(&loop.getTerminator().getRegion().front());
     tensor::ParallelInsertSliceOp::create(b, loc, p8OwnC, loop.getRegionOutArgs()[0], SmallVector<OpFoldResult>{first, zero, zero}, attrs({part, G, 1}), attrs({1, 1, 1}));
     tensor::ParallelInsertSliceOp::create(b, loc, spC, loop.getRegionOutArgs()[1], SmallVector<OpFoldResult>{first, zero}, attrs({part, G}), attrs({1, 1}));
@@ -478,6 +601,8 @@ struct HybKv8Pass : mlir::hybrid::impl::HybKv8Base<HybKv8Pass> {
       if (name && (name.getValue().starts_with("past_k.") || name.getValue().starts_with("past_v.")))
         insertAt = a.getArgNumber() + 1;
     }
+    int64_t directLayers = 0;
+    auto kT2Bytes = [](RankedTensorType kc) { return 2 * kc.getNumElements(); };   // K and V, INT8
     std::map<int, std::pair<Value, Value>> scales;
     SmallVector<std::pair<std::string, Value>> newOutputs;
     llvm::BitVector erase(step.getNumArguments());
@@ -504,24 +629,31 @@ struct HybKv8Pass : mlir::hybrid::impl::HybKv8Base<HybKv8Pass> {
     };
     for (auto &[i, l] : layers) {
       auto [skArg, svArg] = scales[i];
+      l.pastK.setType(RankedTensorType::get(tensorOf(l.pastK).getShape(), i8));
+      l.pastV.setType(RankedTensorType::get(tensorOf(l.pastV).getShape(), i8));
       b.setInsertionPoint(l.kc);
       Value kNew = l.kc.getInputs()[1], vNew = l.vc.getInputs()[1];     // [H, D, M], [H, M, D]
       if (l.vc->isBeforeInBlock(l.kc)) b.setInsertionPoint(l.kc);
       Value kRows = transposed(b, loc, kNew, {0, 2, 1});
       auto [skNew, k8, k8T] = quantizeNewRows(b, loc, kRows, true, cores, headScale ? skArg : Value());
       auto kcT = tensorOf(l.kc.getResult());
-      Value kc8 = mode == "pim" ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get(kcT.getShape(), i8), 2, ValueRange{l.pastK, k8T}));
-      Value sk = mode == "pim" || headScale ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get({kcT.getDimSize(0), kcT.getDimSize(2)}, f32), 1, ValueRange{skArg, skNew}));
+      // K and V on the L2 copy of all heads (the path of FP16), unless together they take more than half of L2: then a core reads one head at a time from LP6.
+      const bool direct = mode == "int8" && (directOption == "on" || (directOption == "auto" && 2 * kT2Bytes(kcT) > target->npu.l2Bytes));
+      if (direct) ++directLayers;
+      Value kc8 = mode == "pim" || direct ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get(kcT.getShape(), i8), 2, ValueRange{l.pastK, k8T}));
+      Value sk = mode == "pim" || headScale ? (mode != "pim" && headScale ? skArg : Value()) : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get({kcT.getDimSize(0), kcT.getDimSize(2)}, f32), 1, ValueRange{skArg, skNew}));
       // V may be defined after the K concat in the block: keep the order of the original concat.
       if (l.kc->isBeforeInBlock(l.vc)) b.setInsertionPointAfter(l.vc.getOperation());
       auto [svNew, v8, unused] = quantizeNewRows(b, loc, vNew, false, cores, headScale ? svArg : Value());
       auto vcT = tensorOf(l.vc.getResult());
-      Value vc8 = mode == "pim" ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get(vcT.getShape(), i8), 1, ValueRange{l.pastV, v8}));
-      Value sv = mode == "pim" || headScale ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get({vcT.getDimSize(0), vcT.getDimSize(1)}, f32), 1, ValueRange{svArg, svNew}));
+      Value vc8 = mode == "pim" || direct ? Value() : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get(vcT.getShape(), i8), 1, ValueRange{l.pastV, v8}));
+      Value sv = mode == "pim" || headScale ? (mode != "pim" && headScale ? svArg : Value()) : Value(tensor::ConcatOp::create(b, loc, RankedTensorType::get({vcT.getDimSize(0), vcT.getDimSize(1)}, f32), 1, ValueRange{svArg, svNew}));
       // The chains.
       b.setInsertionPoint(l.qk);
       Value q = l.qk.getDpsInputs()[0];
-      if (mode == "pim") {
+      if (direct) {
+        if (failed(lowerDirectAttention(b, loc, l.qk, l.pv, l.pastK, l.pastV, k8T, v8, sk, sv, cores, headScale))) return signalPassFailure();
+      } else if (mode == "pim") {
         if (failed(lowerPimAttention(b, loc, i, l.qk, l.pv, k8T, v8, skArg, skNew, svArg, svNew, cores, headScale))) return signalPassFailure();
       } else if (mode == "int8") {
         Value sq = rowScale(b, loc, q);
@@ -553,8 +685,6 @@ struct HybKv8Pass : mlir::hybrid::impl::HybKv8Base<HybKv8Pass> {
       }
       l.kc.erase();
       l.vc.erase();
-      l.pastK.setType(RankedTensorType::get(tensorOf(l.pastK).getShape(), i8));
-      l.pastV.setType(RankedTensorType::get(tensorOf(l.pastV).getShape(), i8));
       if (mode == "pim") {
         erase.resize(step.getNumArguments());
         erase.set(l.pastK.getArgNumber());
@@ -602,6 +732,7 @@ struct HybKv8Pass : mlir::hybrid::impl::HybKv8Base<HybKv8Pass> {
     step.setType(FunctionType::get(&getContext(), argTypes, resultTypes));
     step.setAllResultAttrs(attrs);
     module->setAttr("hyb.kv8", b.getStringAttr(mode));
+    if (directLayers) module->setAttr("hyb.kv8_direct_layers", b.getI64IntegerAttr(directLayers));
     module->setAttr("hyb.kv8_scale", b.getStringAttr(scale));
   }
 };

@@ -272,6 +272,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
     in.beforePim = pimBefore.before;
     in.commonWeights = extra.commonWeights.empty() ? nullptr : &extra.commonWeights;
     in.commonChunkRows = extra.commonChunkRows;
+    if (auto capacity = mod->getAttrOfType<IntegerAttr>("hyb.capacity")) in.kvSlot = int(capacity.getInt()) - 1;
     pimBefore = {};
     program.beginPhase(name, exit);
     NpuPhaseStats stats;

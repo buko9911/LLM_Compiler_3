@@ -503,12 +503,13 @@ LogicalResult Codegen::scatterPimKv(const View &s, const View &d, std::string &e
     return failure();
   }
   const pim::Activation &a = in.pim->activations[size_t(cast<IntegerAttr>(acts[size_t(m)]).getInt())];
-  if (K != a.k || col % K) {
+  if (K > a.k || col % a.k) {
     err = "PIM K/V input copy must cover one head's slice";
     return failure();
   }
-  const int head = int(col / K), channels = in.pim->channels;
-  const int64_t bg = in.pim->bgBytes(), colBytes = in.pim->colBytes(), count = a.packets();
+  // K can be shorter than the sweeps of the stored matrix; the matrix is zero behind it, so what the last packet holds there adds nothing.
+  const int head = int(col / a.k), channels = in.pim->channels;
+  const int64_t bg = in.pim->bgBytes(), colBytes = in.pim->colBytes(), count = (K + 31) / 32;
   if (count * bg > in.spec->npu.l1ReservedBytes - kPoolMax) {
     err = "PIM K/V input needs its column slices in the L1 scratch";
     return failure();

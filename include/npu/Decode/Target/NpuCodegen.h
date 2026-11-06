@@ -59,9 +59,9 @@ struct NpuPhaseInput {
   // Research option --common-layout: where the NPU GEMV weights really are, and the GDMA size of their rows.
   const std::vector<pim::CommonWeight> *commonWeights = nullptr;
   int commonChunkRows = 8;
-  // Research option --kv8=pim: the cache slot a new K/V row is written to. The bursts are real, the slot is fixed at compile time: the last one, which a short
+  // Research option --kv8=pim: the cache slot a new K/V row is written to. The bursts are real, the slot is fixed at compile time: the last one (capacity - 1), which a short
   // test never reads (the program has no indirect addressing; a real one would take the slot from the host).
-  int kvSlot = 511;
+  int kvSlot = 0;
 };
 
 struct NpuPhaseStats {

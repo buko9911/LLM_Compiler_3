@@ -75,6 +75,7 @@ def HybKv8 : Pass<"hyb-kv8", "ModuleOp"> {
   }];
   let options = [Option<"mode", "mode", "std::string", "\"int8\"", "dequant | int8 | pim">,
                  Option<"scale", "scale", "std::string", "\"row\"", "row: scale per (row, KV head); head: fixed scale per (layer, KV head)">,
+                 Option<"directOption", "direct", "std::string", "\"auto\"", "mode=int8: auto reads K and V head by head from LP6 when they take more than half of L2; on, off force it">,
                  Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
   let dependentDialects = ["arith::ArithDialect", "linalg::LinalgDialect", "math::MathDialect", "tensor::TensorDialect", "scf::SCFDialect"];
 }
