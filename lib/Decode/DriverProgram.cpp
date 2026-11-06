@@ -184,6 +184,7 @@ bool driver::emitPhases(ModuleOp mod, func::FuncOp step, const pim::Program &pro
                         plena::ProgramBuilder &program, LP6Extra &extra,
                         std::vector<int> &exit, int &logicalCores, json::Array &report, std::string &err) {
   program.gdmaLookahead = uint32_t(spec.npu.gdmaLookahead);
+  program.gdmaChainPerRank = spec.npu.gdmaChainPerRank != 0;
   program.l1Bytes = uint64_t(spec.npu.l1BaseBytes + spec.npu.l1Bytes);
   program.commandSchedule = true;
   CarriedAccesses carried;   // the last NPU phase's L2 / LP6 accesses (the next phase waits only on these)

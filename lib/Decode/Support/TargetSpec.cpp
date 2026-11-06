@@ -52,7 +52,7 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
     if (o)
       for (auto &kv : *o) {
         llvm::StringRef key = kv.first;
-        if (!key.starts_with("_") && !llvm::is_contained(keys, key) && !(name == "npu" && (key == "l1_base_bytes" || key == "l2_base_bytes"))) {
+        if (!key.starts_with("_") && !llvm::is_contained(keys, key) && !(name == "npu" && (key == "gdma_chain_per_rank" || key == "l1_base_bytes" || key == "l2_base_bytes"))) {
           error = (name + "." + key + " is not a target parameter (optimizations have no switches)").str();
           return true;
         }
@@ -138,6 +138,8 @@ FailureOr<TargetSpec> TargetSpec::load(llvm::StringRef path, std::string &error)
   num(n, "weight_stream_max_slots", s.npu.weightStreamMaxSlots);
   num(n, "gemv_tile_bytes", s.npu.gemvTileBytes);
   num(n, "staging_misc_bytes", s.npu.stagingMiscBytes);
+  if (n && n->get("gdma_chain_per_rank"))
+    if (auto value = n->getInteger("gdma_chain_per_rank")) s.npu.gdmaChainPerRank = *value;
   if (n && n->get("gdma_lookahead")) {
     auto value = n->getInteger("gdma_lookahead");
     if (!value || *value < 0 || *value > 1024) {

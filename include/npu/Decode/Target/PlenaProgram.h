@@ -52,6 +52,7 @@ public:
   /// share a core's window. Aggregate admission is bounded by N * logical cores;
   /// histories are separate because core streams are emitted sequentially.
   uint32_t gdmaLookahead = 0;
+  bool gdmaChainPerRank = false;
   int gdmaChainGroup = 0;   // weight reads of one core in several independent chains (research: common layout)
   // Research option --common-layout: keep the schedule of a phase with far dependencies; they go through barriers at finish(). The
   // simulator's completion events are a ring of 65536 slots, so commands that should run together must stay within that distance.

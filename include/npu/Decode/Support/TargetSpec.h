@@ -64,6 +64,7 @@ struct TargetSpec {
     // Per-core weight-stream GDMA commands in flight within a phase; zero is unlimited. Small staged
     // loads and stores are not counted.
     int64_t gdmaLookahead = 0;
+    int64_t gdmaChainPerRank = 0;  // research: one GDMA chain per rank
     // Bytes at the end of each staging window for small LP6 <-> L1 transfers, used as a byte
     // ring; the weight ring stays below them. Zero stages every transfer at the window start.
     int64_t stagingMiscBytes = 0;

@@ -207,8 +207,10 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
   // otherwise independent cores. Aggregate admission is at most N * cores.
   // These resource edges supplement true memory hazards. The predecessor is
   // already appended, so an added edge cannot introduce a command DAG cycle.
+  // Research key npu.gdma_chain_per_rank: a chain per rank, so reads waiting for a busy rank do not hold back the other rank's.
+  const int chain = logicalCore + 256 * gdmaChainGroup + (gdmaChainPerRank ? 65536 * int((lp6 >> 33) & 1) : 0);
   if (gdmaLookahead && admitted) {
-    const auto &history = phaseGdmas[logicalCore + 256 * gdmaChainGroup];
+    const auto &history = phaseGdmas[chain];
     if (history.size() >= gdmaLookahead) {
       c.deps.push_back(history[history.size() - gdmaLookahead]);
       std::sort(c.deps.begin(), c.deps.end());
@@ -216,7 +218,7 @@ int ProgramBuilder::appendGdma(Kind kind, std::vector<int> deps, uint64_t lp6, u
     }
   }
   int id = push(std::move(c));
-  if (gdmaLookahead && admitted) phaseGdmas[logicalCore + 256 * gdmaChainGroup].push_back(id);
+  if (gdmaLookahead && admitted) phaseGdmas[chain].push_back(id);
   return id;
 }
 
