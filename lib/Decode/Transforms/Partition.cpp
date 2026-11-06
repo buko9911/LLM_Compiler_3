@@ -102,6 +102,11 @@ struct HybPartitionPass : mlir::hybrid::impl::HybPartitionBase<HybPartitionPass>
         x.target = force;
         x.why = "force";
       }
+      // --kv8=pim: the K and V GEMVs have no NPU form.
+      if (StringRef(ops.front().getWeight()).starts_with("kv8.")) {
+        x.target = "pim";
+        x.why = "kv8";
+      }
       if (x.target != "npu" && x.target != "pim") {
         module.emitError() << "unknown target '" << x.target << "'";
         return signalPassFailure();

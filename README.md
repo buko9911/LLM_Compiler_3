@@ -115,6 +115,7 @@ $PY -B runtime/decode.py out-npu --prompt "..." --steps 8 --check               
 |---|---|
 | `--force=npu\|pim`, `--map=substr:target` | GEMV 그룹의 장치를 강제 |
 | `--flash-attention=auto\|on\|off` | online softmax attention. `auto`(기본)는 전체 행이 L2·L1에 안 들어갈 때만, `on`은 NPU-only 프로그램의 모든 attention(PIM phase가 있으면 오류), `off`는 쓰지 않음(안 들어가면 오류) |
+| `--kv8=dequant\|int8\|pim`, `--kv8-scale=row\|head` | 연구 옵션, 기본 꺼짐. K/V cache를 INT8로(`lib/Decode/Transforms/Kv8.cpp`). `dequant`: FP16 matmul 앞에서 FP16으로 되돌림, `int8`: QKᵀ·PV를 SA에서 INT8로, `pim`: 지난 행의 QKᵀ·PV를 PIM에서(1토큰, K/V는 PU마다 KV head 하나인 PIM 행렬, 주소는 `kv_packets.bin`). `row`: (행, KV head)마다 scale, `head`: (층, KV head)마다 고정 scale. 입력 `past_ks.i`, `past_vs.i`, 출력 `new_k.i`, `new_v.i`는 INT8(`row`면 `new_ks.i`, `new_vs.i`도) |
 | `--no-image`, `--no-output-collect`, `--debug-collect [--debug-phases=a,b]` | `lp6.bin` 생략, 출력 회수 생략, phase 사이 값 회수 |
 | `--pim-bankset-pingpong=N` | PIM weight row bank-set 교대. -1(기본)은 target의 `pim.bankset_pingpong_lead`, 0은 끔, 1은 lead 12, 2..63은 그 lead |
 

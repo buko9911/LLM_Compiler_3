@@ -71,6 +71,7 @@ struct Projection {
   int splitK = 1;                           // K pieces (sweeps() % splitK == 0)
   int tailAccs = 0;                         // accumulators of the tail blocks (0: no tail)
   int64_t tailBlocks = 0;
+  int inputsPerSweep = kInTiles;            // input slices of 8 per sweep: 32, or fewer for a short K (--kv8=pim, K = head_dim)
   int64_t outputBase = 0;
   std::vector<int64_t> streamWeightBase;    // first weight tile of each stream, in its partition
   std::vector<int64_t> activations;         // activation per token
@@ -95,7 +96,7 @@ struct Projection {
     return t < mainTiles ? t / (accs / 2) : mainBlocks() + (t - mainTiles) / (tailAccs / 2);
   }
   int64_t streams() const { return blocks() * splitK; }
-  int64_t sweeps() const { return k / kKPerSweep; }
+  int64_t sweeps() const { return k / (inputsPerSweep * kGroup); }
   int64_t pieceSweeps() const { return sweeps() / splitK; }
   int64_t rowsPerPU() const { return nPad / kPUs; }
   int64_t tilesPerPU() const { return nPad / (kPUs * 8); }   // output tiles of 8 per PU, per piece and token
@@ -104,7 +105,7 @@ struct Projection {
   // Weight tiles per sweep. Common layout: an empty row per sweep when a sweep takes an even number of rows, so that the rows of one
   // accumulator pair in consecutive sweeps alternate bank sets (the NPU can open the next one early).
   int64_t sweepTiles(int accs) const {
-    return accs * kInTiles + (common && (accs / 2) % 2 == 0 ? kPacketsPerRow : 0);
+    return accs * inputsPerSweep + (common && (accs / 2) % 2 == 0 ? kPacketsPerRow : 0);
   }
   int64_t streamTiles(int64_t g) const { return pieceSweeps() * sweepTiles(streamAccs(g)); }
   // Common layout: outputs of two equal segments (gate, up) lie on the odd and even PUs of a bank group, others in PU order.
@@ -138,7 +139,7 @@ struct Projection {
   int64_t commands() const {
     int64_t perToken = 0;
     for (int64_t b = 0; b < blocks(); ++b)
-      perToken += splitK * (blockAccs(b) + pieceSweeps() * (kInTiles / kSlices + 1) + blockAccs(b) / 2);
+      perToken += splitK * (blockAccs(b) + pieceSweeps() * (inputsPerSweep / kSlices + 1) + blockAccs(b) / 2);
     return int64_t(tokens()) * perToken;
   }
 };
@@ -192,13 +193,13 @@ struct Program {
   int64_t addProjection(const std::string &name, int64_t n, int64_t k, const std::vector<int64_t> &activations,
                         std::map<int, int64_t> &loads, int accs = kAccs, int splitK = 1,
                         std::function<int64_t(int)> streamLoad = {}, int tailAccs = 0, int64_t tailBlocks = 0,
-                        int pieceRanks = 1);
+                        int pieceRanks = 1, int inputsPerSweep = kInTiles);
   // Packet ranges of activation `index` that the streams on rank `rank` read (sorted, merged). A rank that computes
   // only some K pieces needs only their packets.
   std::vector<std::pair<int64_t, int64_t>> activationPackets(int64_t index, int rank) const;
   // Common layout: one projection for a group of GEMVs. `rank` is the rank of this phase when commonLayout == 1.
   int64_t addCommonProjection(const std::string &name, const std::vector<std::pair<std::string, int64_t>> &segments, int64_t k,
-                              const std::vector<int64_t> &activations, int rank, bool mayCutK);
+                              const std::vector<int64_t> &activations, int rank, bool mayCutK, int inputsPerSweep = kInTiles);
   // Weight tiles already stored in the partitions of rank `rank`.
   int64_t storedTiles(int rank) const;
   // Output tile ids of every projection again, in order (after the streams were rebound).
@@ -317,12 +318,12 @@ void Program::forEachWeightPacketLocation(const Projection &p, Fn fn) const {
     const int accs = p.blockAccs(block);
     for (int64_t s = 0; s < sweeps; ++s)
       for (int o = 0; o < accs; ++o)
-        for (int i = 0; i < kInTiles; ++i) {
-          int64_t tile = p.streamWeightBase[size_t(g)] + s * p.sweepTiles(accs) + o * kInTiles + i;
+        for (int i = 0; i < p.inputsPerSweep; ++i) {
+          int64_t tile = p.streamWeightBase[size_t(g)] + s * p.sweepTiles(accs) + o * p.inputsPerSweep + i;
           for (int pu = 0; pu < kPUs; ++pu) {
             WeightPacketLocation location;
             location.address = weightPacketAddress(tile, pu, p.streamPart[size_t(g)]);
-            location.inputBegin = ((piece * sweeps + s) * kInTiles + i) * kGroup;
+            location.inputBegin = ((piece * sweeps + s) * p.inputsPerSweep + i) * kGroup;
             for (int l = 0; l < kLanes; ++l)
               location.outputChannels[size_t(l)] =
                   p.common ? p.commonPUIndex(pu) * rows +

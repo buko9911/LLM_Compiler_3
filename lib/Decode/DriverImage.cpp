@@ -156,7 +156,7 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
       }
   std::vector<std::string> names;
   for (const pim::Projection &p : prog.projections)
-    if (!p.common && std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
+    if (!p.common && !StringRef(p.name).starts_with("kv8.") && std::find(names.begin(), names.end(), p.name) == names.end()) names.push_back(p.name);
   for (auto &[name, list] : npuWeights)
     if (std::find(names.begin(), names.end(), name) == names.end()) names.push_back(name);
   std::atomic<bool> ok{true};
@@ -219,7 +219,7 @@ bool driver::writeImage(const std::string &model, const std::string &outDir, uin
   // Research option --common-layout: a group of GEMVs is one projection with the rows of its tensors in order.
   std::vector<size_t> commons;
   for (size_t i = 0; i < prog.projections.size(); ++i)
-    if (prog.projections[i].common) commons.push_back(i);
+    if (prog.projections[i].common && !StringRef(prog.projections[i].name).starts_with("kv8.")) commons.push_back(i);
   llvm::parallelFor(0, commons.size(), [&](size_t i) {
     const pim::Projection &p = prog.projections[commons[i]];
     std::vector<int8_t> all(size_t(p.n * p.k));

@@ -97,9 +97,15 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
       Value qx = call.getOperand(0);
       auto qxT = cast<MemRefType>(qx.getType());
       int64_t M = qxT.getDimSize(0), K = qxT.getDimSize(1);
+      // --kv8=pim: K or V of a layer. Every PU keeps one KV head and reads its own input slice, so the input [M, heads x K] is
+      // M vectors of K per PU; the PUs of a subchannel run one stream with different inputs.
+      bool kvGemv = false;
+      callee.walk([&](hyb::QMatmulOp q) { kvGemv |= q.getWeight().starts_with("kv8."); });
+      const int inputsPerSweep = kvGemv && K / pim::kPUs < pim::kKPerSweep ? int(K / pim::kPUs / pim::kGroup) : pim::kInTiles;
+      if (kvGemv) K /= pim::kPUs;
       // A sweep loads 256 inputs. The primitives count whole sweeps, so another K would drop inputs and
       // produce wrong sums without any other sign.
-      if (K % pim::kKPerSweep) {
+      if (K % (inputsPerSweep * pim::kGroup)) {
         call.emitError() << "PIM GEMV needs K to be a multiple of " << pim::kKPerSweep << ", got " << K
                          << " (compile this group for the NPU with --map or --force=npu)";
         placementOK = false;
@@ -167,7 +173,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
           label += (i ? ";" : "") + q.getWeight().str();
           segments.push_back({q.getWeight().str(), rows[i]});
         }
-        const int64_t pi = program.addCommonProjection(label, segments, K, acts, rank, allowSplit);
+        const int64_t pi = program.addCommonProjection(label, segments, K, acts, rank, allowSplit && !kvGemv, inputsPerSweep);
         pim::Projection &p = program.projections[size_t(pi)];
         p.computeFirst = records;
         p.computeCount = p.commands();
@@ -184,6 +190,11 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
                              "A=" + std::to_string(p.accs) + " S=" + std::to_string(p.splitK) + " tail " +
                                  std::to_string(p.tailBlocks) + "xA=" + std::to_string(p.tailAccs),
                              {{"rows", double(p.n)}, {"k", double(K)}});
+      } else if (kvGemv) {
+        // One stream per subchannel: all of the rows of a PU in the fewest accumulators that hold them.
+        shapes[0].accs = int(rows[0] / (int64_t(pim::kPUs) * pim::kLanes * program.channels));
+        cost::recordDecision(callee, "pim stream layout", group[0].getWeight().str(), "A=" + std::to_string(shapes[0].accs) + ", one KV head per PU",
+                             {{"tokens", double(M)}, {"k", double(K)}, {"partitions", double(open)}});
       } else if (!group.empty()) {
         pimcost::Estimate best, plain = pimcost::estimate(*specOr, M, K, rows, shapes, open);
         shapes = pimcost::choose(*specOr, M, K, rows, open, allowSplit, best);
@@ -204,12 +215,12 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         auto out = cast<BlockArgument>(q.getInit());
         auto outT = cast<MemRefType>(out.getType());
         const pimcost::Shape shape = shapes[qi++];
-        const int64_t pieceSweeps = K / pim::kKPerSweep / shape.splitK;
+        const int64_t pieceSweeps = K / (inputsPerSweep * pim::kGroup) / shape.splitK;
         auto streamLoad = [&](int accs) { return pimcost::streamCycles(*specOr, M, pieceSweeps, accs); };
         // Both ranks open and an even K split: each rank computes its own K pieces and needs only their input.
         const int pieceRanks = open == program.channels * pim::kRanks && shape.splitK % pim::kRanks == 0 ? pim::kRanks : 1;
         int64_t pi = program.addProjection(q.getWeight().str(), outT.getDimSize(1), K, acts, loads, shape.accs,
-                                           shape.splitK, streamLoad, shape.tailAccs, shape.tailBlocks, pieceRanks);
+                                           shape.splitK, streamLoad, shape.tailAccs, shape.tailBlocks, kvGemv ? 1 : pieceRanks, inputsPerSweep);
         const pim::Projection &p = program.projections[pi];
         program.projections[pi].computeFirst = records;
         int64_t count = p.commands(); // final executable primitive count
@@ -239,7 +250,7 @@ struct HybPlanLP6Pass : mlir::hybrid::impl::HybPlanLP6Base<HybPlanLP6Pass> {
         cost::recordDecision(callee, "pim records", "PIM phase of " + std::to_string(records - first) + " primitives",
                              std::to_string(count), {{"fetch_us", fetchUs}, {"sweep_rounds", double(rounds)}});
       }
-      pimBuffers[qx] = b.getDictionaryAttr({b.getNamedAttr("layout", b.getStringAttr("pim_act")),
+      pimBuffers[qx] = b.getDictionaryAttr({b.getNamedAttr("layout", b.getStringAttr(kvGemv ? "pim_act_kv" : "pim_act")),
                                             b.getNamedAttr("acts", b.getI64ArrayAttr(acts))});
     });
     if (!placementOK) return signalPassFailure();

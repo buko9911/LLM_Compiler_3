@@ -67,6 +67,18 @@ def HybStorageF16 : Pass<"hyb-storage-f16", "ModuleOp"> {
   let dependentDialects = ["arith::ArithDialect", "linalg::LinalgDialect", "tensor::TensorDialect"];
 }
 
+def HybKv8 : Pass<"hyb-kv8", "ModuleOp"> {
+  let summary = "Research option --kv8: the K/V cache in INT8 (W8A8KV8)";
+  let description = [{
+    Symmetric INT8 per (token row, KV head). mode=dequant reads K and V back to FP16 next to the FP16 matmuls, mode=int8
+    computes QK^T and PV on the SA in INT8, mode=pim computes them on PIM. See lib/Decode/Transforms/Kv8.cpp.
+  }];
+  let options = [Option<"mode", "mode", "std::string", "\"int8\"", "dequant | int8 | pim">,
+                 Option<"scale", "scale", "std::string", "\"row\"", "row: scale per (row, KV head); head: fixed scale per (layer, KV head)">,
+                 Option<"spec", "spec", "std::string", "\"\"", "target spec JSON">];
+  let dependentDialects = ["arith::ArithDialect", "linalg::LinalgDialect", "math::MathDialect", "tensor::TensorDialect", "scf::SCFDialect"];
+}
+
 //===----------------------------------------------------------------------===//
 // 2. Device and phases.
 //===----------------------------------------------------------------------===//

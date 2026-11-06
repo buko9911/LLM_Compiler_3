@@ -74,6 +74,10 @@ static cl::opt<int> commonChunk("common-chunk-rows",
     cl::desc("research, with --common-layout: an NPU weight tile is read in GDMAs of this many 128-byte rows"), cl::init(8));
 static cl::opt<int> collectLogitRows("collect-logit-rows",
     cl::desc("research: collect only this many logits rows when all of them fit no SRAM dump (0: all)"), cl::init(0));
+static cl::opt<std::string> kv8Mode("kv8",
+    cl::desc("research: the K/V cache in INT8, per (row, KV head). dequant: read back to FP16 next to the FP16 matmuls; int8: QK^T and PV in INT8 on the SA; "
+             "pim: QK^T and PV of the past rows on PIM (one token). Default off"), cl::init(""));
+static cl::opt<std::string> kv8Scale("kv8-scale", cl::desc("research, with --kv8: row (default): a scale per (row, KV head); head: a fixed scale per (layer, KV head)"), cl::init("row"));
 static cl::opt<bool> debugCollect("debug-collect", cl::desc("also collect every buffer passed between phases"),
                                   cl::init(false));
 static cl::opt<bool> noOutputCollect("no-output-collect",
@@ -138,12 +142,13 @@ std::string decodePipeline(const std::string &overrideOpt) {
   const std::string spec = "{spec=" + specFile + "}";
   // 1. Tensor math: name the arguments, clean up the import, W8A8 quantization, FP16 storage.
   const std::string tensor =
-      "hyb-annotate{manifest=" + manifestFile + "},"          // argument kinds and checkpoint names
+      std::string("hyb-annotate{manifest=") + manifestFile + "},"  // argument kinds and checkpoint names
       "func.func(hyb-simplify,canonicalize,cse,"              // import clean-up, elementwise fusion
       "hyb-raise-linear,canonicalize,"                        // matmul(x, W^T) -> hyb.linear
       "hyb-quantize,cse,"                                     // linear -> quant + qmatmul + dequant
       "hyb-fold-transpose,canonicalize),"                     // transpose(K) into the batch_matmul map
-      "hyb-storage-f16,";                                     // FP16 storage, FP32 reductions
+      "hyb-storage-f16," +                                    // FP16 storage, FP32 reductions
+      (kv8Mode.empty() ? std::string() : "hyb-kv8{mode=" + kv8Mode + " scale=" + kv8Scale + " spec=" + specFile + "},canonicalize,cse,");
   // 2. Device and phases: NPU or PIM per GEMV group, NPU GEMV layout, one function per phase.
   const std::string placement =
       "hyb-partition{spec=" + specFile + " report=" + outDir + "/partition.json" +

@@ -2,6 +2,7 @@ add_mlir_library(NPUDecodeTransforms
   Common.cpp
   TensorPasses.cpp
   StorageF16.cpp
+  Kv8.cpp
   Partition.cpp
   OutlinePhases.cpp
   PlanLP6.cpp

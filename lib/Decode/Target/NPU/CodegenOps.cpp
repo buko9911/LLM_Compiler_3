@@ -37,6 +37,7 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
     return success();
   }
   if (op->hasAttr("hyb.quant_feeds")) return success();
+  if (d0->layout == "pim_act_kv") return scatterPimKv(*s0, *d0, err);
   if (d0->layout == "pim_act") {
     if (auto c = op->getAttrOfType<IntegerAttr>("hyb.feed_cores"))
       return scatterPimActCores(*s0, *d0, int(c.getInt()), err);
@@ -49,6 +50,7 @@ LogicalResult Codegen::lowerCopy(Operation *op, Value srcV, Value dstV, ArrayRef
   }
   readAfterGather = op->hasAttr("hyb.read_after_gather");
   llvm::scope_exit resetReadOrder([&] { readAfterGather = false; });
+  storeKvRow(*s0, *d0);
   View s = *s0, d = *d0;
   if (!perm.empty()) {    // linalg.transpose: dst dim i = src dim perm[i]
     View p = s;
@@ -255,10 +257,13 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
   FailureOr<View> A = viewOf(mm.getDpsInputs()[0], err), B = viewOf(mm.getDpsInputs()[1], err),
                   C = viewOf(mm.getDpsInits()[0], err);
   if (failed(A) || failed(B) || failed(C)) return failure();
-  if (!A->et.isF16() || !B->et.isF16()) {
+  // --kv8: QK^T and PV in INT8, with INT32 results.
+  const bool int8 = A->et.isInteger(8) && B->et.isInteger(8) && C->et.isInteger(32);
+  if (!int8 && (!A->et.isF16() || !B->et.isF16())) {
     err = "matmul operands must be f16";
     return failure();
   }
+  const uint32_t weightF = int8 ? 1 : 3, activationF = int8 ? 5 : 7, mmaF = int8 ? 1 : 3;
   if (failed(checkZeroInit(mm, err))) return failure();
   auto maps = mm.getIndexingMapsArray();
   int nb = batched ? 1 : 0;
@@ -267,13 +272,13 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
   bool transB = bm.getResult(bm.getNumResults() - 1) == getAffineDimExpr(kDim, mm.getContext());
   int64_t batch = batched ? C->shape[0] : 1;
   int64_t M = C->shape[nb], N = C->shape[nb + 1], K = A->shape[nb + 1];
-  uint32_t woF = C->et.isF16() ? 1 : 4;
-  int64_t aRow = A->strides[nb] * 2, cRow = C->strides[nb] * C->eb;
+  uint32_t woF = int8 ? 2 : C->et.isF16() ? 1 : 4;
+  int64_t aRow = A->strides[nb] * A->eb, cRow = C->strides[nb] * C->eb;
   if (A->strides[nb + 1] != 1 || C->strides[nb + 1] != 1 || B->strides[nb + 1] != 1) {
     err = "matmul operands need a contiguous innermost dim";
     return failure();
   }
-  int64_t bRow = B->strides[nb] * 2;
+  int64_t bRow = B->strides[nb] * B->eb;
   for (int64_t b = 0; b < batch; ++b) {
     int64_t ao = batched ? b * A->strides[0] : 0, bo = batched ? b * B->strides[0] : 0,
             co = batched ? b * C->strides[0] : 0;
@@ -283,9 +288,9 @@ LogicalResult Codegen::lowerMatmul(linalg::LinalgOp mm, std::string &err) {
           int64_t mm_ = std::min<int64_t>(32, M - m0), nn = std::min<int64_t>(32, N - n0);
           load(7, uint32_t(addr(*B, bo + n0)));
           load(8, uint32_t(addr(*A, ao + m0 * A->strides[nb])));
-          matrixInputs(matrixLoad(7, uint32_t(K), uint32_t(nn), uint32_t(bRow), 3),
-                       matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(aRow), 7));
-          mma(K, 3);
+          matrixInputs(matrixLoad(7, uint32_t(K), uint32_t(nn), uint32_t(bRow), weightF),
+                       matrixLoad(8, uint32_t(mm_), uint32_t(K), uint32_t(aRow), activationF));
+          mma(K, mmaF);
           load(9, uint32_t(addr(*C, co + m0 * C->strides[nb] + n0)));
           rec(matrixWriteout(9, uint32_t(mm_), uint32_t(nn), uint32_t(cRow), woF));
         }
@@ -476,6 +481,130 @@ void Codegen::reduceToScalar(uint64_t src, int64_t elements, uint32_t funct, uin
   sstore(dst, s);
 }
 
+/// --kv8 (Transforms/Kv8.cpp): the generics marked hyb.kv_op. Rows are the innermost axis, contiguous.
+LogicalResult Codegen::lowerKv(linalg::GenericOp g, StringRef kind, std::string &err) {
+  SmallVector<View> v;
+  for (Value o : g->getOperands()) {
+    FailureOr<View> x = viewOf(o, err);
+    if (failed(x)) return failure();
+    v.push_back(*x);
+  }
+  // The offset of the row with outer index idx in a view whose dims are the first dims of the op's loops.
+  auto rowOffset = [](const View &x, ArrayRef<int64_t> idx) {
+    int64_t off = 0;
+    for (size_t k = 0; k < idx.size() && k < x.strides.size(); ++k) off += idx[k] * x.strides[k];
+    return off;
+  };
+  if (kind == "row_scale") {
+    const View &X = v[0], &S = v[1];
+    const int64_t K = X.shape.back();
+    if (X.strides.back() != 1) { err = "row_scale needs contiguous rows"; return failure(); }
+    forEachOuter(X.shape, 1, [&](ArrayRef<int64_t> idx) {
+      quantMax(addr(X, rowOffset(X, idx)), K);
+      sload(1, uint64_t(poolL1 + scalarConst(1.0f / 127.0f)));
+      emit(rform(OP_S_ALU, 0, 0, 1, 0, 3));          // s0 = max / 127
+      sstore(addr(S, rowOffset(S, idx)), 0);
+    });
+    return success();
+  }
+  if (kind == "quant") {
+    const View &X = v[0], &S = v[1], &Q = v[2];
+    const int64_t K = X.shape.back();
+    if (X.strides.back() != 1 || Q.strides.back() != 1) { err = "quant needs contiguous rows"; return failure(); }
+    forEachOuter(X.shape, 1, [&](ArrayRef<int64_t> idx) {
+      sload(0, addr(S, rowOffset(S, idx.take_front(S.shape.size()))));
+      quantApply(addr(X, rowOffset(X, idx)), addr(Q, rowOffset(Q, idx)), K);
+    });
+    return success();
+  }
+  if (kind == "add_i32") {
+    const View &A = v[0], &B = v[1], &Y = v[2];
+    const int64_t N = Y.shape.back();
+    if (A.strides.back() != 1 || B.strides.back() != 1 || Y.strides.back() != 1) { err = "add needs contiguous rows"; return failure(); }
+    forEachOuter(Y.shape, 1, [&](ArrayRef<int64_t> idx) {
+      const uint64_t a = addr(A, rowOffset(A, idx)), c = addr(B, rowOffset(B, idx)), y = addr(Y, rowOffset(Y, idx));
+      for (int64_t e = 0; e < N; e += 16) {
+        const uint32_t lanes = uint32_t(std::min<int64_t>(16, N - e));
+        setVL(lanes);
+        vload(0, a + uint64_t(e * 4), 7);
+        vload(1, c + uint64_t(e * 4), 7);
+        rec(typedVector(T_ADD, DT_I32, 2, 0, 1, 0, lanes));
+        vstore(y + uint64_t(e * 4), 2, 8);
+      }
+    });
+    return success();
+  }
+  // dequant: y[h, r, n] = acc[h, r, n] * s0[h, r] * s1[h, n], acc INT32, or INT8 with one of the scales.
+  const View &A = v[0], &Y = v.back();
+  auto maps = g.getIndexingMapsArray();
+  MLIRContext *ctx = g.getContext();
+  const View *rowS = nullptr, *colS = nullptr, *headS = nullptr;
+  for (size_t i = 1; i + 1 < v.size(); ++i) {
+    if (maps[i].getNumResults() == 1) headS = &v[i];
+    else if (maps[i].getResults().back() == getAffineDimExpr(2, ctx)) colS = &v[i];
+    else rowS = &v[i];
+  }
+  const bool i8 = A.et.isInteger(8);
+  const int64_t N = Y.shape.back();
+  if (A.strides.back() != 1 || Y.strides.back() != 1 || (colS && colS->strides.back() != 1)) {
+    err = "dequant needs contiguous rows";
+    return failure();
+  }
+  const uint32_t aEb = uint32_t(A.eb);
+  // v3k = acc, v(3k+1) = scale, v(3k+2) = result; four chunks of 16 lanes at a time, in a hardware loop on long rows.
+  const uint64_t ones = uint64_t(poolL1 + vectorConst(1.0, DT_F32));
+  auto convert = [&](uint32_t u) { emit(rform(OP_V_CONV, 3 * u + 2, 3 * u, 0, 3 * u + 1, 3)); };
+  forEachOuter(Y.shape, 1, [&](ArrayRef<int64_t> idx) {
+    if (rowS) sload(0, addr(*rowS, rowOffset(*rowS, idx)));
+    else sload(0, uint64_t(poolL1 + scalarConst(1.0f)));
+    if (headS) {
+      sload(1, addr(*headS, idx[0] * headS->strides[0]));
+      emit(rform(OP_S_ALU, 0, 0, 1, 0, 3));          // s0 *= scale of the head
+    }
+    const uint64_t src = addr(A, rowOffset(A, idx)), dst = addr(Y, rowOffset(Y, idx));
+    const uint64_t col = colS ? addr(*colS, rowOffset(*colS, idx.take_front(1))) : ones;
+    const uint32_t colBytes = colS ? 64 : 0;
+    int64_t s = 0;
+    if (const int64_t iterations = N / 64; iterations >= 2) {
+      const uint64_t span = uint64_t(iterations * 64);
+      guardLoopRange(src, src + span * aEb, false);
+      if (colS) guardLoopRange(col, col + span * 4, false);
+      guardLoopRange(dst, dst + span * 2, true);
+      load(kLoopPointers[0], uint32_t(src));
+      load(kLoopPointers[1], uint32_t(col));
+      load(kLoopPointers[2], uint32_t(dst));
+      setVL(16);
+      loopBegin(uint32_t(iterations));
+      for (uint32_t u = 0; u < 4; ++u) vloadAt(3 * u, kLoopPointers[0], u * 16 * aEb, i8 ? 5 : 7);
+      for (uint32_t u = 0; u < 4; ++u) vloadAt(3 * u + 1, kLoopPointers[1], colS ? u * 64 : 0, 3);
+      if (i8)
+        for (uint32_t u = 0; u < 4; ++u) rec(typedVector(T_CAST_I32, DT_I8, 3 * u, 3 * u, 0, 0, 16));
+      for (uint32_t u = 0; u < 4; ++u) convert(u);
+      for (uint32_t u = 0; u < 4; ++u) vstoreAt(kLoopPointers[2], u * 32, 3 * u + 2, 2);
+      advance(kLoopPointers[0], 64 * aEb);
+      if (colS) advance(kLoopPointers[1], 256);
+      advance(kLoopPointers[2], 128);
+      loopEnd();
+      s += int64_t(span);
+    }
+    (void)colBytes;
+    while (s < N) {
+      const uint32_t full = uint32_t(std::min<int64_t>(4, (N - s) / 16));
+      const uint32_t group = std::max<uint32_t>(full, 1);
+      const uint32_t lanes = uint32_t(std::min<int64_t>(16, N - s));
+      setVL(lanes);
+      for (uint32_t u = 0; u < group; ++u) vload(3 * u, src + uint64_t(s + u * 16) * aEb, i8 ? 5 : 7);
+      for (uint32_t u = 0; u < group; ++u) vload(3 * u + 1, colS ? col + uint64_t(s + u * 16) * 4 : ones, 3);
+      if (i8)
+        for (uint32_t u = 0; u < group; ++u) rec(typedVector(T_CAST_I32, DT_I8, 3 * u, 3 * u, 0, 0, lanes));
+      for (uint32_t u = 0; u < group; ++u) convert(u);
+      for (uint32_t u = 0; u < group; ++u) vstore(dst + uint64_t(s + u * 16) * 2, 3 * u + 2, 2);
+      s += int64_t(group) * 16;
+    }
+  });
+  return success();
+}
+
 /// y[m, n] = acc[m, n] * scale[m] * wscale[n], 16 lanes per vector (INT32 -> FP16), over rows
 /// [row0, row0 + rows) and columns [col0, col0 + cols). The op itself (rows < 0) covers all of
 /// it, or only the columns a pipelined GEMV loop left (dequantTail).
@@ -569,6 +698,7 @@ LogicalResult Codegen::lower(Operation *op, std::string &err) {
       auto shape = cast<ShapedType>(g.getDpsInits()[0].getType()).getShape();
       return lowerGenericBlock(g, 0, shape[0], tail->second, shape[1] - tail->second, err);
     }
+    if (auto kv = g->getAttrOfType<StringAttr>("hyb.kv_op")) return lowerKv(g, kv.getValue(), err);
     return g->hasAttr("hyb.npu_gemv") ? lowerGemv(g, err) : lowerGeneric(g, err);
   }
   if (auto f = dyn_cast<linalg::FillOp>(op)) return lowerFill(f, err);

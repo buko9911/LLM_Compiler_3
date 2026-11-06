@@ -492,4 +492,90 @@ LogicalResult Codegen::scatterPimAct(const View &s, const View &d, std::string &
   return success();
 }
 
+/// --kv8=pim: M input vectors, [M, heads x K] in contiguous L1 rows, where a PU reads the slice of its KV head. One column of a bank
+/// holds the packet of one head per bank group, the same bytes over the subchannels: each packet is copied per bank group and doubled to the
+/// subchannels, then one store per bank (even PUs, odd PUs).
+LogicalResult Codegen::scatterPimKv(const View &s, const View &d, std::string &err) {
+  if (s.space != kL1 || s.strides.back() != 1) {
+    err = "PIM K/V input copy needs contiguous L1 rows";
+    return failure();
+  }
+  auto acts = d.lp6.getAs<ArrayAttr>("acts");
+  const int64_t rows = s.shape[0], sRow = s.strides[0], colBytes = in.pim->colBytes(), bgBytes = in.pim->bgBytes();
+  const int channels = in.pim->channels;
+  const uint64_t dup = scratchBase, win = windowBase(curCore), windowEnd = win + uint64_t(ringWindow());
+  uint64_t stage = win;
+  for (int64_t m = 0; m < rows; ++m) {
+    const int64_t actIndex = cast<IntegerAttr>(acts[size_t(m)]).getInt();
+    const pim::Activation &a = in.pim->activations[size_t(actIndex)];
+    const uint64_t row = addr(s, m * sRow);
+    const int64_t batch = std::min({std::max<int64_t>(1, (a.packets() + 3) / 4), (in.spec->npu.l1ReservedBytes - kPoolMax) / (2 * colBytes),
+                                    (int64_t(ringWindow()) - 32 * pim::kPacketsPerRow) / (2 * colBytes)});
+    if (batch < 1) {
+      err = "PIM K/V input needs two columns of L1 scratch and L2 staging";
+      return failure();
+    }
+    for (int64_t begin = 0; begin < a.packets(); begin += batch) {
+      const int64_t count = std::min(batch, a.packets() - begin);
+      if (stage + uint64_t(2 * colBytes * count) > windowEnd) stage = win;
+      for (int parity = 0; parity < 2; ++parity)
+        for (int group = 0; group < 4; ++group) {
+          const uint64_t first = dup + uint64_t(parity * colBytes + group * bgBytes);
+          const int head = 2 * group + parity;
+          l1Copy(first, row + uint64_t(head * a.k + begin * 32), 32, uint32_t(count), 32, uint32_t(2 * colBytes));
+          for (int64_t have = 32; have < bgBytes; have *= 2)
+            l1Copy(first + uint64_t(have), first, uint32_t(have), uint32_t(count), uint32_t(2 * colBytes), uint32_t(2 * colBytes));
+        }
+      ldma(dup, stage, uint32_t(2 * colBytes * count), 1, 0, 0, false);
+      std::set<int> ranks;
+      for (int part : a.parts) ranks.insert(in.pim->partRank(part));
+      for (int rk : ranks)
+        for (int parity = 0; parity < 2; ++parity)
+          for (int64_t p = begin; p < begin + count;) {
+            const int64_t n = std::min(begin + count - p, pim::kPacketsPerRow - (a.packetBase() + p) % pim::kPacketsPerRow);
+            gdmaStore(stage + uint64_t((p - begin) * 2 * colBytes + parity * colBytes), in.pim->activationPacketAddress(a, p, parity, rk * channels),
+                      uint32_t(colBytes), uint32_t(n), uint32_t(2 * colBytes), uint32_t(colBytes));
+            p += n;
+          }
+      stage += uint64_t(2 * colBytes * count);
+    }
+  }
+  return success();
+}
+
+/// --kv8=pim: writing a new K/V row of the step (the copy to its output new_k.i, new_v.i) also writes the row into the stored matrix: one burst per
+/// packet that holds a byte of the row. The slot is a compile-time number (timing): the bursts are real, their other lanes are not preserved, so the
+/// host writes the matrices again before the next step (research/race_decoding/kv8/run_kv8.py) and no later read of this step sees them.
+void Codegen::storeKvRow(const View &s, const View &d) {
+  if (!in.pim || d.space != kLP6 || !d.lp6 || s.space != kL1) return;
+  auto name = d.lp6.getAs<StringAttr>("name");
+  if (!name) return;
+  const bool isK = name.getValue().starts_with("new_k."), isV = name.getValue().starts_with("new_v.");
+  if (!isK && !isV) return;
+  const std::string key = std::string(isK ? "kv8.k." : "kv8.v.") + name.getValue().drop_front(6).str();
+  const pim::Projection *p = nullptr;
+  for (const pim::Projection &x : in.pim->projections)
+    if (x.name == key) p = &x;
+  if (!p) return;
+  const int64_t slot = in.kvSlot, heads = pim::kPUs;
+  std::map<int64_t, std::vector<uint64_t>> byHead;
+  in.pim->forEachWeightPacketLocation(*p, [&](const pim::WeightPacketLocation &l) {
+    if (isK) {
+      // K: rows n = head x capacity + position, inputs = head_dim. All packets of the row, one lane each.
+      const int64_t perHead = p->n / heads;
+      for (int64_t ch : l.outputChannels)
+        if (ch < p->n && ch % perHead == slot) byHead[ch / perHead].push_back(l.address);
+    } else if (slot >= l.inputBegin && slot < l.inputBegin + pim::kGroup) {
+      // V: rows n = head x head_dim + column, inputs = position. The packet that holds this position, for each column.
+      for (int64_t ch : l.outputChannels)
+        if (ch < p->n) { byHead[ch / (p->n / heads)].push_back(l.address); break; }
+    }
+  });
+  for (auto &[head, list] : byHead) {
+    std::sort(list.begin(), list.end());
+    list.erase(std::unique(list.begin(), list.end()), list.end());
+    for (uint64_t address : list) copyL1ToLP6(addr(s, 0) + uint64_t(head) * 128, address, 32, 1, 32, 32);
+  }
+}
+
 } // namespace mlir::hybrid::codegen

@@ -20,11 +20,12 @@ int64_t Program::addActivation(int64_t k) {
 int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
                                const std::vector<int64_t> &inputs, std::map<int, int64_t> &loads, int accs,
                                int splitK, std::function<int64_t(int)> streamLoad, int tailAccs,
-                               int64_t tailBlocks, int pieceRanks) {
+                               int64_t tailBlocks, int pieceRanks, int inputsPerSweep) {
   Projection p;
   p.name = name;
   p.n = n;
   p.k = k;
+  p.inputsPerSweep = inputsPerSweep;
   p.accs = accs;
   p.splitK = splitK;
   p.tailAccs = tailBlocks > 0 ? tailAccs : 0;
@@ -44,7 +45,7 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
   // load, the greedy pass gave it). A stream's default load is its LdMAC count (sweeps x accumulators).
   if (int(nextWeight.size()) < partitions) nextWeight.resize(size_t(partitions), 0);
   std::vector<int64_t> count(size_t(partitions), 0);
-  auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.pieceSweeps() * accs * kInTiles; };
+  auto stored = [&](int c) { return nextWeight[size_t(c)] + count[size_t(c)] * p.pieceSweeps() * accs * p.inputsPerSweep; };
   auto load = [&](int a) {
     return streamLoad ? streamLoad(a) : p.pieceSweeps() * a * int64_t(inputs.size());
   };
@@ -84,10 +85,11 @@ int64_t Program::addProjection(const std::string &name, int64_t n, int64_t k,
 }
 
 int64_t Program::addCommonProjection(const std::string &name, const std::vector<std::pair<std::string, int64_t>> &segments, int64_t k,
-                                     const std::vector<int64_t> &inputs, int rank, bool mayCutK) {
+                                     const std::vector<int64_t> &inputs, int rank, bool mayCutK, int inputsPerSweep) {
   Projection p;
   p.name = name;
   p.common = true;
+  p.inputsPerSweep = inputsPerSweep;
   p.segments = segments;
   for (const auto &seg : segments) p.n += seg.second;
   p.k = k;
@@ -146,7 +148,7 @@ std::vector<std::pair<int64_t, int64_t>> Program::activationPackets(int64_t inde
   std::vector<std::pair<int64_t, int64_t>> ranges;
   for (const Projection &p : projections) {
     if (!std::count(p.activations.begin(), p.activations.end(), index)) continue;
-    const int64_t packetsPerSweep = kInTiles / kSlices;
+    const int64_t packetsPerSweep = p.inputsPerSweep / kSlices;
     for (int64_t g = 0; g < p.streams(); ++g) {
       if (partRank(p.streamPart[size_t(g)]) != rank) continue;
       const int64_t piece = g / p.blocks();
@@ -267,20 +269,20 @@ Result<bool> Program::emitCompute(int64_t index, std::vector<Primitive> &command
         commands.push_back(q);
       }
     for (int64_t sweep = from; sweep < to; ++sweep) {
-      int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * kInTiles;
+      int64_t firstA = a.base + (piece * p.pieceSweeps() + sweep) * p.inputsPerSweep;
       int64_t firstW = p.streamWeightBase[size_t(g)] + sweep * p.sweepTiles(accs);
-      if (firstA + kInTiles > INT32_MAX || firstW + accs * kInTiles > INT32_MAX)
+      if (firstA + p.inputsPerSweep > INT32_MAX || firstW + accs * p.inputsPerSweep > INT32_MAX)
         return Result<bool>::failure(p.name + ": PIM tile ID exceeds INT32_MAX");
       // A load fills a whole 32-byte input register (four logical K=8
       // slices). Emit it once per packet; all slices remain addressable.
-      for (int i = 0; i < kInTiles; i += kSlices) {
+      for (int i = 0; i < p.inputsPerSweep; i += kSlices) {
         auto q = make(Opcode::LoadActivation); q.activation = int32_t(firstA + i);
         commands.push_back(q);
       }
       auto q = make(Opcode::GemvStream);
       q.weight = int32_t(firstW); q.activation = int32_t(firstA); q.accumulator = 0;
-      q.inputs = kInTiles; q.outputs = accs;
-      q.weightInputStride = 1; q.weightOutputStride = kInTiles;
+      q.inputs = p.inputsPerSweep; q.outputs = accs;
+      q.weightInputStride = 1; q.weightOutputStride = p.inputsPerSweep;
       q.activationInputStride = 1; q.accumulatorOutputStride = 1;
       commands.push_back(q);
     }

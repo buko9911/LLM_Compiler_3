@@ -92,6 +92,30 @@ void driver::writeIO(const std::string &outDir, const std::string &manifestFile,
                   {"outputs", std::move(outputs)},
                   {"phases", std::move(report)}};
   if (!uncollected.empty()) io["uncollected"] = std::move(uncollected);
+  if (auto kv8 = mod->getAttrOfType<StringAttr>("hyb.kv8")) io["kv8"] = kv8.getValue().str();
+  if (auto scale = mod->getAttrOfType<StringAttr>("hyb.kv8_scale")) io["kv8_scale"] = scale.getValue().str();
+  // --kv8=pim: the host writes the K and V matrices. kv_packets.bin: per packet, address (u64), first input (i32), the four lanes' rows (i32).
+  json::Array kvMatrices;
+  std::error_code kvError;
+  std::unique_ptr<llvm::raw_fd_ostream> kvFile;
+  int64_t kvPackets = 0;
+  for (const pim::Projection &p : prog.projections) {
+    if (!StringRef(p.name).starts_with("kv8.")) continue;
+    if (!kvFile) kvFile = std::make_unique<llvm::raw_fd_ostream>(outDir + "/kv_packets.bin", kvError);
+    const int64_t first = kvPackets;
+    prog.forEachWeightPacketLocation(p, [&](const pim::WeightPacketLocation &l) {
+      kvFile->write(reinterpret_cast<const char *>(&l.address), 8);
+      const int32_t begin = int32_t(l.inputBegin);
+      kvFile->write(reinterpret_cast<const char *>(&begin), 4);
+      for (int64_t channel : l.outputChannels) {
+        const int32_t c = int32_t(channel);
+        kvFile->write(reinterpret_cast<const char *>(&c), 4);
+      }
+      ++kvPackets;
+    });
+    kvMatrices.push_back(json::Object{{"name", p.name}, {"n", p.n}, {"k", p.k}, {"first", first}, {"count", kvPackets - first}});
+  }
+  if (!kvMatrices.empty()) io["pim_kv"] = std::move(kvMatrices);
   std::error_code ec;
   llvm::raw_fd_ostream os(outDir + "/io.json", ec);
   os << llvm::formatv("{0:1}", json::Value(std::move(io))) << "\n";

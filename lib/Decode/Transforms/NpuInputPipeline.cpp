@@ -22,12 +22,13 @@ using namespace mlir;
 using namespace mlir::hybrid;
 
 namespace {
-bool staticF16(Value value, unsigned rank, unsigned space) {
+/// The element type of a matrix operand: FP16, or --kv8's INT8 operands and INT32 result.
+bool staticElements(Value value, unsigned rank, unsigned space, unsigned intBits = 0) {
   auto type = dyn_cast<MemRefType>(value.getType());
   SmallVector<int64_t> strides;
   int64_t offset;
   return type && type.hasStaticShape() && type.getRank() == rank &&
-         type.getElementType().isF16() && type.getMemorySpaceAsInt() == space &&
+         (intBits ? type.getElementType().isInteger(intBits) : type.getElementType().isF16()) && type.getMemorySpaceAsInt() == space &&
          llvm::all_of(type.getShape(), [](int64_t dim) { return dim > 0; }) &&
          succeeded(type.getStridesAndOffset(strides, offset)) &&
          llvm::all_of(strides, [](int64_t stride) { return stride > 0; }) &&
@@ -83,7 +84,8 @@ linalg::FillOp privateZeroInit(Value output, Operation *matrix) {
     Attribute value;
     if (!fill || init || fill.getOutputs()[0] != output ||
         !matchPattern(fill.getInputs()[0], m_Constant(&value)) ||
-        !isa<FloatAttr>(value) || !cast<FloatAttr>(value).getValue().isZero()) return {};
+        !((isa<FloatAttr>(value) && cast<FloatAttr>(value).getValue().isZero()) ||
+          (isa<IntegerAttr>(value) && cast<IntegerAttr>(value).getValue().isZero()))) return {};
     init = fill;
   }
   return init;
@@ -146,8 +148,10 @@ int64_t pipeline(memref::CopyOp copy, int64_t tileColumns) {
   unsigned rank = batched ? 3 : 2;
   Value a = matrix.getDpsInputs()[0], b = matrix.getDpsInputs()[1], c = matrix.getDpsInits()[0];
   if (copy.getTarget() != b || !b.getDefiningOp<memref::AllocOp>() ||
-      !staticF16(a, rank, 1) || !staticF16(b, rank, 1) || !staticF16(c, rank, 1) ||
-      !staticF16(copy.getSource(), rank, 2) || !canonicalMaps(matrix, batched)) return 0;
+      !canonicalMaps(matrix, batched)) return 0;
+  const bool int8 = cast<MemRefType>(b.getType()).getElementType().isInteger(8);
+  if (!staticElements(a, rank, 1, int8 ? 8 : 0) || !staticElements(b, rank, 1, int8 ? 8 : 0) || !staticElements(c, rank, 1, int8 ? 32 : 0) ||
+      !staticElements(copy.getSource(), rank, 2, int8 ? 8 : 0)) return 0;
   if (llvm::any_of(b.getUsers(), [&](Operation *user) {
         return user != copy.getOperation() && user != matrix.getOperation();
       })) return 0;

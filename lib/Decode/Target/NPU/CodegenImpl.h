@@ -336,6 +336,8 @@ private:
   LogicalResult gatherPimCommon(const View &s, const View &d, std::string &err);
   bool commonWeightLoad(uint64_t logical, uint64_t slot, uint32_t bytes);
   LogicalResult scatterPimAct(const View &s, const View &d, std::string &err);
+  LogicalResult scatterPimKv(const View &s, const View &d, std::string &err);
+  void storeKvRow(const View &s, const View &d);
   LogicalResult scatterPimActCores(const View &s, const View &d, int feedCores, std::string &err);
   void storeActivationPackets(int64_t actIndex, uint64_t l2, int64_t first, int64_t count);
 
@@ -346,6 +348,7 @@ private:
   LogicalResult lowerMatmul(linalg::LinalgOp mm, std::string &err);
   LogicalResult lowerGemv(linalg::GenericOp g, std::string &err);
   LogicalResult lowerQuant(hyb::QuantOp q, std::string &err);
+  LogicalResult lowerKv(linalg::GenericOp g, StringRef kind, std::string &err);
   LogicalResult lowerQuantCores(hyb::QuantOp q, std::string &err);
   void quantMax(uint64_t src, int64_t K);
   void quantApply(uint64_t src, uint64_t dst, int64_t K);

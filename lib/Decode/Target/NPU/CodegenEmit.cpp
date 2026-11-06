@@ -466,6 +466,11 @@ void Codegen::transfer2d(int64_t ss, int64_t ds, uint64_t src, uint64_t dst, uin
   else if (ss == kL2 && ds == kLP6) gdmaStore(src, dst, runBytes, rows, sStride, dStride);
   else if (ss == kLP6 && ds == kL1) copyLP6ToL1(src, dst, runBytes, rows, sStride, dStride);
   else if (ss == kL1 && ds == kLP6) copyL1ToLP6(src, dst, runBytes, rows, sStride, dStride);
+  else if (ss == kLP6 && ds == kLP6 && uint64_t(runBytes) * rows <= uint64_t(in.spec->npu.l1ReservedBytes - kPoolMax)) {
+    // --kv8: rows of a step value in LP6 returned as an output of fewer rows. Through the L1 scratch.
+    copyLP6ToL1(src, scratchBase, runBytes, rows, sStride, runBytes);
+    copyL1ToLP6(scratchBase, dst, runBytes, rows, runBytes, dStride);
+  }
   else err = "unsupported copy between memory spaces " + std::to_string(ss) + " -> " + std::to_string(ds);
 }
 

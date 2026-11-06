@@ -135,6 +135,10 @@ void Codegen::collectConstants(func::FuncOp fn) {
   scalarConst(1.0f / 127.0f);
   scalarConst(0.0f);
   fn.walk([&](Operation *op) {
+    if (op->hasAttr("hyb.kv_op")) {
+      scalarConst(1.0f);
+      vectorConst(1.0, DT_F32);
+    }
     if (auto g = dyn_cast<linalg::GenericOp>(op))
       g.getRegion().walk([&](Operation *b) {
         for (Value o : b->getOperands())

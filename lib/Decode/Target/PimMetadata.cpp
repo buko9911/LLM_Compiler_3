@@ -20,6 +20,7 @@ llvm::json::Value toJSON(const Program &program) {
     if (x.accs != kAccs) o["accs"] = x.accs;
     if (x.splitK != 1) o["split_k"] = x.splitK;
     if (x.tailBlocks) { o["tail_accs"] = x.tailAccs; o["tail_blocks"] = x.tailBlocks; }
+    if (x.inputsPerSweep != kInTiles) o["inputs_per_sweep"] = x.inputsPerSweep;
     if (x.common) {
       o["common"] = true;
       o["stream_order"] = llvm::json::Array(x.streamOrder);
@@ -82,6 +83,7 @@ Program fromJSON(const llvm::json::Value &v) {
     if (auto v = xo->getInteger("split_k")) p.splitK = int(*v);
     if (auto v = xo->getInteger("tail_accs")) p.tailAccs = int(*v);
     if (auto v = xo->getInteger("tail_blocks")) p.tailBlocks = *v;
+    if (auto v = xo->getInteger("inputs_per_sweep")) p.inputsPerSweep = int(*v);
     if (auto v = xo->getBoolean("common")) p.common = *v;
     if (const llvm::json::Array *a = xo->getArray("stream_order"))
       for (const llvm::json::Value &c : *a) p.streamOrder.push_back(*c.getAsInteger());

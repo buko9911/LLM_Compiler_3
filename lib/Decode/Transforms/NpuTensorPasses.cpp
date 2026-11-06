@@ -183,7 +183,7 @@ struct HybNpuTilePass : mlir::hybrid::impl::HybNpuTileBase<HybNpuTilePass> {
     fn.walk([&](linalg::BatchMatmulOp b) { bmms.push_back(b); });
     IRRewriter rewriter(&getContext());
     for (linalg::BatchMatmulOp b : llvm::reverse(bmms)) {
-      if (!b->getBlock() || insideForall(b)) continue;       // fused into a later one
+      if (!b->getBlock() || insideForall(b) || b->hasAttr("hyb.kv_own")) continue;       // fused into a later one
       int64_t B = b.getStaticLoopRanges()[0];
       int64_t cores = largestDivisorAtMost(B, target.npu.cores);
       if (cores < 2) continue;

@@ -138,6 +138,56 @@ struct AttentionChain {
   }
 };
 
+/// --kv8 (Kv8.cpp): the attention of a layer, from Q to the output, on the cores that hold its KV heads. The chain is what
+/// the root reads through generics, matmuls, fills and reshapes; it stops at Q (hyb.kv_q ops take it as it is) and at the
+/// cache concats.
+LogicalResult fuseKv8(IRRewriter &rw, func::FuncOp fn, const TargetSpec &target, int64_t &fused) {
+  SmallVector<Operation *> roots;
+  fn.walk([&](Operation *op) {
+    if (op->hasAttr("hyb.kv_attention")) roots.push_back(op);
+  });
+  for (Operation *root : roots) {
+    llvm::SetVector<Operation *> chain;
+    SmallVector<Value> work(root->getOperands());
+    while (!work.empty()) {
+      Operation *def = work.pop_back_val().getDefiningOp();
+      if (!def || chain.contains(def) || def->getBlock() != root->getBlock()) continue;
+      if (!isa<linalg::GenericOp, linalg::BatchMatmulOp, linalg::FillOp, tensor::ExpandShapeOp, tensor::CollapseShapeOp>(def)) continue;
+      chain.insert(def);
+      unsigned first = def->hasAttr("hyb.kv_q") ? 1 : 0;   // a Q op's first operand is Q, outside the chain
+      for (unsigned i = first; i < def->getNumOperands(); ++i) work.push_back(def->getOperand(i));
+    }
+    auto iterators = cast<linalg::LinalgOp>(root).getNumLoops();
+    const int64_t heads = cast<RankedTensorType>(root->getResult(0).getType()).getDimSize(0);
+    const int64_t cores = largestDivisorAtMost(heads, target.npu.cores);
+    if (cores < 2) continue;
+    scf::SCFTileAndFuseOptions options;
+    options.tilingOptions.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
+    SmallVector<OpFoldResult> threads(iterators, rw.getIndexAttr(0));
+    threads[0] = rw.getIndexAttr(cores);
+    options.tilingOptions.setNumThreads(threads);
+    options.setFusionControlFn([&](tensor::ExtractSliceOp, OpResult result, bool)
+        -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
+      Operation *producer = result.getOwner();
+      if (isa<linalg::FillOp>(producer) || chain.contains(producer)) return scf::SCFTileAndFuseOptions::ControlFnResult{};
+      return std::nullopt;
+    });
+    RewritePatternSet cleanup(rw.getContext());
+    tensor::populateBubbleUpExtractSliceOpPatterns(cleanup);
+    tensor::populateFoldTensorEmptyPatterns(cleanup);
+    options.cleanupPatterns.emplace(std::move(cleanup));
+    rw.setInsertionPoint(root);
+    auto result = scf::tileConsumerAndFuseProducersUsingSCF(rw, cast<TilingInterface>(root), options);
+    if (failed(result) || result->loops.empty()) return root->emitError("cannot fuse the INT8 K/V attention over its heads");
+    for (auto &[original, replacement] : result->replacements) rw.replaceAllUsesWith(original, replacement);
+    auto loop = result->loops.front();
+    loop->setAttr("hyb.cores", rw.getI64IntegerAttr(cores));
+    loop->setAttr("hyb.attention_fused", rw.getUnitAttr());
+    ++fused;
+  }
+  return success();
+}
+
 struct HybNpuAttentionFusionPass
     : mlir::hybrid::impl::HybNpuAttentionFusionBase<HybNpuAttentionFusionPass> {
   using Base::Base;
@@ -153,6 +203,7 @@ struct HybNpuAttentionFusionPass
       SmallVector<linalg::BatchMatmulOp> products;
       fn.walk([&](linalg::BatchMatmulOp mm) { products.push_back(mm); });
       IRRewriter rw(&getContext());
+      if (failed(fuseKv8(rw, fn, *target, fused))) return signalPassFailure();
       // Reverse traversal sees PV before QK. Delete dead producers only after
       // all candidates have been considered, keeping this worklist valid.
       for (linalg::BatchMatmulOp mm : llvm::reverse(products)) {
